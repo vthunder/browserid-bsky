@@ -1,11 +1,11 @@
 ---
 # browserid-bsky-n78o
 title: 'Post-attestation signatures: unforgeable post<->grantee binding (provenance phase 2)'
-status: todo
+status: in-progress
 type: feature
 priority: high
 created_at: 2026-07-24T15:59:35Z
-updated_at: 2026-07-24T15:59:56Z
+updated_at: 2026-07-24T18:56:19Z
 blocked_by:
     - browserid-bsky-27c0
 ---

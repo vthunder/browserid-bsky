@@ -18,6 +18,7 @@
 //! use. Local in-process verification returns when browserid-ng extracts
 //! the algorithm as a crate (bean browserid-ng-kozn).
 
+pub mod attestation;
 pub mod pds;
 pub mod routes;
 pub mod scopes;
@@ -74,6 +75,7 @@ impl BridgeState {
         axum::Router::new()
             .route("/browserid/provision", axum::routing::post(routes::provision))
             .route("/browserid/token", axum::routing::post(routes::token))
+            .route("/browserid/post", axum::routing::post(routes::attributed_post))
             .route(
                 "/.well-known/oauth-authorization-server",
                 axum::routing::get(routes::oauth_metadata),

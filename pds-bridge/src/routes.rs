@@ -278,6 +278,198 @@ pub async fn oauth_metadata(State(state): State<S>) -> Json<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// POST /browserid/post — attributed (signed) post (provenance phase 2)
+// ---------------------------------------------------------------------------
+
+#[derive(serde::Deserialize)]
+pub struct AttestationEnvelope {
+    pub claims: crate::attestation::AttestationClaims,
+    pub sig: String,
+}
+
+#[derive(serde::Deserialize)]
+pub struct AttributedPostReq {
+    /// The full `app.bsky.feed.post` record the grantee authored & signed
+    pub record: serde_json::Value,
+    pub attestation: AttestationEnvelope,
+    #[serde(rename = "accessCert")]
+    pub access_cert: String,
+}
+
+/// Resolve + revocation-check a bearer bridge token, or return the 401/err
+/// response. (Live warrant re-check mirrors the scoped proxy.)
+async fn authorize_token(state: &S, headers: &HeaderMap) -> Result<crate::store::BridgeToken, Response> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .filter(|b| b.starts_with(TOKEN_PREFIX));
+    let Some(bearer) = bearer else {
+        return Err(err(StatusCode::UNAUTHORIZED, "invalid_token", "missing bridge token"));
+    };
+    let token = match state.store.token(bearer) {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err(err(StatusCode::UNAUTHORIZED, "invalid_token", "unknown or expired token")),
+        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string())),
+    };
+    if let Some((uri_s, idx)) = &token.warrant_status {
+        let r = StatusRef { uri: uri_s.clone(), idx: *idx };
+        let mut verdict = state.status_cache.check(&r);
+        if verdict == StatusVerdict::Unknown {
+            let _ = state.status_cache.refresh(&r.uri, &state.broker_key).await;
+            verdict = state.status_cache.check(&r);
+        }
+        match verdict {
+            StatusVerdict::Revoked => {
+                let _ = state.store.revoke_tokens_for_warrant(uri_s, *idx);
+                return Err(err(StatusCode::UNAUTHORIZED, "invalid_token", "warrant revoked"));
+            }
+            StatusVerdict::Unknown => {
+                return Err(err(StatusCode::FORBIDDEN, "invalid_token", "warrant status unavailable (fail-closed)"));
+            }
+            StatusVerdict::Valid => {}
+        }
+    }
+    Ok(token)
+}
+
+/// createRecord on the account repo, refreshing the session once on expiry.
+/// Returns the created record JSON and the (possibly refreshed) account.
+async fn create_via_session(
+    state: &S,
+    did: &str,
+    collection: &str,
+    record: &serde_json::Value,
+) -> Result<(serde_json::Value, Account), Response> {
+    let mut account = match state.store.account_by_did(did) {
+        Ok(Some(a)) => a,
+        Ok(None) => return Err(err(StatusCode::FORBIDDEN, "invalid_token", "account no longer exists")),
+        Err(e) => return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string())),
+    };
+    let body = serde_json::json!({ "repo": did, "collection": collection, "record": record });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let call = |jwt: String, bytes: Vec<u8>| {
+        let state = state.clone();
+        async move {
+            state
+                .pds
+                .forward("POST", "com.atproto.repo.createRecord", None, Some("application/json"), bytes, &jwt)
+                .await
+                .map_err(|e| e.to_string())
+        }
+    };
+    let mut resp = call(account.access_jwt.clone(), body_bytes.clone()).await;
+    let expired = match &resp {
+        Ok(r) => r.status() == reqwest::StatusCode::UNAUTHORIZED || r.status() == reqwest::StatusCode::BAD_REQUEST,
+        Err(_) => false,
+    };
+    if expired {
+        if let Ok(s) = state.pds.refresh_session(&account.refresh_jwt).await {
+            let _ = state.store.update_session(did, &s.access_jwt, &s.refresh_jwt);
+            account.access_jwt = s.access_jwt.clone();
+            account.refresh_jwt = s.refresh_jwt.clone();
+            resp = call(s.access_jwt, body_bytes).await;
+        }
+    }
+    match resp {
+        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+            Ok(v) => Ok((v, account)),
+            Err(e) => Err(err(StatusCode::BAD_GATEWAY, "server_error", e.to_string())),
+        },
+        Ok(r) => {
+            let code = r.status().as_u16();
+            let b = r.text().await.unwrap_or_default();
+            Err(err(StatusCode::BAD_GATEWAY, "server_error", format!("PDS {code}: {b}")))
+        }
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, "server_error", e)),
+    }
+}
+
+pub async fn attributed_post(
+    State(state): State<S>,
+    headers: HeaderMap,
+    Json(req): Json<AttributedPostReq>,
+) -> Response {
+    let token = match authorize_token(&state, &headers).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let att = &req.attestation;
+    let claims = &att.claims;
+
+    // 1. The access cert certifies the signing key as the grantee's.
+    let Ok(access_cert) = browserid_core::device::AccessCert::parse(&req.access_cert) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_grant", "malformed access cert");
+    };
+    let ac = access_cert.claims();
+    if ac.identity != token.grantee {
+        return err(StatusCode::FORBIDDEN, "invalid_grant", "access cert is not the token's grantee");
+    }
+    let now = chrono::Utc::now().timestamp();
+    if now >= ac.exp {
+        return err(StatusCode::FORBIDDEN, "invalid_grant", "access cert expired");
+    }
+    // Chain the access cert to its IdP (advisory well-known; the authoritative
+    // DNSSEC check happens at token exchange via the hosted verifier).
+    match fetch_well_known_key(&state, &ac.iss).await {
+        Some(k) if access_cert.verify(&k).is_ok() => {}
+        _ => return err(StatusCode::FORBIDDEN, "invalid_grant", "access cert not verifiable to its IdP"),
+    }
+
+    // 2. The grantee's signature over the attestation.
+    if !claims.verify(&access_cert.claims().access_key, &att.sig) {
+        return err(StatusCode::BAD_REQUEST, "invalid_grant", "attestation signature invalid");
+    }
+
+    // 3. The attestation binds this exact post + is fresh.
+    if claims.did != token.did || claims.collection != "app.bsky.feed.post" {
+        return err(StatusCode::BAD_REQUEST, "invalid_grant", "attestation target mismatch");
+    }
+    if claims.content_hash != crate::attestation::content_hash(&req.record) {
+        return err(StatusCode::BAD_REQUEST, "invalid_grant", "content hash does not match the post");
+    }
+    if (now - claims.iat).abs() > 600 {
+        return err(StatusCode::BAD_REQUEST, "invalid_grant", "attestation not fresh (iat skew)");
+    }
+
+    // 4. Scope: the warrant must permit creating feed posts.
+    let scopes = parse_scopes(&token.scopes);
+    let required = crate::scopes::Required::Repo {
+        collection: "app.bsky.feed.post".into(),
+        action: crate::scopes::RepoAction::Create,
+    };
+    if !scopes_cover(&scopes, &required) {
+        return err(StatusCode::FORBIDDEN, "insufficient_scope", "warrant does not permit creating posts");
+    }
+
+    // 5. Replay guard: claim the nonce before writing anything.
+    match state.store.reserve_nonce(&claims.nonce, &token.did) {
+        Ok(true) => {}
+        Ok(false) => return err(StatusCode::CONFLICT, "invalid_grant", "attestation nonce already used (replay)"),
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    }
+
+    // 6. Create the post, then wire up nonce + signed provenance.
+    let (created, account) = match create_via_session(&state, &token.did, "app.bsky.feed.post", &req.record).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    let post_uri = created["uri"].as_str().unwrap_or_default().to_string();
+    let rkey = post_uri.rsplit('/').next().unwrap_or_default();
+    let _ = state.store.set_nonce_rkey(&claims.nonce, rkey);
+    let _ = state.store.audit(&token, "com.atproto.repo.createRecord", "ok-attested");
+
+    let attestation_json = serde_json::json!({
+        "claims": claims,
+        "sig": att.sig,
+        "accessCert": req.access_cert,
+    });
+    write_provenance(&state, &token, &account, &post_uri, created["cid"].as_str(), &claims.nonce, Some(attestation_json)).await;
+
+    (StatusCode::OK, Json(created)).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // GET /verify?uri=<post at-uri>[&format=json] — provenance receipt
 // ---------------------------------------------------------------------------
 //
@@ -482,7 +674,44 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
         prov["attributedTo"].as_str() == Some(&grantor) && prov["executedBy"].as_str() == Some(&grantee),
         &mut checks, &mut ok);
 
+    // Phase 2: if the post carries a grantee attestation, verify the
+    // unforgeable post↔grantee binding by recomputing the content hash from
+    // the *published* post and checking the grantee's signature.
+    let mut post_binding_verified = false;
+    if let Some(att) = prov.get("attestation") {
+        let mut att_ok = true;
+        let claims: Option<crate::attestation::AttestationClaims> =
+            serde_json::from_value(att["claims"].clone()).ok();
+        let sig = att["sig"].as_str().unwrap_or("");
+        let access_cert = att["accessCert"].as_str().and_then(|c| browserid_core::device::AccessCert::parse(c).ok());
+        let post_rec = get_record(&state, &pds, &did, "app.bsky.feed.post", &rkey).await;
+        match (&claims, &access_cert, &post_rec) {
+            (Some(cl), Some(acc), Some(rec)) => {
+                let acc_claims = acc.claims();
+                check("attestation_signed_by_grantee", cl.verify(&acc.claims().access_key, sig), &mut checks, &mut att_ok);
+                check("access_cert_is_grantee", acc_claims.identity == grantee, &mut checks, &mut att_ok);
+                let idp2 = fetch_well_known_key(&state, &acc_claims.iss).await;
+                check("access_cert_signed_by_idp", idp2.map(|k| acc.verify(&k).is_ok()).unwrap_or(false), &mut checks, &mut att_ok);
+                check("content_hash_matches_post", cl.content_hash == crate::attestation::content_hash(rec), &mut checks, &mut att_ok);
+                check("attestation_within_cert_validity", cl.iat < acc_claims.exp, &mut checks, &mut att_ok);
+                check("nonce_matches_provenance", prov["nonce"].as_str() == Some(cl.nonce.as_str()), &mut checks, &mut att_ok);
+                post_binding_verified = att_ok;
+            }
+            _ => {
+                check("attestation_well_formed", false, &mut checks, &mut att_ok);
+            }
+        }
+        if !att_ok { ok = false; }
+    }
+
     let root = root_identity(&grantor);
+    let caveat = if post_binding_verified {
+        "Fully verified: the delegation AND the grantee's signature over this exact post's content are cryptographically checked — unforgeable, independent of the PDS."
+    } else if prov.get("attestation").is_some() {
+        "This post carries an attestation but it did not verify — treat the post↔grantee binding as unproven."
+    } else {
+        "Phase 1: the delegation is verified from the published records, but the link from this exact post to the grantee is asserted by the PDS (no grantee signature present)."
+    };
     let result = serde_json::json!({
         "ok": ok,
         "post": post_uri,
@@ -490,13 +719,14 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
         "executedBy": grantee,
         "root": root,
         "onBehalf": grantor != grantee,
+        "postBindingVerified": post_binding_verified,
         "audience": wc.audience,
         "scopes": wc.scopes,
         "issuer": iss,
         "delegationVerified": ok,
         "checks": serde_json::Value::Object(checks),
         "warrantRecord": warrant_uri,
-        "caveat": "Phase 1: the delegation is verified from the published records, but the link from this exact post to the grantee is asserted by the PDS. A grantee signature (bean n78o) will make it unforgeable.",
+        "caveat": caveat,
     });
     if want_json {
         Json(result).into_response()
@@ -552,6 +782,12 @@ fn verify_html(r: &serde_json::Value) -> String {
     let ok = r["ok"].as_bool().unwrap_or(false);
     let badge = if ok { "✓ delegation verified" } else { "✗ verification failed" };
     let color = if ok { "#0a7d33" } else { "#b00020" };
+    let bound = r["postBindingVerified"].as_bool().unwrap_or(false);
+    let binding_line = if bound {
+        "<div style='color:#0a7d33'>🔒 authorship cryptographically bound to this post (unforgeable)</div>"
+    } else {
+        "<div style='color:#a06000'>authorship of this exact post is PDS-asserted (no valid grantee signature)</div>"
+    };
     let on_behalf = r["onBehalf"].as_bool().unwrap_or(false);
     let relation = if on_behalf {
         format!("<b>{}</b> posted <b>on behalf of</b> <b>{}</b>", esc(r["executedBy"].as_str().unwrap_or("")), esc(r["attributedTo"].as_str().unwrap_or("")))
@@ -566,12 +802,13 @@ fn verify_html(r: &serde_json::Value) -> String {
         "<!doctype html><meta charset=utf-8><title>browserid verify</title>\
          <div style='font:16px/1.5 system-ui;max-width:44rem;margin:3rem auto;padding:0 1rem'>\
          <div style='color:{color};font-weight:700;font-size:1.3rem'>{badge}</div>\
+         {binding_line}\
          <p style='font-size:1.1rem'>{relation}, authorized under <b>{root}</b>.</p>\
          <p>Audience: <code>{aud}</code><br>Scopes: <code>{scopes}</code><br>IdP: <code>{iss}</code></p>\
          <table style='border-collapse:collapse' cellpadding=6>{rows}</table>\
          <p style='color:#666;font-size:.9rem;margin-top:1.5rem'>{caveat}</p>\
          <p style='color:#999;font-size:.8rem'>Post: <code>{post}</code></p></div>",
-        color = color, badge = badge, relation = relation,
+        color = color, badge = badge, binding_line = binding_line, relation = relation,
         root = esc(r["root"].as_str().unwrap_or("")),
         aud = esc(r["audience"].as_str().unwrap_or("")),
         scopes = esc(&scopes), iss = esc(r["issuer"].as_str().unwrap_or("")),
@@ -780,7 +1017,13 @@ async fn scoped_call(
         };
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             if let Some(uri) = v["uri"].as_str() {
-                write_provenance(state, &token, &account, uri, v["cid"].as_str()).await;
+                // Phase-1 (unsigned proxy) path: bridge mints the nonce.
+                let mut nb = [0u8; 16];
+                rand::thread_rng().fill_bytes(&mut nb);
+                let nonce = URL_SAFE_NO_PAD.encode(nb);
+                let rkey = uri.rsplit('/').next().unwrap_or_default();
+                let _ = state.store.put_nonce(&nonce, &account.did, rkey);
+                write_provenance(state, &token, &account, uri, v["cid"].as_str(), &nonce, None).await;
             }
         }
         let mut b = Response::builder().status(status);
@@ -806,6 +1049,8 @@ async fn write_provenance(
     account: &Account,
     post_uri: &str,
     post_cid: Option<&str>,
+    nonce: &str,
+    attestation: Option<serde_json::Value>,
 ) {
     let Ok(Some(w)) = state.store.warrant_by_hash(&token.warrant_ref) else {
         tracing::warn!(reff = %token.warrant_ref, "provenance: warrant not found");
@@ -843,14 +1088,6 @@ async fn write_provenance(
     // Per-post provenance, rkey = the post's rkey (1:1, findable by at-uri).
     let rkey = post_uri.rsplit('/').next().unwrap_or_default();
 
-    // A per-post nonce, resolvable via verify?n=<nonce> (the form an
-    // optional in-post link uses). Phase 1: bridge-minted; phase 2 the
-    // agent chooses it as the signed attestation nonce (bean n78o).
-    let mut nb = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut nb);
-    let nonce = URL_SAFE_NO_PAD.encode(nb);
-    let _ = state.store.put_nonce(&nonce, &account.did, rkey);
-
     let mut prov = serde_json::json!({
         "$type": "me.browserid.provenance",
         "post": post_uri,
@@ -861,6 +1098,10 @@ async fn write_provenance(
     });
     if let Some(cid) = post_cid {
         prov["postCid"] = serde_json::Value::String(cid.to_string());
+    }
+    // Phase 2: the grantee's signed attestation, if this post carried one.
+    if let Some(att) = attestation {
+        prov["attestation"] = att;
     }
     if let Err(e) = state
         .pds

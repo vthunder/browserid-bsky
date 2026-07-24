@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 browserid-agent = { workspace = true }
+browserid-core = { workspace = true }
+pds-bridge = { path = "../pds-bridge" }
 tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

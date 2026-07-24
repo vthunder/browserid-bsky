@@ -374,6 +374,27 @@ impl Store {
         Ok(())
     }
 
+    /// Claim a nonce before creating the post (phase-2 replay guard):
+    /// inserts with an empty rkey placeholder. `Ok(false)` = already seen →
+    /// the caller MUST reject (replay). Fill the rkey after the post is
+    /// created with [`set_nonce_rkey`].
+    pub fn reserve_nonce(&self, nonce: &str, did: &str) -> Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "INSERT INTO nonces (nonce, did, rkey) VALUES (?1, ?2, '')
+             ON CONFLICT(nonce) DO NOTHING",
+            params![nonce, did],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn set_nonce_rkey(&self, nonce: &str, rkey: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE nonces SET rkey = ?2 WHERE nonce = ?1",
+            params![nonce, rkey],
+        )?;
+        Ok(())
+    }
+
     /// Resolve a nonce to `(did, rkey)`.
     pub fn resolve_nonce(&self, nonce: &str) -> Result<Option<(String, String)>> {
         self.conn

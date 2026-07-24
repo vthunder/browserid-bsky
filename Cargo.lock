@@ -1753,7 +1753,9 @@ name = "smoke"
 version = "0.1.0"
 dependencies = [
  "browserid-agent",
+ "browserid-core",
  "chrono",
+ "pds-bridge",
  "reqwest",
  "serde",
  "serde_json",

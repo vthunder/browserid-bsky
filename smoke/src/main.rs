@@ -117,7 +117,11 @@ async fn post(text: &str) {
     let did = state.did.clone().expect("no did in state — setup incomplete");
     let mut agent = agent_from(&state);
 
-    let bundle = agent.assertion_for(BRIDGE).await.expect("bundle mint failed");
+    // Get the bundle AND the access key seed, so we can sign a post
+    // attestation with the same access key the bundle certifies.
+    let (bundle, access_seed) =
+        agent.assertion_with_access_seed(BRIDGE).await.expect("bundle mint failed");
+    let access_cert = bundle.split('~').next().expect("access cert").to_string();
     let http = client();
     let resp = http
         .post(format!("{BRIDGE}/browserid/token"))
@@ -138,19 +142,39 @@ async fn post(text: &str) {
     let token = body["access_token"].as_str().expect("no token").to_string();
     println!("bridge token issued (scopes {:?})", body["scopes"]);
 
+    // Build the post the grantee will sign — including the optional in-post
+    // verify link, keyed by the attestation nonce (known before the post
+    // exists), so the signature covers exactly what's published.
+    // A random single-use nonce (base64url, url-safe). Chosen by the agent
+    // before the post exists, so the signed content can embed the link.
+    let nonce = browserid_core::KeyPair::generate().public_key().to_base64();
+    let text_with_link = format!("{text}\n\nverify: {BRIDGE}/verify?n={nonce}");
     let record = serde_json::json!({
-        "repo": did,
-        "collection": "app.bsky.feed.post",
-        "record": {
-            "$type": "app.bsky.feed.post",
-            "text": text,
-            "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        }
+        "$type": "app.bsky.feed.post",
+        "text": text_with_link,
+        "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     });
+
+    use browserid_core::KeyPair;
+    use pds_bridge::attestation::{content_hash, AttestationClaims};
+    let access_key = KeyPair::from_seed(&access_seed).expect("access seed");
+    let claims = AttestationClaims::new(
+        &did,
+        "app.bsky.feed.post",
+        &content_hash(&record),
+        &nonce,
+        chrono::Utc::now().timestamp(),
+    );
+    let sig = claims.sign(&access_key);
+
     let resp = http
-        .post(format!("{BRIDGE}/xrpc/com.atproto.repo.createRecord"))
+        .post(format!("{BRIDGE}/browserid/post"))
         .bearer_auth(&token)
-        .json(&record)
+        .json(&serde_json::json!({
+            "record": record,
+            "attestation": { "claims": claims, "sig": sig },
+            "accessCert": access_cert,
+        }))
         .send()
         .await
         .expect("bridge unreachable");
@@ -161,7 +185,8 @@ async fn post(text: &str) {
         println!("(if you just revoked the warrant: this is the revocation working)");
         std::process::exit(1);
     }
-    println!("posted: {}", body["uri"].as_str().unwrap_or("?"));
+    println!("posted (signed): {}", body["uri"].as_str().unwrap_or("?"));
+    println!("verify: {BRIDGE}/verify?n={nonce}");
 
     // Read it back from the PDS directly (public, unauthenticated).
     let listed: serde_json::Value = http
