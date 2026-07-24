@@ -8,9 +8,11 @@ use axum::Json;
 use chrono::Duration;
 use serde_json::{json, Value};
 
-use browserid_core::device::{AccessCert, DeviceCert, Holder, HolderMatcher, Purpose, Warrant};
-use browserid_core::{Assertion, KeyPair, StatusList, StatusListToken, StatusRef};
-use browserid_rp::{StatusCache, Verifier};
+use browserid_core::device::{
+    AccessCert, AccessPresentation, DeviceCert, Holder, HolderMatcher, Purpose, Warrant,
+};
+use browserid_core::{Assertion, KeyPair, PublicKey, StatusList, StatusListToken, StatusRef};
+use browserid_rp::StatusCache;
 use pds_bridge::store::Store;
 use pds_bridge::{pds::PdsClient, BridgeState};
 
@@ -92,22 +94,64 @@ async fn mock_pds() -> String {
     base
 }
 
+/// A mock hosted verifier: runs the REAL core verification algorithm
+/// (`AccessPresentation::verify`) with the test issuer key and answers in
+/// the broker's `/verify-access` response shape — the bridge outsources
+/// verification, so the tests exercise its handling of that contract.
+async fn mock_broker(idp_pub: PublicKey) -> String {
+    async fn verify_access(
+        axum::extract::State(idp_pub): axum::extract::State<PublicKey>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        let pres = body["presentation"].as_str().unwrap_or_default();
+        let audience = body["audience"].as_str().unwrap_or_default().to_string();
+        let out = AccessPresentation::parse(pres).and_then(|p| {
+            p.verify(&audience, |iss| {
+                if iss == ISSUER {
+                    Ok(idp_pub.clone())
+                } else {
+                    Err(browserid_core::Error::DiscoveryFailed {
+                        domain: iss.to_string(),
+                        reason: "issuer not trusted".to_string(),
+                    })
+                }
+            })
+        });
+        match out {
+            Ok(v) => Json(json!({
+                "status": "okay",
+                "email": v.email,
+                "holder": v.holder.as_str(),
+                "scopes": v.scopes,
+                "issuer": v.issuer,
+            })),
+            Err(e) => Json(json!({ "status": "failure", "reason": e.to_string() })),
+        }
+    }
+    let app = axum::Router::new()
+        .route("/verify-access", post(verify_access))
+        .with_state(idp_pub);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base
+}
+
 async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<StatusCache>) {
     let cache = Arc::new(StatusCache::new());
     let list = StatusList::from_revoked(revoked.iter().copied(), 64);
     let token = StatusListToken::create(ISSUER, STATUS_URI, &list, idp).unwrap();
     cache.insert(STATUS_URI, token);
 
-    let verifier = Verifier::new(ORIGIN)
-        .trust_issuer(ISSUER, idp.public_key())
-        .with_status_cache(cache.clone());
     let state = BridgeState {
         origin: ORIGIN.to_string(),
         handle_domain: "at.browserid.test".to_string(),
-        verifier,
+        broker_url: mock_broker(idp.public_key()).await,
+        broker_key: idp.public_key(),
         status_cache: cache.clone(),
         store: Store::open_in_memory().unwrap(),
         pds: PdsClient::new(mock_pds().await, "admin-secret"),
+        http: reqwest::Client::new(),
     };
     (axum_test::TestServer::new(state.router()).unwrap(), cache)
 }

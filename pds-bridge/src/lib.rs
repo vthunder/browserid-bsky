@@ -1,17 +1,22 @@
-//! bsky.browserid.me — the Bluesky PDS bridge (bean ezk6, design doc
-//! `docs/plans/2026-07-24-bsky-pds-bridge-design.md`).
+//! bsky.browserid.me — the Bluesky PDS bridge (bean browserid-bsky-aa7g,
+//! design doc `docs/plans/2026-07-24-bsky-pds-bridge-design.md`).
 //!
 //! One public origin, three surfaces:
 //! - `/browserid/provision` — browserid login → create an atproto account
 //!   on the internal stock PDS, bind grantor-email ↔ DID.
 //! - `/browserid/token` — RFC 7521 grant exchange: four-object bundle in,
-//!   scoped bridge token out. Verified fail-closed with `browserid-rp`.
+//!   scoped bridge token out.
 //! - `/xrpc/*` — bridge-token requests are scope-enforced then forwarded
 //!   with the account's PDS session; everything else passes through
 //!   untouched (human clients, relay crawl).
 //!
-//! The bridge is a plain relying party: browserid.me holds no special
-//! position, and the broker is trusted only as an accepted fallback issuer.
+//! Verification is **outsourced to the hosted verifier**
+//! (`POST {broker}/verify-access`) — there is exactly one verification
+//! algorithm and it runs where it is maintained, with real DNSSEC-rooted
+//! discovery (primaries like sandmill.org just work). The bridge keeps only
+//! a status-list *client* for live warrant-revocation re-checks on token
+//! use. Local in-process verification returns when browserid-ng extracts
+//! the algorithm as a crate (bean browserid-ng-kozn).
 
 pub mod pds;
 pub mod routes;
@@ -20,7 +25,8 @@ pub mod store;
 
 use std::sync::Arc;
 
-use browserid_rp::{StatusCache, Verifier};
+use browserid_core::PublicKey;
+use browserid_rp::StatusCache;
 
 use crate::pds::PdsClient;
 use crate::store::Store;
@@ -50,10 +56,16 @@ pub struct BridgeState {
     pub origin: String,
     /// Zone user handles live under (e.g. `at.browserid.me`)
     pub handle_domain: String,
-    pub verifier: Verifier,
+    /// The hosted verifier's base URL (the broker)
+    pub broker_url: String,
+    /// The broker's published key — used ONLY to verify its signed warrant
+    /// status lists for revocation re-checks (a status-list client, not a
+    /// verifier)
+    pub broker_key: PublicKey,
     pub status_cache: Arc<StatusCache>,
     pub store: Store,
     pub pds: PdsClient,
+    pub http: reqwest::Client,
 }
 
 impl BridgeState {

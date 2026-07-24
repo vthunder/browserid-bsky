@@ -13,8 +13,8 @@ use rand::RngCore;
 
 use browserid_core::device::AccessPresentation;
 use browserid_core::rp_auth::{TokenRequest, TokenResponse, GRANT_TYPE_ASSERTION};
-use browserid_core::StatusRef;
-use browserid_rp::{oauth_metadata_with_scopes, StatusVerdict, VerifiedIdentity};
+use browserid_core::{RpChallenge, StatusRef};
+use browserid_rp::{oauth_metadata_with_scopes, StatusVerdict};
 
 use crate::scopes::{parse_scopes, required_for, scopes_cover};
 use crate::store::{Account, BridgeToken, TOKEN_PREFIX};
@@ -27,32 +27,63 @@ fn err(status: StatusCode, code: &str, msg: impl Into<String>) -> Response {
         .into_response()
 }
 
-/// Refresh any status list the presentation references that the cache can't
-/// currently answer for, then verify. Keeps `Verifier::verify` synchronous
-/// while staying fail-closed: a list that still can't be fetched/verified
-/// leaves the verdict Unknown → reject.
-async fn verify_presentation(state: &S, presentation: &str) -> Result<VerifiedIdentity, Response> {
-    if let Ok(pres) = AccessPresentation::parse(presentation) {
-        let refs: Vec<StatusRef> = [
-            pres.access_cert.claims().status.clone(),
-            pres.config_cert.claims().status.clone(),
-            pres.warrant.claims().status.clone(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        for r in refs {
-            if state.status_cache.check(&r) == StatusVerdict::Unknown {
-                if let Err(e) = state.verifier.refresh_status(&r.uri).await {
-                    tracing::warn!(uri = %r.uri, "status list refresh failed: {e}");
-                }
-            }
-        }
+/// What the bridge learns from a verified presentation.
+pub struct Verified {
+    pub grantor: String,
+    pub grantee: String,
+    pub holder: String,
+    pub scopes: Vec<String>,
+    pub warrant_status: Option<StatusRef>,
+}
+
+/// Verify a presentation by **outsourcing to the hosted verifier**
+/// (`POST {broker}/verify-access`) — one verification algorithm, running
+/// where it is maintained, with real DNSSEC-rooted discovery (bean
+/// browserid-ng-kozn tracks in-process reuse of the same algorithm). The
+/// hosted response omits grantee/warrant-status (audit D2), so those claims
+/// are read from the just-verified bundle and cross-checked against the
+/// verifier's answer.
+async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, Response> {
+    let resp = state
+        .http
+        .post(format!("{}/verify-access", state.broker_url))
+        .json(&serde_json::json!({ "presentation": presentation, "audience": state.origin }))
+        .send()
+        .await
+        .map_err(|e| {
+            err(StatusCode::BAD_GATEWAY, "server_error", format!("hosted verifier unreachable: {e}"))
+        })?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()))?;
+    if v["status"] != "okay" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            format!("assertion rejected: {}", v["reason"].as_str().unwrap_or("verification failed")),
+        ));
     }
-    state
-        .verifier
-        .verify(presentation)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_grant", e.to_string()))
+    let email = v["email"]
+        .as_str()
+        .ok_or_else(|| err(StatusCode::BAD_GATEWAY, "server_error", "verifier response missing email"))?;
+
+    let pres = AccessPresentation::parse(presentation)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, "invalid_grant", e.to_string()))?;
+    let wc = pres.warrant.claims();
+    if wc.grantor != email || wc.audience != state.origin {
+        return Err(err(StatusCode::BAD_REQUEST, "invalid_grant", "bundle/verifier mismatch"));
+    }
+    Ok(Verified {
+        grantor: email.to_string(),
+        grantee: wc.grantee.clone(),
+        holder: v["holder"].as_str().unwrap_or_default().to_string(),
+        scopes: v["scopes"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_else(|| wc.scopes.clone()),
+        warrant_status: wc.status.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -85,14 +116,14 @@ pub async fn provision(
     };
     // Provisioning is a first-party action: the signed-in identity itself,
     // not a delegated grantee, opens the account.
-    if identity.grantee != identity.email {
+    if identity.grantee != identity.grantor {
         return err(
             StatusCode::FORBIDDEN,
             "invalid_grant",
             "provisioning requires a first-party login (grantee == grantor)",
         );
     }
-    let email = identity.email;
+    let email = identity.grantor;
 
     let label = req.handle.to_lowercase();
     if !valid_label(&label) || RESERVED_LABELS.contains(&label.as_str()) {
@@ -162,13 +193,13 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
     };
 
     // The grantor names the account; only a provisioned grantor can delegate.
-    let account = match state.store.account_by_email(&identity.email) {
+    let account = match state.store.account_by_email(&identity.grantor) {
         Ok(Some(a)) => a,
         Ok(None) => {
             return err(
                 StatusCode::FORBIDDEN,
                 "invalid_grant",
-                format!("{} has no account here — provision first", identity.email),
+                format!("{} has no account here — provision first", identity.grantor),
             )
         }
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
@@ -189,9 +220,9 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
 
     let token = BridgeToken {
         did: account.did,
-        grantor: identity.email,
+        grantor: identity.grantor,
         grantee: identity.grantee,
-        holder: identity.holder.as_str().to_string(),
+        holder: identity.holder,
         scopes: granted.clone(),
         warrant_status: identity.warrant_status.map(|r| (r.uri, r.idx)),
         expires_at: Utc::now() + Duration::minutes(TOKEN_TTL_MINUTES),
@@ -264,10 +295,10 @@ async fn scoped_call(
 ) -> Response {
     let challenge = || {
         let mut resp = err(StatusCode::UNAUTHORIZED, "invalid_token", "unknown or expired token");
-        let header_value = state
-            .verifier
-            .challenge(format!("{}/browserid/token", state.origin))
-            .to_header_value();
+        let header_value =
+            RpChallenge::new(state.origin.clone(), format!("{}/browserid/token", state.origin))
+                .with_scopes(ADVERTISED_SCOPES.iter().map(|s| s.to_string()))
+                .to_header_value();
         if let Ok(v) = header_value.parse() {
             resp.headers_mut().insert(header::WWW_AUTHENTICATE, v);
         }
@@ -281,11 +312,13 @@ async fn scoped_call(
     };
 
     // Live revocation: re-check the warrant ref on every use (≤5 min cache).
+    // Warrant lists come from the broker's registry, so its published key
+    // verifies them (a status-list client, not verification logic).
     if let Some((uri_s, idx)) = &token.warrant_status {
         let r = StatusRef { uri: uri_s.clone(), idx: *idx };
         let mut verdict = state.status_cache.check(&r);
         if verdict == StatusVerdict::Unknown {
-            if let Err(e) = state.verifier.refresh_status(&r.uri).await {
+            if let Err(e) = state.status_cache.refresh(&r.uri, &state.broker_key).await {
                 tracing::warn!(uri = %r.uri, "status refresh failed: {e}");
             }
             verdict = state.status_cache.check(&r);

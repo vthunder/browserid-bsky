@@ -2,9 +2,10 @@
 //! `docs/plans/2026-07-24-bsky-pds-bridge-design.md`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use browserid_rp::{StatusCache, Verifier};
-use pds_bridge::{store::Store, BridgeState, ADVERTISED_SCOPES};
+use browserid_rp::StatusCache;
+use pds_bridge::{store::Store, BridgeState};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -26,38 +27,37 @@ async fn main() {
     let pds_admin_password = std::env::var("PDS_ADMIN_PASSWORD")
         .expect("PDS_ADMIN_PASSWORD is required (the stock PDS admin secret)");
     let broker_url = env_or("BROKER_URL", "https://browserid.me");
-    // Additional trusted primary IdPs (comma-separated base URLs). The RP
-    // decides which issuers it accepts (spec §6.1); keys fetched from each
-    // IdP's /.well-known/browserid.
-    let trusted_idps = env_or("TRUSTED_IDPS", "");
     let db_path = env_or("BRIDGE_DB", "pds-bridge.db");
 
-    // Fail-closed by default (4lxl): status lists are refreshed on demand in
-    // the handlers; unknown status → reject.
-    let status_cache = Arc::new(StatusCache::new());
-    // TODO(ezk6/P2): DNSSEC-rooted issuer discovery instead of a static
-    // well-known-fetched trust table.
-    let mut verifier = Verifier::new(origin.clone())
-        .trust_issuer_from_well_known(&broker_url)
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .expect("failed to build HTTP client");
+
+    // The broker's published key — verifies its signed warrant status lists
+    // for the live revocation re-check. Verification of presentations is
+    // outsourced to {broker_url}/verify-access (see lib.rs).
+    let doc: browserid_core::discovery::SupportDocument = http
+        .get(format!("{broker_url}/.well-known/browserid"))
+        .send()
         .await
-        .expect("failed to fetch broker key")
-        .with_scopes(ADVERTISED_SCOPES.iter().copied())
-        .with_status_cache(status_cache.clone());
-    for idp in trusted_idps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        verifier = verifier
-            .trust_issuer_from_well_known(idp)
-            .await
-            .unwrap_or_else(|e| panic!("failed to fetch key for trusted IdP {idp}: {e}"));
-        tracing::info!("trusting primary IdP {idp}");
-    }
+        .and_then(|r| r.error_for_status())
+        .expect("broker unreachable")
+        .json()
+        .await
+        .expect("bad broker support document");
+    let broker_key = doc.public_key.expect("broker support document has no key");
 
     let state = BridgeState {
         origin: origin.clone(),
         handle_domain,
-        verifier,
-        status_cache,
+        broker_url,
+        broker_key,
+        // Fail-closed (4lxl): unknown/stale warrant status → reject.
+        status_cache: Arc::new(StatusCache::new()),
         store: Store::open(&db_path).expect("failed to open bridge db"),
         pds: pds_bridge::pds::PdsClient::new(pds_url, pds_admin_password),
+        http,
     };
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
