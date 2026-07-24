@@ -392,7 +392,7 @@ async fn scoped_call(
     }
 
     // Forward with the account session; refresh once on auth failure.
-    let account = match state.store.account_by_did(&token.did) {
+    let mut account = match state.store.account_by_did(&token.did) {
         Ok(Some(a)) => a,
         Ok(None) => return err(StatusCode::FORBIDDEN, "invalid_token", "account no longer exists"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
@@ -432,6 +432,9 @@ async fn scoped_call(
             match state.pds.refresh_session(&account.refresh_jwt).await {
                 Ok(s) => {
                     let _ = state.store.update_session(&token.did, &s.access_jwt, &s.refresh_jwt);
+                    // Keep the local copy fresh — write_provenance below uses it.
+                    account.access_jwt = s.access_jwt.clone();
+                    account.refresh_jwt = s.refresh_jwt.clone();
                     resp = match send(s.access_jwt, body.to_vec()).await {
                         Ok(r) => r,
                         Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
