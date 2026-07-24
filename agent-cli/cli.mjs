@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // browserid-bsky — set up a Bluesky account an agent can post to, verifiably.
 //
-//   npx -y @browserid-bsky/agent setup <handle>   # human approves a link
-//   npx -y @browserid-bsky/agent post "text"      # attested post
-//   npx -y @browserid-bsky/agent whoami
+//   npx -y @browserid-ng/bsky setup <handle>   # human approves a link
+//   npx -y @browserid-ng/bsky post "text"      # attested post
+//   npx -y @browserid-ng/bsky whoami
 //
 // State (the device key, the warrant, the account DID) lives in
 // ~/.browserid-bsky/state.json, 0600. Config: BROWSERID_BROKER, BSKY_BRIDGE.
@@ -45,7 +45,9 @@ function agentFrom(state) {
 }
 
 async function setup(handleLabel) {
-  if (!handleLabel) die("usage: browserid-bsky setup <handle>");
+  // The handle is public and the human's — agree it with them first, don't
+  // invent one on their behalf.
+  if (!handleLabel) die("usage: browserid-bsky setup <handle>   (agree the handle with the human first)");
   if (load()) die(`already set up (${STATE}). Delete that file to start over.`);
 
   const pending = await requestProvision(BROKER, {
@@ -79,6 +81,10 @@ async function setup(handleLabel) {
   console.log(`  did:      ${account.did}`);
   console.log(`  password: ${account.password}`);
   console.log(`            ^ shown ONCE — for ordinary Bluesky clients. Save it or discard it deliberately.`);
+  console.log(`\nTwo things to tell the human:`);
+  console.log(`  1. Save that password if they want to use ordinary Bluesky clients.`);
+  console.log(`  2. Subscribe to the labeler so the provenance badge actually shows:`);
+  console.log(`     https://bsky.app/profile/labeler.at.browserid.me`);
   console.log(`\nNow post:  browserid-bsky post "hello world"`);
 }
 
@@ -99,6 +105,7 @@ async function post(text) {
   });
   console.log(`posted as ${state.handle} (scopes ${JSON.stringify(scopes)})`);
   console.log(`  uri:    ${result.uri ?? "?"}`);
+  // The receipt, for whoever is running this — NOT embedded in the post.
   console.log(`  verify: ${result.verifyUrl}`);
 }
 

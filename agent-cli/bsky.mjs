@@ -53,32 +53,22 @@ export function signAttestation(claims, accessKey) {
 }
 
 /**
- * Build a post record with the in-post verify link rendered as a compact
- * clickable facet. The facet is part of the record, so the signature covers
- * it too — the link cannot be swapped after signing.
- *
- * Facet ranges are UTF-8 BYTE offsets, not character offsets.
+ * Build a post record. Deliberately NO in-post verify link: the labeler is
+ * the trust surface, and a link inside post content is author-controlled — it
+ * can point at a convincing fake verifier, so teaching readers to click it
+ * trains exactly the wrong reflex. Readers check a post by pasting its link
+ * at the verifier they navigated to themselves.
  */
-export function buildPostRecord({ text, verifyUrl, createdAt = new Date().toISOString() }) {
-  const label = "🔗 verify";
-  const prefix = `${text}\n\n`;
-  const byteStart = Buffer.byteLength(prefix, "utf8");
-  const byteEnd = byteStart + Buffer.byteLength(label, "utf8");
+export function buildPostRecord({ text, createdAt = new Date().toISOString() }) {
   return {
     $type: POST_COLLECTION,
-    text: `${prefix}${label}`,
+    text,
     createdAt,
-    facets: [
-      {
-        index: { byteStart, byteEnd },
-        features: [{ $type: "app.bsky.richtext.facet#link", uri: verifyUrl }],
-      },
-    ],
   };
 }
 
-/** A single-use nonce: 32 random bytes, base64url — also the key the in-post
- *  `verify?n=` link uses, so it must be chosen BEFORE the post is built. */
+/** A single-use nonce: 32 random bytes, base64url. The attestation's replay
+ *  guard, and the key `/verify?n=` looks a receipt up by. */
 export function newNonce() {
   return b64u(globalThis.crypto.getRandomValues(new Uint8Array(32)));
 }
@@ -125,7 +115,7 @@ export async function exchangeToken(bridge, { presentation, http = fetch }) {
  */
 export async function attestedPost(bridge, { text, did, token, accessKey, accessCert, http = fetch }) {
   const nonce = newNonce();
-  const record = buildPostRecord({ text, verifyUrl: `${bridge}/verify?n=${nonce}` });
+  const record = buildPostRecord({ text });
   const claims = attestationClaims({ did, contentHash: contentHash(record), nonce });
   const { res, json } = await callJson(http, `${bridge}/browserid/post`, {
     headers: { authorization: `Bearer ${token}` },

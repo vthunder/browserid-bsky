@@ -142,31 +142,15 @@ async fn post(text: &str) {
     let token = body["access_token"].as_str().expect("no token").to_string();
     println!("bridge token issued (scopes {:?})", body["scopes"]);
 
-    // Build the post the grantee will sign — including the optional in-post
-    // verify link, keyed by the attestation nonce (known before the post
-    // exists), so the signature covers exactly what's published.
-    // A random single-use nonce (base64url, url-safe). Chosen by the agent
-    // before the post exists, so the signed content can embed the link.
+    // Build the post the grantee will sign. NO in-post verify link: the
+    // labeler is the trust surface, and a link inside post content is
+    // author-controlled (so it can point at a convincing fake verifier).
+    // The nonce still guards replay and keys the `/verify?n=` receipt.
     let nonce = browserid_core::KeyPair::generate().public_key().to_base64();
-    let verify_url = format!("{BRIDGE}/verify?n={nonce}");
-
-    // Render the link as a compact clickable facet ("🔗 verify") rather than
-    // a bare URL: the label is the display text; the URL lives in the facet.
-    // Facet ranges are UTF-8 BYTE offsets. The facet is part of the record,
-    // so it's covered by the grantee's signature too.
-    let label = "🔗 verify";
-    let prefix = format!("{text}\n\n");
-    let byte_start = prefix.len();
-    let full_text = format!("{prefix}{label}");
-    let byte_end = full_text.len();
     let record = serde_json::json!({
         "$type": "app.bsky.feed.post",
-        "text": full_text,
+        "text": text,
         "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "facets": [{
-            "index": { "byteStart": byte_start, "byteEnd": byte_end },
-            "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": verify_url }],
-        }],
     });
 
     use browserid_core::KeyPair;
@@ -200,7 +184,9 @@ async fn post(text: &str) {
         std::process::exit(1);
     }
     println!("posted (signed): {}", body["uri"].as_str().unwrap_or("?"));
-    println!("verify: {verify_url}");
+    // The receipt URL, printed for the OPERATOR — deliberately not embedded in
+    // the post itself (the labeler is the trust surface).
+    println!("verify: {BRIDGE}/verify?n={nonce}");
 
     // Read it back from the PDS directly (public, unauthenticated).
     let listed: serde_json::Value = http

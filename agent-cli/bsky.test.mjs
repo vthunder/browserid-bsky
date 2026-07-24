@@ -33,18 +33,19 @@ test("content hash matches the Rust implementation", () => {
   assert.equal(contentHash(shuffled), HASH);
 });
 
-test("the verify facet covers the link, in UTF-8 byte offsets", () => {
-  const record = buildPostRecord({ text: "héllo 🌍", verifyUrl: "https://b/verify?n=N" });
-  const { byteStart, byteEnd } = record.facets[0].index;
-  const bytes = Buffer.from(record.text, "utf8");
-  assert.equal(bytes.subarray(byteStart, byteEnd).toString("utf8"), "🔗 verify");
-  assert.equal(record.facets[0].features[0].uri, "https://b/verify?n=N");
+test("a post record carries no in-post verify link", () => {
+  // The labeler is the trust surface; an author-controlled link in post
+  // content is phishable, so nothing here should add one.
+  const record = buildPostRecord({ text: "héllo 🌍" });
+  assert.equal(record.text, "héllo 🌍", "the text is the human's, unmodified");
+  assert.equal(record.facets, undefined, "no facets — no verify link");
+  assert.deepEqual(Object.keys(record).sort(), ["$type", "createdAt", "text"]);
 });
 
 test("an attestation signs the exact record and verifies against the access key", async () => {
   const { KeyPair, PublicKey } = await import("@browserid-ng/agent");
   const accessKey = KeyPair.generate();
-  const record = buildPostRecord({ text: "hi", verifyUrl: "https://b/verify?n=N" });
+  const record = buildPostRecord({ text: "hi" });
   const claims = attestationClaims({ did: "did:plc:abc", contentHash: contentHash(record), nonce: "N", iat: 1 });
   const sig = signAttestation(claims, accessKey);
   assert.ok(PublicKey.fromB64u(accessKey.publicKeyB64).verify(canonicalJson(claims), sig));
@@ -83,7 +84,8 @@ test("attestedPost sends the record, its attestation, and the access cert", asyn
   const { record, attestation } = seen.body;
   assert.equal(attestation.claims.content_hash, contentHash(record));
   assert.equal(attestation.claims.did, "did:plc:abc");
-  assert.ok(record.facets[0].features[0].uri.endsWith(attestation.claims.nonce));
+  assert.equal(record.facets, undefined, "no in-post verify link");
+  assert.ok(attestation.claims.nonce, "the nonce still guards replay and keys the receipt");
   assert.ok(PublicKey.fromB64u(accessKey.publicKeyB64).verify(canonicalJson(attestation.claims), attestation.sig));
   assert.equal(out.uri, "at://did:plc:abc/app.bsky.feed.post/xyz");
 });

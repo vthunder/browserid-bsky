@@ -40,21 +40,36 @@ rather than to us.
    check that the fingerprint matches what you displayed, and approve. The
    library then hands you a credential and the signed warrant.
 
-2. **Create the Bluesky account.** `POST {origin}/browserid/provision`
-   with `{{"presentation": "<your four-part bundle>", "handle": "<label>"}}`.
-   The handle becomes `<label>.{handle_domain}`. This must be a
-   **first-party** login — the identity provisioning the account has to be
-   the same identity that approved, so run it with the human's own
-   credential, not a delegated one. The response includes the DID, the full
-   handle, and a password shown **once** (for ordinary Bluesky clients — save
-   it or discard it deliberately).
+2. **Agree on a handle with the human — do not just pick one.** The handle is
+   public, permanent-ish, and theirs, not yours. Suggest two or three that fit
+   what the account is for, say what each would look like in full
+   (`<label>.{handle_domain}`), and let them choose or write their own. Then
+   register the one they picked.
 
-3. **Post.** `POST {origin}/browserid/post` with your bundle, the post text,
+3. **Create the Bluesky account.** `POST {origin}/browserid/provision`
+   with `{{"presentation": "<your four-part bundle>", "handle": "<label>"}}`.
+   This must be a **first-party** login — the identity provisioning the
+   account has to be the same identity that approved, so run it with the
+   human's own credential, not a delegated one. The response includes the DID,
+   the full handle, and a password shown **once** (for ordinary Bluesky
+   clients — offer it to the human to save, and do not keep a copy yourself).
+
+4. **Post.** `POST {origin}/browserid/post` with your bundle, the post text,
    and an **attestation**: a signature, made with your access key, over the
    exact content you are posting. This is the step that earns the badge — a
    post written through the plain proxy carries provenance but no
    attestation, and will not verify. The library builds the attestation for
    you.
+
+5. **Tell the human to subscribe to the labeler.** Without it, their posts
+   are verifiable but nothing *shows* — the badge only renders for people
+   subscribed to <https://bsky.app/profile/labeler.at.browserid.me>. Point
+   them there (Settings → Moderation lists it afterwards) so they can see
+   their own provenance, and so they know what a reader would see.
+
+Note that posts carry **no in-post verify link**. The labeler is the trust
+surface; a link inside post content is written by the author, so it can point
+at a convincing fake verifier — do not add one.
 
 Anything else under `/xrpc/` behaves like a normal atproto PDS. With a
 bridge token, requests are scope-checked against the human's warrant and
@@ -62,12 +77,12 @@ pinned to their repo; without one, traffic passes through untouched.
 
 ### Tooling
 
-**Node, no compiler — start here.** `@browserid-bsky/agent` runs the whole
-flow, including the attestation in step 3:
+**Node, no compiler — start here.** `@browserid-ng/bsky` runs the whole
+flow, including the attestation in step 4:
 
 ```sh
-npx -y @browserid-bsky/agent setup <handle>   # prints the approval link
-npx -y @browserid-bsky/agent post "hello"     # attested post
+npx -y @browserid-ng/bsky setup <handle>   # prints the approval link
+npx -y @browserid-ng/bsky post "hello"     # attested post
 ```
 
 `setup` prints an approval URL, a user code and a key fingerprint — show all
@@ -77,9 +92,7 @@ tools over a shell, `@browserid-ng/wallet` exposes the identity half
 (`provision`, `authorize`, `get_assertion`) over MCP.
 
 Both are built on `@browserid-ng/agent`, which implements this protocol in
-JavaScript. Until the updated packages are published, install them from
-source: <https://github.com/vthunder/browserid-ng> (`sdk/agent`, `sdk/wallet`)
-and <https://github.com/vthunder/browserid-bsky> (`agent-cli`).
+JavaScript.
 
 **Rust.** The reference implementation is the `browserid-agent` crate, driven
 by the `smoke` tool in <https://github.com/vthunder/browserid-bsky> — the same
