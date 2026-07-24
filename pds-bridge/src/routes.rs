@@ -413,16 +413,42 @@ async fn scoped_call(
         Ok(r) => r,
         Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
     };
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        match state.pds.refresh_session(&account.refresh_jwt).await {
-            Ok(s) => {
-                let _ = state.store.update_session(&token.did, &s.access_jwt, &s.refresh_jwt);
-                resp = match send(s.access_jwt, body.to_vec()).await {
-                    Ok(r) => r,
-                    Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
-                };
-            }
+    // The PDS signals an expired account access JWT as 401, or as 400 with
+    // `error: "ExpiredToken"`. On either, refresh via the refresh JWT and
+    // retry once. (We must peek the body to see the 400 case, so buffer it
+    // and rebuild the response if it turns out not to be an expiry.)
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+        || resp.status() == reqwest::StatusCode::BAD_REQUEST
+    {
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let ct = resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(String::from);
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
             Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
+        };
+        let expired = status == StatusCode::UNAUTHORIZED
+            || bytes.windows(12).any(|w| w == b"ExpiredToken");
+        if expired {
+            match state.pds.refresh_session(&account.refresh_jwt).await {
+                Ok(s) => {
+                    let _ = state.store.update_session(&token.did, &s.access_jwt, &s.refresh_jwt);
+                    resp = match send(s.access_jwt, body.to_vec()).await {
+                        Ok(r) => r,
+                        Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
+                    };
+                }
+                Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
+            }
+        } else {
+            // A genuine client error — relay it verbatim.
+            let _ = state.store.audit(&token, &nsid, "pds-error");
+            let mut b = Response::builder().status(status);
+            if let Some(ct) = ct {
+                b = b.header(header::CONTENT_TYPE, ct);
+            }
+            return b
+                .body(axum::body::Body::from(bytes))
+                .unwrap_or_else(|_| err(StatusCode::BAD_GATEWAY, "server_error", "relay failed"));
         }
     }
 
