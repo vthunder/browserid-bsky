@@ -133,3 +133,32 @@ mod tests {
         assert!(!renonced.verify(&kp.public_key(), &sig));
     }
 }
+
+#[cfg(test)]
+mod cross_impl_vector {
+    use super::*;
+
+    /// A FIXED vector the JavaScript implementation must reproduce byte for
+    /// byte (see the `attestation` test in the browserid-bsky agent CLI). If
+    /// this constant changes, the JS signer stops producing signatures this
+    /// bridge accepts — so treat a diff here as a protocol break, not a test
+    /// to update.
+    #[test]
+    fn canonical_json_and_content_hash_are_stable() {
+        let record = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "hello \"world\"\n",
+            "createdAt": "2026-07-24T00:00:00.000Z",
+            "facets": [{
+                "index": { "byteStart": 0, "byteEnd": 5 },
+                "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": "https://x/y?a=1&b=2" }],
+            }],
+            "langs": ["en"],
+        });
+        assert_eq!(
+            canonical_json(&record),
+            r#"{"$type":"app.bsky.feed.post","createdAt":"2026-07-24T00:00:00.000Z","facets":[{"features":[{"$type":"app.bsky.richtext.facet#link","uri":"https://x/y?a=1&b=2"}],"index":{"byteEnd":5,"byteStart":0}}],"langs":["en"],"text":"hello \"world\"\n"}"#
+        );
+        assert_eq!(content_hash(&record), "YyPkrj7WIS8fjNwoclhYN1MN1S_8igt7LivI4Tk1ps8");
+    }
+}

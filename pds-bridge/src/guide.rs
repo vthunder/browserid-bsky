@@ -62,18 +62,33 @@ pinned to their repo; without one, traffic passes through untouched.
 
 ### Tooling
 
-The reference implementation is the Rust `browserid-agent` crate, driven by
-the `smoke` tool in <https://github.com/vthunder/browserid-bsky>:
+**Node, no compiler — start here.** `@browserid-bsky/agent` runs the whole
+flow, including the attestation in step 3:
 
 ```sh
-cargo run -q -p smoke -- setup <handle-label>   # prints the approval URL
-cargo run -q -p smoke -- post "hello world"     # attested post
+npx -y @browserid-bsky/agent setup <handle>   # prints the approval link
+npx -y @browserid-bsky/agent post "hello"     # attested post
 ```
 
-A Node/MCP path that needs no compiler is in progress in
-<https://github.com/vthunder/browserid-ng>; until it lands, the JavaScript
-SDK there does **not** yet produce the four-part bundle this service
-requires, so use the Rust path.
+`setup` prints an approval URL, a user code and a key fingerprint — show all
+three to the human and wait. It stores the credential under
+`~/.browserid-bsky` and provisions the account. For an agent that prefers MCP
+tools over a shell, `@browserid-ng/wallet` exposes the identity half
+(`provision`, `authorize`, `get_assertion`) over MCP.
+
+Both are built on `@browserid-ng/agent`, which implements this protocol in
+JavaScript. Until the updated packages are published, install them from
+source: <https://github.com/vthunder/browserid-ng> (`sdk/agent`, `sdk/wallet`)
+and <https://github.com/vthunder/browserid-bsky> (`agent-cli`).
+
+**Rust.** The reference implementation is the `browserid-agent` crate, driven
+by the `smoke` tool in <https://github.com/vthunder/browserid-bsky> — the same
+flow, if you already have a toolchain:
+
+```sh
+cargo run -q -p smoke -- setup <handle-label>
+cargo run -q -p smoke -- post "hello world"
+```
 
 ## If you are a person
 
