@@ -1,11 +1,11 @@
 ---
 # browserid-bsky-n78o
 title: 'Post-attestation signatures: unforgeable post<->grantee binding (provenance phase 2)'
-status: in-progress
+status: completed
 type: feature
 priority: high
 created_at: 2026-07-24T15:59:35Z
-updated_at: 2026-07-24T18:56:19Z
+updated_at: 2026-07-24T19:01:41Z
 blocked_by:
     - browserid-bsky-27c0
 ---
@@ -20,3 +20,13 @@ Design:
 - Touches: agent SDK (sign at post time), bridge API (accept the signature alongside createRecord; can't be minted bridge-side without the grantee key), provenance record schema.
 
 Blocked-by/related: browserid-bsky-27c0 (phase 1), browserid-ng typed-signing design, i9rr (cross-issuer grantee).
+
+
+
+## DONE (2026-07-24) — live, unforgeable end to end
+
+POST /browserid/post: grantee signs {typ,did,collection,content_hash,nonce,iat} with the access key; bridge verifies sig<-access-cert<-grantee<-IdP, content_hash==exact post, iat freshness, single-use nonce reserve (replay guard) before create; embeds {claims,sig,accessCert} in provenance. Verifier recomputes content_hash from the PUBLISHED post, checks the grantee sig + nonce + cert chain -> postBindingVerified=true. Confirmed live: verify?n=... returns all 12 checks green, "unforgeable, independent of the PDS". Nonce triple-duty: replay guard + verify?n= link key + agent-chosen so the in-post link is inside the signed content (design A). Residual: access-cert->IdP uses .well-known (advisory); authoritative DNSSEC rooting at token exchange via hosted verifier — tighten with browserid-ng-kozn.
+
+## DONE (2026-07-24) — live, unforgeable end to end
+
+POST /browserid/post: grantee signs {typ,did,collection,content_hash,nonce,iat} with the access key; bridge verifies sig<-access-cert<-grantee<-IdP, content_hash==exact post, iat freshness, single-use nonce reserve (replay guard) before create; embeds {claims,sig,accessCert} in provenance. Verifier recomputes content_hash from the PUBLISHED post, checks the grantee sig + nonce + cert chain -> postBindingVerified=true. Confirmed live: all 12 checks green, 'unforgeable, independent of the PDS'. Nonce triple-duty: replay guard + verify?n= link key + agent-chosen so the in-post link is inside the signed content (design A). Residual: access-cert->IdP uses .well-known (advisory); authoritative DNSSEC rooting happens at token exchange via the hosted verifier — tighten with browserid-ng-kozn.

@@ -148,11 +148,25 @@ async fn post(text: &str) {
     // A random single-use nonce (base64url, url-safe). Chosen by the agent
     // before the post exists, so the signed content can embed the link.
     let nonce = browserid_core::KeyPair::generate().public_key().to_base64();
-    let text_with_link = format!("{text}\n\nverify: {BRIDGE}/verify?n={nonce}");
+    let verify_url = format!("{BRIDGE}/verify?n={nonce}");
+
+    // Render the link as a compact clickable facet ("🔗 verify") rather than
+    // a bare URL: the label is the display text; the URL lives in the facet.
+    // Facet ranges are UTF-8 BYTE offsets. The facet is part of the record,
+    // so it's covered by the grantee's signature too.
+    let label = "🔗 verify";
+    let prefix = format!("{text}\n\n");
+    let byte_start = prefix.len();
+    let full_text = format!("{prefix}{label}");
+    let byte_end = full_text.len();
     let record = serde_json::json!({
         "$type": "app.bsky.feed.post",
-        "text": text_with_link,
+        "text": full_text,
         "createdAt": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "facets": [{
+            "index": { "byteStart": byte_start, "byteEnd": byte_end },
+            "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": verify_url }],
+        }],
     });
 
     use browserid_core::KeyPair;
@@ -186,7 +200,7 @@ async fn post(text: &str) {
         std::process::exit(1);
     }
     println!("posted (signed): {}", body["uri"].as_str().unwrap_or("?"));
-    println!("verify: {BRIDGE}/verify?n={nonce}");
+    println!("verify: {verify_url}");
 
     // Read it back from the PDS directly (public, unauthenticated).
     let listed: serde_json::Value = http
