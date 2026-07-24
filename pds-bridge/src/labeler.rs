@@ -87,8 +87,11 @@ impl Labeler {
         })
     }
 
-    /// Build and sign a label on `uri` with value `val` at time `cts`.
-    pub fn sign_label(&self, uri: &str, val: &str, cts: &str) -> serde_json::Value {
+    /// Sign a label on `uri` with value `val` at time `cts`, returning the
+    /// raw 64-byte signature. The same signature is served two ways: as
+    /// `{"$bytes": …}` over JSON (`queryLabels`) and as a CBOR byte string
+    /// over the firehose (`subscribeLabels`).
+    pub fn sign(&self, uri: &str, val: &str, cts: &str) -> Vec<u8> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
             cts: &'a str,
@@ -103,15 +106,67 @@ impl Labeler {
         let digest = Sha256::digest(&cbor);
         let sig: Signature = self.signing_key.sign_prehash(&digest).expect("sign");
         let sig = sig.normalize_s(); // low-S required by atproto
-        let sig_bytes = sig.to_bytes(); // 64-byte compact r||s
+        sig.to_bytes().to_vec() // 64-byte compact r||s
+    }
+
+    /// Build and sign a label, JSON-shaped for `queryLabels`.
+    pub fn sign_label(&self, uri: &str, val: &str, cts: &str) -> serde_json::Value {
+        self.label_json(uri, val, cts, &self.sign(uri, val, cts))
+    }
+
+    /// JSON form of an already-signed label.
+    pub fn label_json(&self, uri: &str, val: &str, cts: &str, sig: &[u8]) -> serde_json::Value {
         serde_json::json!({
             "ver": 1,
             "src": self.did,
             "uri": uri,
             "val": val,
             "cts": cts,
-            "sig": { "$bytes": B64.encode(sig_bytes) },
+            "sig": { "$bytes": B64.encode(sig) },
         })
+    }
+
+    /// One `subscribeLabels` message: an atproto event-stream frame, which
+    /// is two concatenated DAG-CBOR objects — a header naming the event
+    /// type, then the body. `seq` is the consumer's cursor.
+    pub fn labels_frame(&self, l: &crate::store::EmittedLabel) -> Vec<u8> {
+        #[derive(Serialize)]
+        struct Header<'a> {
+            t: &'a str,
+            op: i64,
+        }
+        #[derive(Serialize)]
+        struct Label<'a> {
+            // Field order is the canonical DAG-CBOR map order (keys of equal
+            // length, sorted bytewise) — serde_ipld_dagcbor writes struct
+            // fields as declared, so the declaration IS the encoding.
+            cts: &'a str,
+            #[serde(with = "serde_bytes")]
+            sig: &'a [u8],
+            src: &'a str,
+            uri: &'a str,
+            val: &'a str,
+            ver: i64,
+        }
+        #[derive(Serialize)]
+        struct Body<'a> {
+            seq: i64,
+            labels: Vec<Label<'a>>,
+        }
+        let mut frame = serde_ipld_dagcbor::to_vec(&Header { t: "#labels", op: 1 }).expect("hdr");
+        let body = Body {
+            seq: l.seq,
+            labels: vec![Label {
+                cts: &l.cts,
+                sig: &l.sig,
+                src: &self.did,
+                uri: &l.uri,
+                val: &l.val,
+                ver: 1,
+            }],
+        };
+        frame.extend_from_slice(&serde_ipld_dagcbor::to_vec(&body).expect("body"));
+        frame
     }
 }
 
@@ -154,6 +209,63 @@ mod tests {
         assert_eq!(label["src"], plc, "labels issue under the subscribable account DID");
         // The self-hosted did:web document still describes did:web (same key).
         assert_eq!(l.did_document()["id"], "did:web:bsky.browserid.me");
+    }
+
+    /// A `subscribeLabels` frame must decode as header-then-body, with the
+    /// signature as a CBOR byte string (not the JSON `$bytes` wrapper), and
+    /// the signature must verify — this is exactly what the AppView does
+    /// before storing a label, and getting it wrong means silent rejection.
+    #[test]
+    fn firehose_frame_decodes_and_verifies() {
+        let l = Labeler::new(&test_key(), "https://bsky.browserid.me", None).unwrap();
+        let uri = "at://did:plc:abc/app.bsky.feed.post/xyz";
+        let cts = "2026-07-24T00:00:00.000Z";
+        let stored = crate::store::EmittedLabel {
+            seq: 7,
+            uri: uri.into(),
+            val: LABEL_VERIFIED.into(),
+            cts: cts.into(),
+            sig: l.sign(uri, LABEL_VERIFIED, cts),
+        };
+
+        #[derive(serde::Deserialize)]
+        struct Header { t: String, op: i64 }
+        #[derive(serde::Deserialize)]
+        struct DecodedLabel {
+            cts: String,
+            #[serde(with = "serde_bytes")]
+            sig: Vec<u8>,
+            src: String,
+            uri: String,
+            val: String,
+            ver: i64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Body { seq: i64, labels: Vec<DecodedLabel> }
+
+        let frame = l.labels_frame(&stored);
+        // `_once` leaves the reader positioned after the first object — the
+        // frame is two objects back to back, which is how consumers read it.
+        let mut cur = std::io::Cursor::new(frame);
+        let h: Header = serde_ipld_dagcbor::de::from_reader_once(&mut cur).expect("header");
+        assert_eq!((h.t.as_str(), h.op), ("#labels", 1));
+        let body: Body = serde_ipld_dagcbor::de::from_reader_once(&mut cur).expect("body");
+        assert_eq!(body.seq, 7, "seq is the consumer's cursor");
+        let got = &body.labels[0];
+        assert_eq!((got.uri.as_str(), got.val.as_str(), got.ver), (uri, LABEL_VERIFIED, 1));
+        assert_eq!(got.src, l.did);
+        assert_eq!(got.sig.len(), 64);
+
+        #[derive(Serialize)]
+        struct Unsigned<'a> { cts: &'a str, src: &'a str, uri: &'a str, val: &'a str, ver: i64 }
+        let digest = Sha256::digest(
+            &serde_ipld_dagcbor::to_vec(&Unsigned {
+                cts: &got.cts, src: &got.src, uri: &got.uri, val: &got.val, ver: got.ver,
+            })
+            .unwrap(),
+        );
+        let sig = Signature::from_slice(&got.sig).unwrap();
+        assert!(l.signing_key.verifying_key().verify_prehash(&digest, &sig).is_ok());
     }
 
     #[test]

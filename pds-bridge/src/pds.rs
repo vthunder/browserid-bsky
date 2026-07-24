@@ -44,6 +44,11 @@ pub struct PdsClient {
 }
 
 impl PdsClient {
+    /// The network-internal PDS base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     pub fn new(base: impl Into<String>, admin_password: impl Into<String>) -> Self {
         Self {
             base: base.into().trim_end_matches('/').to_string(),

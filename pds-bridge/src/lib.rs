@@ -71,11 +71,31 @@ pub struct BridgeState {
     /// The atproto labeler (signs labels for verified posts); None if no
     /// signing key is configured.
     pub labeler: Option<crate::labeler::Labeler>,
+    /// Fan-out to live `subscribeLabels` consumers. Labels are PUSHED: the
+    /// AppView ingests this stream into its own index and serves badges from
+    /// there, so an unstreamed label is invisible no matter what
+    /// `queryLabels` says.
+    pub label_tx: tokio::sync::broadcast::Sender<crate::store::EmittedLabel>,
+}
+
+/// Live-stream backlog per consumer. A slow consumer that overruns this is
+/// disconnected rather than silently skipped — it reconnects with its cursor
+/// and backfills from the store, so nothing is lost.
+const LABEL_CHANNEL_CAPACITY: usize = 1024;
+
+/// Build the label fan-out channel (used by `BridgeState` construction).
+pub fn label_channel() -> tokio::sync::broadcast::Sender<crate::store::EmittedLabel> {
+    tokio::sync::broadcast::channel(LABEL_CHANNEL_CAPACITY).0
 }
 
 impl BridgeState {
     pub fn router(self) -> axum::Router {
-        let state = Arc::new(self);
+        Self::router_from(Arc::new(self))
+    }
+
+    /// Router over an already-shared state, so callers that need the `Arc`
+    /// too (e.g. to spawn the startup label backfill) can keep it.
+    pub fn router_from(state: Arc<Self>) -> axum::Router {
         axum::Router::new()
             .route("/browserid/provision", axum::routing::post(routes::provision))
             .route("/browserid/token", axum::routing::post(routes::token))
@@ -88,6 +108,10 @@ impl BridgeState {
             .route("/verify", axum::routing::get(routes::verify))
             .route("/.well-known/did.json", axum::routing::get(routes::did_json))
             .route("/xrpc/com.atproto.label.queryLabels", axum::routing::get(routes::query_labels))
+            .route(
+                "/xrpc/com.atproto.label.subscribeLabels",
+                axum::routing::get(routes::subscribe_labels),
+            )
             .fallback(routes::proxy)
             .with_state(state)
     }

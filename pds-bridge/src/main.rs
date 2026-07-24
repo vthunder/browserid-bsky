@@ -68,11 +68,16 @@ async fn main() {
         pds: pds_bridge::pds::PdsClient::new(pds_url, pds_admin_password),
         http,
         labeler,
+        label_tx: pds_bridge::label_channel(),
     };
+    let state = Arc::new(state);
+    // Posts made before the labeler existed still need to reach the
+    // firehose — that stream, not queryLabels, is what renders badges.
+    tokio::spawn(pds_bridge::routes::backfill_labels(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .expect("failed to bind");
     tracing::info!("pds-bridge listening on :{port} (origin {origin})");
-    axum::serve(listener, state.router()).await.expect("server error");
+    axum::serve(listener, BridgeState::router_from(state)).await.expect("server error");
 }

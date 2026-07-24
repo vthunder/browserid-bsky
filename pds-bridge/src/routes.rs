@@ -306,7 +306,6 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
                 .collect()
         })
         .unwrap_or_default();
-    let cts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut labels = Vec::new();
     for uri in patterns.iter().take(200) {
         // Exact post at-uris only (ignore wildcard patterns for v1).
@@ -314,15 +313,12 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
         if coll != "app.bsky.feed.post" {
             continue;
         }
-        // Which of the two provenance paths this post took decides the badge;
-        // an unverifiable post gets no label at all (absence is the signal).
-        if let Some(on_behalf) = fully_verified(&state, &did, &rkey).await {
-            let val = if on_behalf {
-                crate::labeler::LABEL_ON_BEHALF
-            } else {
-                crate::labeler::LABEL_VERIFIED
-            };
-            labels.push(labeler.sign_label(uri, val, &cts));
+        // Evaluating here doubles as a catch-up path: a post nobody has
+        // labeled yet gets one now, and it goes out on the firehose too, so
+        // both surfaces always show the same label with the same `cts`.
+        emit_label(&state, &did, &rkey).await;
+        if let Ok(stored) = state.store.labels_for(uri) {
+            labels.extend(stored.iter().map(|l| labeler.label_json(&l.uri, &l.val, &l.cts, &l.sig)));
         }
     }
     Json(serde_json::json!({ "labels": labels })).into_response()
@@ -333,6 +329,131 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
 /// unforgeable grantee attestation over this exact post. The bar for
 /// emitting a label. (Shares logic with the `/verify` handler; a future
 /// refactor extracts one `evaluate_post` — bean kozn-adjacent.)
+/// GET /xrpc/com.atproto.label.subscribeLabels — the labeler firehose, and
+/// the only delivery path that actually renders badges: the AppView ingests
+/// this stream into its own label index (it does **not** call queryLabels on
+/// the read path). Backfills everything above `cursor`, then tails live.
+pub async fn subscribe_labels(
+    State(state): State<S>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+    raw: axum::extract::RawQuery,
+) -> Response {
+    if state.labeler.is_none() {
+        return (StatusCode::NOT_FOUND, "labeler not configured").into_response();
+    }
+    let cursor: i64 = reqwest::Url::parse(&format!("http://x/?{}", raw.0.unwrap_or_default()))
+        .ok()
+        .and_then(|u| u.query_pairs().find(|(k, _)| k == "cursor").and_then(|(_, v)| v.parse().ok()))
+        .unwrap_or(0);
+    ws.on_upgrade(move |socket| stream_labels(state, socket, cursor))
+}
+
+async fn stream_labels(state: S, mut socket: axum::extract::ws::WebSocket, cursor: i64) {
+    use axum::extract::ws::Message;
+    let labeler = state.labeler.as_ref().expect("checked before upgrade");
+    // Subscribe BEFORE backfilling so a label emitted mid-backfill is queued
+    // rather than lost in the gap between the two.
+    let mut live = state.label_tx.subscribe();
+    let mut sent_through = cursor;
+    loop {
+        let batch = match state.store.labels_since(sent_through, 500) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("subscribeLabels backfill failed: {e}");
+                return;
+            }
+        };
+        if batch.is_empty() {
+            break;
+        }
+        for l in &batch {
+            if socket.send(Message::Binary(labeler.labels_frame(l))).await.is_err() {
+                return;
+            }
+            sent_through = l.seq;
+        }
+    }
+    loop {
+        match live.recv().await {
+            Ok(l) => {
+                // Skip anything the backfill already covered.
+                if l.seq <= sent_through {
+                    continue;
+                }
+                if socket.send(Message::Binary(labeler.labels_frame(&l))).await.is_err() {
+                    return;
+                }
+                sent_through = l.seq;
+            }
+            // Lagged: the consumer will reconnect with its cursor and
+            // backfill the gap from the store, so just drop it.
+            Err(_) => return,
+        }
+    }
+}
+
+/// Label any post in a hosted repo that carries provenance but has no label
+/// yet. Run at startup so posts made before the labeler existed (or while it
+/// was down) enter the firehose; idempotent, so repeated runs are cheap.
+pub async fn backfill_labels(state: S) {
+    if state.labeler.is_none() {
+        return;
+    }
+    let accounts = match state.store.all_accounts() {
+        Ok(a) => a,
+        Err(e) => return tracing::warn!("label backfill: {e}"),
+    };
+    for account in accounts {
+        let url = format!("{}/xrpc/com.atproto.repo.listRecords", state.pds.base_url());
+        let resp = state
+            .http
+            .get(&url)
+            .query(&[
+                ("repo", account.did.as_str()),
+                ("collection", "me.browserid.provenance"),
+                ("limit", "100"),
+            ])
+            .send()
+            .await;
+        let Ok(v) = resp else { continue };
+        let Ok(v) = v.json::<serde_json::Value>().await else { continue };
+        let Some(records) = v["records"].as_array() else { continue };
+        for r in records {
+            // The provenance record shares its rkey with the post it describes.
+            let Some((_, _, rkey)) = r["uri"].as_str().and_then(parse_at_uri) else { continue };
+            emit_label(&state, &account.did, &rkey).await;
+        }
+    }
+}
+
+/// Verify a post and, if it earns a label, sign + persist + broadcast one.
+/// Idempotent: a subject that already has a label is left alone, which keeps
+/// firehose sequence numbers stable.
+pub async fn emit_label(state: &S, did: &str, rkey: &str) {
+    let Some(labeler) = &state.labeler else { return };
+    let uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
+    match state.store.label_emitted(&uri) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!("label lookup failed: {e}");
+            return;
+        }
+    }
+    let Some(on_behalf) = fully_verified(state, did, rkey).await else { return };
+    let val = if on_behalf { crate::labeler::LABEL_ON_BEHALF } else { crate::labeler::LABEL_VERIFIED };
+    let cts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let sig = labeler.sign(&uri, val, &cts);
+    match state.store.insert_label(&uri, val, &cts, &sig) {
+        Ok(Some(l)) => {
+            tracing::info!("labeled {uri} {val} (seq {})", l.seq);
+            let _ = state.label_tx.send(l); // no subscribers is fine
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("storing label failed: {e}"),
+    }
+}
+
 /// Returns `Some(on_behalf)` when the post fully verifies — `on_behalf` is
 /// true when grantor != grantee (a delegate acted for another identity) —
 /// and `None` when anything fails to check out.
@@ -1298,7 +1419,11 @@ async fn write_provenance(
         .await
     {
         tracing::warn!("provenance: record write failed: {e}");
+        return;
     }
+    // The post is now verifiable, so label it and push it to the firehose —
+    // that stream is what puts the badge in front of subscribers.
+    emit_label(state, &account.did, rkey).await;
 }
 
 /// Transparent forward of anything that isn't bridge-token traffic.

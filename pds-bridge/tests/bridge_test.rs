@@ -172,6 +172,7 @@ async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<S
         pds: PdsClient::new(mock_pds(captures.clone()).await, "admin-secret"),
         http: reqwest::Client::new(),
         labeler: None,
+        label_tx: pds_bridge::label_channel(),
     };
     (axum_test::TestServer::new(state.router()).unwrap(), cache, captures)
 }

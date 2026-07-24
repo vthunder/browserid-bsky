@@ -73,6 +73,20 @@ pub struct StoredWarrant {
     pub record_uri: Option<String>,
 }
 
+/// A label this labeler has emitted, with its firehose sequence number.
+/// Stored so `subscribeLabels` consumers can resume from a cursor: the
+/// AppView ingests labels from the stream and serves them from its own
+/// index, so a label that was never streamed is a label nobody sees.
+#[derive(Debug, Clone)]
+pub struct EmittedLabel {
+    pub seq: i64,
+    pub uri: String,
+    pub val: String,
+    pub cts: String,
+    /// 64-byte compact k256 signature over the label's DAG-CBOR
+    pub sig: Vec<u8>,
+}
+
 /// SHA-256 (base64url) of a JWS — the dedup key for a warrant.
 pub fn warrant_hash(warrant_jws: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(warrant_jws.as_bytes()))
@@ -126,6 +140,14 @@ impl Store {
                  warrant_jws     TEXT NOT NULL,
                  config_cert_jws TEXT NOT NULL,
                  record_uri      TEXT
+             );
+             CREATE TABLE IF NOT EXISTS labels (
+                 seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+                 uri  TEXT NOT NULL,
+                 val  TEXT NOT NULL,
+                 cts  TEXT NOT NULL,
+                 sig  BLOB NOT NULL,
+                 UNIQUE (uri, val)
              );
              CREATE TABLE IF NOT EXISTS audit_log (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,6 +224,24 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Every account this bridge provisioned — the set whose repos are worth
+    /// scanning for posts that still need a label.
+    pub fn all_accounts(&self) -> Result<Vec<Account>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT email, did, handle, access_jwt, refresh_jwt FROM accounts")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Account {
+                email: r.get(0)?,
+                did: r.get(1)?,
+                handle: r.get(2)?,
+                access_jwt: r.get(3)?,
+                refresh_jwt: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn handle_taken(&self, handle: &str) -> Result<bool> {
@@ -407,6 +447,77 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    // -- labels ------------------------------------------------------------
+
+    /// Record a signed label. The `seq` is the labeler firehose cursor, so
+    /// labels must be stored exactly once and never renumbered — a consumer
+    /// resuming at `cursor` expects everything above it, in order. Returns
+    /// `None` if this (uri, val) was already emitted.
+    pub fn insert_label(&self, uri: &str, val: &str, cts: &str, sig: &[u8]) -> Result<Option<EmittedLabel>> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO labels (uri, val, cts, sig) VALUES (?1, ?2, ?3, ?4)",
+            params![uri, val, cts, sig],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(EmittedLabel {
+            seq: conn.last_insert_rowid(),
+            uri: uri.to_string(),
+            val: val.to_string(),
+            cts: cts.to_string(),
+            sig: sig.to_vec(),
+        }))
+    }
+
+    /// Whether any label has been emitted for a subject (the cheap check
+    /// that keeps backfill from re-verifying every known post).
+    pub fn label_emitted(&self, uri: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT 1 FROM labels WHERE uri = ?1 LIMIT 1", params![uri], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    /// Every label emitted on a subject.
+    pub fn labels_for(&self, uri: &str) -> Result<Vec<EmittedLabel>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT seq, uri, val, cts, sig FROM labels WHERE uri = ?1 ORDER BY seq")?;
+        let rows = stmt.query_map(params![uri], |r| {
+            Ok(EmittedLabel {
+                seq: r.get(0)?,
+                uri: r.get(1)?,
+                val: r.get(2)?,
+                cts: r.get(3)?,
+                sig: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Labels with `seq > cursor`, oldest first — the firehose backfill.
+    pub fn labels_since(&self, cursor: i64, limit: i64) -> Result<Vec<EmittedLabel>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT seq, uri, val, cts, sig FROM labels WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![cursor, limit], |r| {
+            Ok(EmittedLabel {
+                seq: r.get(0)?,
+                uri: r.get(1)?,
+                val: r.get(2)?,
+                cts: r.get(3)?,
+                sig: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     // -- audit -------------------------------------------------------------
