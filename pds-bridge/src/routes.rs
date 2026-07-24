@@ -34,6 +34,11 @@ pub struct Verified {
     pub holder: String,
     pub scopes: Vec<String>,
     pub warrant_status: Option<StatusRef>,
+    /// The signed delegation artifacts, kept so the bridge can publish a
+    /// `me.browserid.warrant` record and reference it from provenance
+    /// (bean 27c0 phase 1).
+    pub warrant_jws: String,
+    pub config_cert_jws: String,
 }
 
 /// Verify a presentation by **outsourcing to the hosted verifier**
@@ -83,6 +88,8 @@ async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, 
             .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
             .unwrap_or_else(|| wc.scopes.clone()),
         warrant_status: wc.status.clone(),
+        warrant_jws: pres.warrant.encoded().to_string(),
+        config_cert_jws: pres.config_cert.encoded().to_string(),
     })
 }
 
@@ -218,6 +225,21 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
     // Store the raw strings that survived parsing, verbatim.
     let granted: Vec<String> = raw.iter().filter(|s| crate::scopes::Scope::parse(s).is_some()).cloned().collect();
 
+    // Persist the delegation artifacts (idempotent) so the post path can
+    // publish/reference a single me.browserid.warrant record (bean 27c0).
+    let warrant_ref = crate::store::warrant_hash(&identity.warrant_jws);
+    if let Err(e) = state.store.upsert_warrant(&crate::store::StoredWarrant {
+        hash: warrant_ref.clone(),
+        did: account.did.clone(),
+        grantor: identity.grantor.clone(),
+        grantee: identity.grantee.clone(),
+        warrant_jws: identity.warrant_jws.clone(),
+        config_cert_jws: identity.config_cert_jws.clone(),
+        record_uri: None,
+    }) {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string());
+    }
+
     let token = BridgeToken {
         did: account.did,
         grantor: identity.grantor,
@@ -225,6 +247,7 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
         holder: identity.holder,
         scopes: granted.clone(),
         warrant_status: identity.warrant_status.map(|r| (r.uri, r.idx)),
+        warrant_ref,
         expires_at: Utc::now() + Duration::minutes(TOKEN_TTL_MINUTES),
     };
     match state.store.issue_token(&token) {
@@ -403,12 +426,107 @@ async fn scoped_call(
         }
     }
 
-    let _ = state.store.audit(
-        &token,
-        &nsid,
-        if resp.status().is_success() { "ok" } else { "pds-error" },
-    );
+    let success = resp.status().is_success();
+    let _ = state.store.audit(&token, &nsid, if success { "ok" } else { "pds-error" });
+
+    // On a successful post creation, write sidecar provenance (bean 27c0
+    // phase 1). Buffer the PDS response so we can read the new record's
+    // uri/cid, then relay the same bytes back.
+    let is_post_create = method == "POST"
+        && nsid == "com.atproto.repo.createRecord"
+        && json_body.as_ref().and_then(|b| b["collection"].as_str()) == Some("app.bsky.feed.post");
+    if success && is_post_create {
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string()),
+        };
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(uri) = v["uri"].as_str() {
+                write_provenance(state, &token, &account, uri, v["cid"].as_str()).await;
+            }
+        }
+        let mut b = Response::builder().status(status);
+        if let Some(ct) = ct {
+            b = b.header(header::CONTENT_TYPE, ct);
+        }
+        return b
+            .body(axum::body::Body::from(bytes))
+            .unwrap_or_else(|_| err(StatusCode::BAD_GATEWAY, "server_error", "relay failed"));
+    }
+
     relay_response(resp).await
+}
+
+/// Write the sidecar provenance for a just-created post: ensure the
+/// warrant record exists once (dedup), then a per-post provenance record
+/// referencing it. Failures are logged, not fatal — the post already
+/// succeeded. Phase 1: the post↔grantee link is PDS-asserted (see bean
+/// browserid-bsky-n78o for the unforgeable signature).
+async fn write_provenance(
+    state: &S,
+    token: &crate::store::BridgeToken,
+    account: &Account,
+    post_uri: &str,
+    post_cid: Option<&str>,
+) {
+    let Ok(Some(w)) = state.store.warrant_by_hash(&token.warrant_ref) else {
+        tracing::warn!(reff = %token.warrant_ref, "provenance: warrant not found");
+        return;
+    };
+
+    // Ensure the warrant record is published exactly once.
+    let warrant_record_uri = match w.record_uri.clone() {
+        Some(u) => u,
+        None => {
+            let record = serde_json::json!({
+                "$type": "me.browserid.warrant",
+                "warrant": w.warrant_jws,
+                "configCert": w.config_cert_jws,
+                "attributedTo": w.grantor,
+                "executedBy": w.grantee,
+            });
+            match state
+                .pds
+                .put_record(&account.did, "me.browserid.warrant", Some(&token.warrant_ref), record, &account.access_jwt)
+                .await
+            {
+                Ok(uri) => {
+                    let _ = state.store.set_warrant_record_uri(&token.warrant_ref, &uri);
+                    uri
+                }
+                Err(e) => {
+                    tracing::warn!("provenance: warrant record write failed: {e}");
+                    return;
+                }
+            }
+        }
+    };
+
+    // Per-post provenance, rkey = the post's rkey (1:1, findable).
+    let rkey = post_uri.rsplit('/').next().unwrap_or_default();
+    let mut prov = serde_json::json!({
+        "$type": "me.browserid.provenance",
+        "post": post_uri,
+        "warrant": warrant_record_uri,
+        "attributedTo": token.grantor,
+        "executedBy": token.grantee,
+    });
+    if let Some(cid) = post_cid {
+        prov["postCid"] = serde_json::Value::String(cid.to_string());
+    }
+    if let Err(e) = state
+        .pds
+        .put_record(&account.did, "me.browserid.provenance", Some(rkey), prov, &account.access_jwt)
+        .await
+    {
+        tracing::warn!("provenance: record write failed: {e}");
+    }
 }
 
 /// Transparent forward of anything that isn't bridge-token traffic.

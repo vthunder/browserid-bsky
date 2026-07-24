@@ -54,8 +54,8 @@ fn presentation(
     )
 }
 
-/// A mock PDS answering the four calls the bridge makes.
-async fn mock_pds() -> String {
+/// A mock PDS answering the calls the bridge makes; captures repo writes.
+async fn mock_pds(captures: Captures) -> String {
     let app = axum::Router::new()
         .route(
             "/xrpc/com.atproto.server.createInviteCode",
@@ -78,20 +78,38 @@ async fn mock_pds() -> String {
         )
         .route(
             "/xrpc/com.atproto.repo.createRecord",
-            post(|headers: axum::http::HeaderMap, Json(body): Json<Value>| async move {
-                assert_eq!(
-                    headers.get("authorization").and_then(|v| v.to_str().ok()),
-                    Some("Bearer pds-access-1"),
-                    "bridge must present the account session"
-                );
-                Json(json!({ "uri": format!("at://{}/{}/rkey1", body["repo"].as_str().unwrap(), body["collection"].as_str().unwrap()), "cid": "cid1" }))
+            post(|axum::extract::State(cap): axum::extract::State<Captures>, Json(body): Json<Value>| async move {
+                let coll = body["collection"].as_str().unwrap();
+                let rkey = if coll == "app.bsky.feed.post" { "rkey1" } else { "auto" };
+                cap.lock().unwrap().push(body.clone());
+                Json(json!({ "uri": format!("at://{}/{}/{}", body["repo"].as_str().unwrap(), coll, rkey), "cid": "cid1" }))
             }),
         )
-        .route("/xrpc/app.bsky.actor.getProfile", get(|| async { Json(json!({ "handle": "public" })) }));
+        .route(
+            "/xrpc/com.atproto.repo.putRecord",
+            post(|axum::extract::State(cap): axum::extract::State<Captures>, Json(body): Json<Value>| async move {
+                cap.lock().unwrap().push(body.clone());
+                Json(json!({ "uri": format!("at://{}/{}/{}", body["repo"].as_str().unwrap(), body["collection"].as_str().unwrap(), body["rkey"].as_str().unwrap_or("auto")), "cid": "cid1" }))
+            }),
+        )
+        .route("/xrpc/app.bsky.actor.getProfile", get(|| async { Json(json!({ "handle": "public" })) }))
+        .with_state(captures.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     base
+}
+
+type Captures = Arc<std::sync::Mutex<Vec<Value>>>;
+
+/// Records the bridge wrote to the account repo (for provenance assertions).
+fn captured(cap: &Captures, collection: &str) -> Vec<Value> {
+    cap.lock()
+        .unwrap()
+        .iter()
+        .filter(|b| b["collection"] == collection)
+        .cloned()
+        .collect()
 }
 
 /// A mock hosted verifier: runs the REAL core verification algorithm
@@ -137,12 +155,13 @@ async fn mock_broker(idp_pub: PublicKey) -> String {
     base
 }
 
-async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<StatusCache>) {
+async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<StatusCache>, Captures) {
     let cache = Arc::new(StatusCache::new());
     let list = StatusList::from_revoked(revoked.iter().copied(), 64);
     let token = StatusListToken::create(ISSUER, STATUS_URI, &list, idp).unwrap();
     cache.insert(STATUS_URI, token);
 
+    let captures: Captures = Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = BridgeState {
         origin: ORIGIN.to_string(),
         handle_domain: "at.browserid.test".to_string(),
@@ -150,10 +169,10 @@ async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<S
         broker_key: idp.public_key(),
         status_cache: cache.clone(),
         store: Store::open_in_memory().unwrap(),
-        pds: PdsClient::new(mock_pds().await, "admin-secret"),
+        pds: PdsClient::new(mock_pds(captures.clone()).await, "admin-secret"),
         http: reqwest::Client::new(),
     };
-    (axum_test::TestServer::new(state.router()).unwrap(), cache)
+    (axum_test::TestServer::new(state.router()).unwrap(), cache, captures)
 }
 
 async fn provision(server: &axum_test::TestServer, idp: &KeyPair, email: &str, handle: &str) -> Value {
@@ -176,7 +195,7 @@ fn exchange_form(pres: &str) -> Vec<(String, String)> {
 #[tokio::test]
 async fn provision_token_post_end_to_end() {
     let idp = KeyPair::generate();
-    let (server, _) = bridge(&idp, &[]).await;
+    let (server, _, cap) = bridge(&idp, &[]).await;
 
     // 1. Provision: browserid login → PDS account + binding.
     let account = provision(&server, &idp, "dan@sandmill.test", "dan").await;
@@ -207,6 +226,24 @@ async fn provision_token_post_end_to_end() {
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
     assert!(resp.text().contains("at://did:plc:testuser/app.bsky.feed.post"));
 
+    // 3b. Sidecar provenance was written (bean 27c0 phase 1): one warrant
+    // record (verifiable delegation artifacts) + one per-post provenance
+    // record referencing it. This exchange used grantor != grantee, so it's
+    // the ON-BEHALF shape: executed_by (the delegate) differs from
+    // attributed_to (the authorizer whose repo the post lives in).
+    let warrants = captured(&cap, "me.browserid.warrant");
+    assert_eq!(warrants.len(), 1, "one warrant record");
+    assert!(!warrants[0]["record"]["warrant"].as_str().unwrap().is_empty(), "carries warrant JWS");
+    assert!(!warrants[0]["record"]["configCert"].as_str().unwrap().is_empty(), "carries config cert");
+
+    let prov = captured(&cap, "me.browserid.provenance");
+    assert_eq!(prov.len(), 1, "one provenance record");
+    let pr = &prov[0]["record"];
+    assert_eq!(pr["post"], "at://did:plc:testuser/app.bsky.feed.post/rkey1");
+    assert_eq!(pr["attributedTo"], "dan@sandmill.test", "authorizer / repo owner");
+    assert_eq!(pr["executedBy"], "dan+agent@sandmill.test", "on-behalf: delegate differs");
+    assert!(pr["warrant"].as_str().unwrap().contains("me.browserid.warrant"), "references the warrant record");
+
     // 4. Outside the warrant: delete is not covered → 403.
     let resp = server
         .post("/xrpc/com.atproto.repo.deleteRecord")
@@ -235,7 +272,7 @@ async fn provision_token_post_end_to_end() {
 #[tokio::test]
 async fn warrant_revocation_kills_live_tokens() {
     let idp = KeyPair::generate();
-    let (server, cache) = bridge(&idp, &[]).await;
+    let (server, cache, _) = bridge(&idp, &[]).await;
     provision(&server, &idp, "dan@sandmill.test", "dan").await;
 
     let pres = presentation(
@@ -270,7 +307,7 @@ async fn warrant_revocation_kills_live_tokens() {
 #[tokio::test]
 async fn exchange_requires_provisioned_grantor_and_usable_scopes() {
     let idp = KeyPair::generate();
-    let (server, _) = bridge(&idp, &[]).await;
+    let (server, _, _) = bridge(&idp, &[]).await;
 
     // Unprovisioned grantor → 403 with a provisioning hint.
     let pres = presentation(
@@ -295,7 +332,7 @@ async fn exchange_requires_provisioned_grantor_and_usable_scopes() {
 #[tokio::test]
 async fn provisioning_rules() {
     let idp = KeyPair::generate();
-    let (server, _) = bridge(&idp, &[]).await;
+    let (server, _, _) = bridge(&idp, &[]).await;
 
     // Reserved and malformed labels refused.
     for label in ["admin", "xrpc", "A_b", "-dash", "x"] {
@@ -330,7 +367,7 @@ async fn provisioning_rules() {
 #[tokio::test]
 async fn passthrough_and_metadata() {
     let idp = KeyPair::generate();
-    let (server, _) = bridge(&idp, &[]).await;
+    let (server, _, _) = bridge(&idp, &[]).await;
 
     // Anonymous XRPC reads pass straight through to the PDS.
     let resp = server.get("/xrpc/app.bsky.actor.getProfile").await;

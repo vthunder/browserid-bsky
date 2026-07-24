@@ -51,7 +51,31 @@ pub struct BridgeToken {
     pub scopes: Vec<String>,
     /// Warrant revocation ref, re-checked on use (design doc §Revocation)
     pub warrant_status: Option<(String, u64)>,
+    /// Hash of the warrant JWS this token was issued from — links to the
+    /// `warrants` table so provenance records can reference the published
+    /// warrant record (bean 27c0 phase 1).
+    pub warrant_ref: String,
     pub expires_at: DateTime<Utc>,
+}
+
+/// The signed delegation artifacts a token was issued from, persisted so the
+/// bridge can publish a `me.browserid.warrant` record ONCE and reference it
+/// from every post's provenance (rather than repeating it per post).
+#[derive(Debug, Clone)]
+pub struct StoredWarrant {
+    pub hash: String,
+    pub did: String,
+    pub grantor: String,
+    pub grantee: String,
+    pub warrant_jws: String,
+    pub config_cert_jws: String,
+    /// AT-URI of the published `me.browserid.warrant` record, once written
+    pub record_uri: Option<String>,
+}
+
+/// SHA-256 (base64url) of a JWS — the dedup key for a warrant.
+pub fn warrant_hash(warrant_jws: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(warrant_jws.as_bytes()))
 }
 
 pub struct Store {
@@ -86,7 +110,17 @@ impl Store {
                  scopes         TEXT NOT NULL,
                  warrant_uri    TEXT,
                  warrant_idx    INTEGER,
+                 warrant_ref    TEXT NOT NULL DEFAULT '',
                  expires_at     TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS warrants (
+                 hash            TEXT PRIMARY KEY,
+                 did             TEXT NOT NULL,
+                 grantor         TEXT NOT NULL,
+                 grantee         TEXT NOT NULL,
+                 warrant_jws     TEXT NOT NULL,
+                 config_cert_jws TEXT NOT NULL,
+                 record_uri      TEXT
              );
              CREATE TABLE IF NOT EXISTS audit_log (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,8 +223,8 @@ impl Store {
         };
         self.conn.lock().unwrap().execute(
             "INSERT INTO tokens (token_hash, did, grantor, grantee, holder, scopes,
-                                 warrant_uri, warrant_idx, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                 warrant_uri, warrant_idx, warrant_ref, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 Self::hash(&token),
                 t.did,
@@ -200,6 +234,7 @@ impl Store {
                 serde_json::to_string(&t.scopes).map_err(|e| StoreError(e.to_string()))?,
                 uri,
                 idx,
+                t.warrant_ref,
                 t.expires_at.to_rfc3339(),
             ],
         )?;
@@ -213,7 +248,7 @@ impl Store {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT did, grantor, grantee, holder, scopes, warrant_uri, warrant_idx, expires_at
+                "SELECT did, grantor, grantee, holder, scopes, warrant_uri, warrant_idx, warrant_ref, expires_at
                  FROM tokens WHERE token_hash = ?1",
                 params![Self::hash(bearer)],
                 |r| {
@@ -226,11 +261,12 @@ impl Store {
                         r.get::<_, Option<String>>(5)?,
                         r.get::<_, Option<i64>>(6)?,
                         r.get::<_, String>(7)?,
+                        r.get::<_, String>(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((did, grantor, grantee, holder, scopes, uri, idx, exp)) = row else {
+        let Some((did, grantor, grantee, holder, scopes, uri, idx, warrant_ref, exp)) = row else {
             return Ok(None);
         };
         let expires_at = DateTime::parse_from_rfc3339(&exp)
@@ -246,8 +282,57 @@ impl Store {
             holder,
             scopes: serde_json::from_str(&scopes).map_err(|e| StoreError(e.to_string()))?,
             warrant_status: uri.zip(idx).map(|(u, i)| (u, i as u64)),
+            warrant_ref,
             expires_at,
         }))
+    }
+
+    // -- warrants ----------------------------------------------------------
+
+    /// Persist the delegation artifacts (idempotent by hash). Called at token
+    /// exchange so the post-time path can publish/reference the warrant record.
+    pub fn upsert_warrant(&self, w: &StoredWarrant) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO warrants (hash, did, grantor, grantee, warrant_jws, config_cert_jws, record_uri)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT(hash) DO NOTHING",
+            params![w.hash, w.did, w.grantor, w.grantee, w.warrant_jws, w.config_cert_jws],
+        )?;
+        Ok(())
+    }
+
+    pub fn warrant_by_hash(&self, hash: &str) -> Result<Option<StoredWarrant>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT hash, did, grantor, grantee, warrant_jws, config_cert_jws, record_uri
+                 FROM warrants WHERE hash = ?1",
+                params![hash],
+                |r| {
+                    Ok(StoredWarrant {
+                        hash: r.get(0)?,
+                        did: r.get(1)?,
+                        grantor: r.get(2)?,
+                        grantee: r.get(3)?,
+                        warrant_jws: r.get(4)?,
+                        config_cert_jws: r.get(5)?,
+                        record_uri: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Record the AT-URI of the published `me.browserid.warrant` record so
+    /// later posts reference it instead of republishing.
+    pub fn set_warrant_record_uri(&self, hash: &str, record_uri: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE warrants SET record_uri = ?2 WHERE hash = ?1",
+            params![hash, record_uri],
+        )?;
+        Ok(())
     }
 
     /// Drop every token bound to a warrant status ref (used when a re-check
@@ -284,6 +369,7 @@ mod tests {
             holder: "svc.agent".into(),
             scopes: vec!["repo:app.bsky.feed.post?action=create".into()],
             warrant_status: Some(("https://browserid.me/.well-known/browserid-status".into(), 42)),
+            warrant_ref: "wh_test".into(),
             expires_at: Utc::now() + Duration::minutes(exp_mins),
         }
     }

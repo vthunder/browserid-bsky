@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: normal
 created_at: 2026-07-24T11:59:18Z
-updated_at: 2026-07-24T14:19:12Z
+updated_at: 2026-07-24T15:10:14Z
 ---
 
 Run a stock @atproto/pds plus a Rust pds-bridge sidecar (browserid-rp) at bsky.browserid.me: browserid-provisioned Bluesky accounts, agent warrants with atproto granular scopes (repo:app.bsky.feed.post?action=create, blob:image/*), RFC 7521 bundle->token exchange verified fail-closed, scoped XRPC proxy, receipts + revocation. Design: docs/plans/2026-07-24-bsky-pds-bridge-design.md
@@ -23,7 +23,7 @@ Related beans in browserid-ng: pv9b (browserid.me-rooted handles), 4lxl (fail-cl
 - [ ] P1d-2: Namecheap A records (bsky + pds.bsky -> sandmill.org) [DAN]; then letsencrypt:enable both apps; switch bridge PDS_URL to https
 - [ ] P1d-3: stage-1 smoke test (provision -> consent -> agent post -> revoke)
 - [~] Stage 2a: relay requestCrawl sent; post ingested by AppView (bsky.app). Author shows as bare DID/handle — NO agent/warrant attribution yet (that's P2 provenance).
-- [~] Stage 2b: handle verification for *.at.browserid.me — plumbing done (PDS serves atproto-did per Host; nginx routes *.at.browserid.me->PDS; acme.sh installed). BLOCKED on manual: deSEC account+token, Namecheap wildcard-A + _acme-challenge CNAME (see docs/plans/2026-07-24-handle-verification-wildcard-cert.md)
+- [x] Stage 2b: handle verification LIVE for *.at.browserid.me. SAN cert (pds.bsky + *.at) via deSEC alias DNS-01, auto-renewing (acme.sh cron + deploy hook -> dokku certs:add). AppView resolveHandle(claude.at.browserid.me)->DID confirmed. Runbook: docs/plans/2026-07-24-handle-verification-wildcard-cert.md. Zero per-handle work for future handles.
 - [ ] P2: provenance — linkage attestation (repo record + alsoKnownAs), me.browserid.provenance receipts and/or labeler
 - [ ] P3: evaluate rsky-pds in-process integration (collapse the proxy)
 - [ ] P4: upstream proposal to atproto community (bundle-native delegation)

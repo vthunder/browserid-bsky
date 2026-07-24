@@ -149,4 +149,43 @@ impl PdsClient {
         }
         Ok(req.send().await?)
     }
+
+    /// Create/replace a record in the account's own repo (used by the bridge
+    /// to write `me.browserid.*` provenance records). `rkey` = `None` lets
+    /// the PDS assign a TID (createRecord); `Some` upserts (putRecord).
+    /// Returns the record's AT-URI.
+    pub async fn put_record(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: Option<&str>,
+        record: serde_json::Value,
+        access_jwt: &str,
+    ) -> Result<String> {
+        let (method, mut body) = match rkey {
+            Some(rk) => (
+                "com.atproto.repo.putRecord",
+                serde_json::json!({ "repo": did, "collection": collection, "rkey": rk, "record": record }),
+            ),
+            None => (
+                "com.atproto.repo.createRecord",
+                serde_json::json!({ "repo": did, "collection": collection, "record": record }),
+            ),
+        };
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("validate".into(), serde_json::Value::Bool(false)); // custom lexicon
+        }
+        let resp = self
+            .http
+            .post(format!("{}/xrpc/{}", self.base, method))
+            .bearer_auth(access_jwt)
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Self::refused(resp).await);
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v["uri"].as_str().unwrap_or_default().to_string())
+    }
 }
