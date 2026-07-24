@@ -10,12 +10,14 @@ WORKDIR /build
 # git and land in this cached layer too)
 COPY Cargo.toml Cargo.lock ./
 COPY pds-bridge/Cargo.toml pds-bridge/
+COPY smoke/Cargo.toml smoke/
 
-RUN mkdir -p pds-bridge/src && \
+RUN mkdir -p pds-bridge/src smoke/src && \
     echo "pub fn dummy() {}" > pds-bridge/src/lib.rs && \
     echo "fn main() {}" > pds-bridge/src/main.rs && \
+    echo "fn main() {}" > smoke/src/main.rs && \
     cargo build --release --package pds-bridge && \
-    rm -rf pds-bridge/src
+    rm -rf pds-bridge/src smoke/src
 
 COPY pds-bridge/src pds-bridge/src
 

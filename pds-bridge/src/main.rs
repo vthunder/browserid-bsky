@@ -26,20 +26,30 @@ async fn main() {
     let pds_admin_password = std::env::var("PDS_ADMIN_PASSWORD")
         .expect("PDS_ADMIN_PASSWORD is required (the stock PDS admin secret)");
     let broker_url = env_or("BROKER_URL", "https://browserid.me");
+    // Additional trusted primary IdPs (comma-separated base URLs). The RP
+    // decides which issuers it accepts (spec §6.1); keys fetched from each
+    // IdP's /.well-known/browserid.
+    let trusted_idps = env_or("TRUSTED_IDPS", "");
     let db_path = env_or("BRIDGE_DB", "pds-bridge.db");
 
     // Fail-closed by default (4lxl): status lists are refreshed on demand in
     // the handlers; unknown status → reject.
     let status_cache = Arc::new(StatusCache::new());
-    // TODO(ezk6/P2): DNSSEC-rooted issuer discovery for primary-IdP users;
-    // P1 trusts the configured broker as the accepted fallback, like the
-    // other reference RPs.
-    let verifier = Verifier::new(origin.clone())
+    // TODO(ezk6/P2): DNSSEC-rooted issuer discovery instead of a static
+    // well-known-fetched trust table.
+    let mut verifier = Verifier::new(origin.clone())
         .trust_issuer_from_well_known(&broker_url)
         .await
         .expect("failed to fetch broker key")
         .with_scopes(ADVERTISED_SCOPES.iter().copied())
         .with_status_cache(status_cache.clone());
+    for idp in trusted_idps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        verifier = verifier
+            .trust_issuer_from_well_known(idp)
+            .await
+            .unwrap_or_else(|e| panic!("failed to fetch key for trusted IdP {idp}: {e}"));
+        tracing::info!("trusting primary IdP {idp}");
+    }
 
     let state = BridgeState {
         origin: origin.clone(),

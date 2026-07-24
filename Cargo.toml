@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "pds-bridge",
+    "smoke",
 ]
 
 [workspace.package]
@@ -15,6 +16,7 @@ repository = "https://github.com/vthunder/browserid-bsky"
 # `cargo update -p browserid-core -p browserid-rp`)
 browserid-core = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
 browserid-rp = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
+browserid-agent = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

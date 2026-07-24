@@ -1,0 +1,15 @@
+[package]
+name = "smoke"
+description = "Stage-1 smoke test driver: provision -> warrant -> post -> revoke against a live bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+browserid-agent = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
