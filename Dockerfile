@@ -21,7 +21,10 @@ RUN mkdir -p pds-bridge/src smoke/src && \
 
 COPY pds-bridge/src pds-bridge/src
 
-RUN touch pds-bridge/src/lib.rs pds-bridge/src/main.rs && \
+# smoke is a workspace member but not shipped — restore a dummy target so
+# the workspace resolves.
+RUN mkdir -p smoke/src && echo "fn main() {}" > smoke/src/main.rs && \
+    touch pds-bridge/src/lib.rs pds-bridge/src/main.rs && \
     cargo build --release --package pds-bridge
 
 # Stage 2: Runtime
