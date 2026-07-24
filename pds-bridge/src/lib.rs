@@ -19,6 +19,7 @@
 //! the algorithm as a crate (bean browserid-ng-kozn).
 
 pub mod attestation;
+pub mod guide;
 pub mod labeler;
 pub mod pds;
 pub mod routes;
@@ -104,6 +105,8 @@ impl BridgeState {
                 "/.well-known/oauth-authorization-server",
                 axum::routing::get(routes::oauth_metadata),
             )
+            .route("/", axum::routing::get(routes::root))
+            .route("/llms.txt", axum::routing::get(routes::llms_txt))
             .route("/browserid/health", axum::routing::get(|| async { "ok" }))
             .route("/verify", axum::routing::get(routes::verify))
             .route("/.well-known/did.json", axum::routing::get(routes::did_json))

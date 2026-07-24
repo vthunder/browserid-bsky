@@ -329,6 +329,32 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
 /// unforgeable grantee attestation over this exact post. The bar for
 /// emitting a label. (Shares logic with the `/verify` handler; a future
 /// refactor extracts one `evaluate_post` — bean kozn-adjacent.)
+/// GET / — what a visitor finds at the origin. An agent told to "set up an
+/// account at bsky.browserid.me" lands here, so it must answer that
+/// instruction rather than show a service banner. Browsers get HTML, every
+/// other client gets the Markdown source.
+pub async fn root(State(state): State<S>, headers: HeaderMap) -> Response {
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+    if wants_html {
+        axum::response::Html(crate::guide::guide_html(&state.origin, &state.handle_domain))
+            .into_response()
+    } else {
+        markdown(crate::guide::guide_markdown(&state.origin, &state.handle_domain))
+    }
+}
+
+/// GET /llms.txt — the same instructions, at the address agents look first.
+pub async fn llms_txt(State(state): State<S>) -> Response {
+    markdown(crate::guide::guide_markdown(&state.origin, &state.handle_domain))
+}
+
+fn markdown(body: String) -> Response {
+    ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], body).into_response()
+}
+
 /// GET /xrpc/com.atproto.label.subscribeLabels — the labeler firehose, and
 /// the only delivery path that actually renders badges: the AppView ingests
 /// this stream into its own label index (it does **not** call queryLabels on
