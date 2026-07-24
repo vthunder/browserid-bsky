@@ -278,6 +278,241 @@ pub async fn oauth_metadata(State(state): State<S>) -> Json<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// GET /verify?uri=<post at-uri>[&format=json] — provenance receipt
+// ---------------------------------------------------------------------------
+//
+// Reads the post's me.browserid.provenance + referenced me.browserid.warrant
+// off the repo and verifies the DELEGATION from the published records — not
+// by trusting the bridge. Honest phase-1 caveat: the post<->grantee link is
+// PDS-asserted until the grantee signature lands (bean n78o).
+
+#[derive(serde::Deserialize)]
+pub struct VerifyQuery {
+    pub uri: String,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+/// Resolve a did:plc/did:web to its atproto PDS endpoint (so the verifier
+/// works for any account, not only ours).
+async fn resolve_pds(state: &S, did: &str) -> Option<String> {
+    let doc: serde_json::Value = state
+        .http
+        .get(format!("https://plc.directory/{did}"))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    doc["service"]
+        .as_array()?
+        .iter()
+        .find(|s| s["id"] == "#atproto_pds")
+        .and_then(|s| s["serviceEndpoint"].as_str())
+        .map(String::from)
+}
+
+async fn get_record(state: &S, pds: &str, did: &str, collection: &str, rkey: &str) -> Option<serde_json::Value> {
+    let v: serde_json::Value = state
+        .http
+        .get(format!("{pds}/xrpc/com.atproto.repo.getRecord"))
+        .query(&[("repo", did), ("collection", collection), ("rkey", rkey)])
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    v.get("value").cloned()
+}
+
+/// Split `at://did/collection/rkey` → (did, collection, rkey).
+fn parse_at_uri(uri: &str) -> Option<(String, String, String)> {
+    let rest = uri.strip_prefix("at://")?;
+    let mut parts = rest.splitn(3, '/');
+    Some((parts.next()?.to_string(), parts.next()?.to_string(), parts.next()?.to_string()))
+}
+
+fn root_identity(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => format!("{}@{}", local.split('+').next().unwrap_or(local), domain),
+        None => email.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod verify_tests {
+    use super::{parse_at_uri, root_identity};
+
+    #[test]
+    fn at_uri_parsing() {
+        let (did, coll, rkey) =
+            parse_at_uri("at://did:plc:abc/app.bsky.feed.post/3krfx").unwrap();
+        assert_eq!(did, "did:plc:abc");
+        assert_eq!(coll, "app.bsky.feed.post");
+        assert_eq!(rkey, "3krfx");
+        assert!(parse_at_uri("https://x/y").is_none());
+        assert!(parse_at_uri("at://did:plc:abc/only-two").is_none());
+    }
+
+    #[test]
+    fn root_strips_subaddress() {
+        assert_eq!(root_identity("danmills+bluesky@sandmill.org"), "danmills@sandmill.org");
+        assert_eq!(root_identity("dan@sandmill.org"), "dan@sandmill.org");
+        assert_eq!(root_identity("weird"), "weird");
+    }
+}
+
+pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extract::Query<VerifyQuery>) -> Response {
+    let want_json = q.format.as_deref() == Some("json");
+    let fail = |status: StatusCode, reason: &str| -> Response {
+        if want_json {
+            (status, Json(serde_json::json!({ "ok": false, "reason": reason }))).into_response()
+        } else {
+            (status, axum::response::Html(verify_html_err(reason))).into_response()
+        }
+    };
+
+    let Some((did, _coll, rkey)) = parse_at_uri(&q.uri) else {
+        return fail(StatusCode::BAD_REQUEST, "not an at:// post URI");
+    };
+    let Some(pds) = resolve_pds(&state, &did).await else {
+        return fail(StatusCode::NOT_FOUND, "could not resolve the account's PDS");
+    };
+
+    let Some(prov) = get_record(&state, &pds, &did, "me.browserid.provenance", &rkey).await else {
+        return fail(StatusCode::NOT_FOUND, "no browserid provenance for this post");
+    };
+    let warrant_uri = prov["warrant"].as_str().unwrap_or_default();
+    let Some((wdid, wcoll, wrkey)) = parse_at_uri(warrant_uri) else {
+        return fail(StatusCode::UNPROCESSABLE_ENTITY, "provenance references no warrant record");
+    };
+    let Some(wrec) = get_record(&state, &pds, &wdid, &wcoll, &wrkey).await else {
+        return fail(StatusCode::NOT_FOUND, "referenced warrant record missing");
+    };
+
+    // Verify the delegation from the published artifacts.
+    let (warrant_jws, cc_jws) = (wrec["warrant"].as_str().unwrap_or(""), wrec["configCert"].as_str().unwrap_or(""));
+    let (Ok(warrant), Ok(cc)) = (
+        browserid_core::device::Warrant::parse(warrant_jws),
+        browserid_core::device::DeviceCert::parse(cc_jws),
+    ) else {
+        return fail(StatusCode::UNPROCESSABLE_ENTITY, "malformed warrant/config-cert");
+    };
+    let wc = warrant.claims();
+    let grantor = wc.grantor.clone();
+    let grantee = wc.grantee.clone();
+
+    // IdP key for the config cert's issuer (advisory well-known fetch; the
+    // authoritative DNSSEC-rooted check runs at post time via the hosted
+    // verifier — stated in the receipt).
+    let iss = cc.claims().iss.clone();
+    let idp_key = fetch_well_known_key(&state, &iss).await;
+
+    let mut checks = serde_json::Map::new();
+    let mut ok = true;
+    let mut check = |name: &str, pass: bool, checks: &mut serde_json::Map<String, serde_json::Value>, ok: &mut bool| {
+        checks.insert(name.into(), serde_json::Value::Bool(pass));
+        if !pass { *ok = false; }
+    };
+    check("warrant_signed_by_config_cert", warrant.verify(cc.public_key()).is_ok(), &mut checks, &mut ok);
+    check("config_cert_authoritative_for_grantor", cc.authorizes_identity(&grantor), &mut checks, &mut ok);
+    match &idp_key {
+        Some(k) => check("config_cert_signed_by_idp", cc.verify(k).is_ok(), &mut checks, &mut ok),
+        None => check("config_cert_signed_by_idp", false, &mut checks, &mut ok),
+    }
+    check("audience_is_this_bridge", wc.audience == state.origin, &mut checks, &mut ok);
+    let now = chrono::Utc::now().timestamp();
+    check("warrant_unexpired", now < wc.exp, &mut checks, &mut ok);
+    check("provenance_matches_warrant",
+        prov["attributedTo"].as_str() == Some(&grantor) && prov["executedBy"].as_str() == Some(&grantee),
+        &mut checks, &mut ok);
+
+    let root = root_identity(&grantor);
+    let result = serde_json::json!({
+        "ok": ok,
+        "post": q.uri,
+        "attributedTo": grantor,
+        "executedBy": grantee,
+        "root": root,
+        "onBehalf": grantor != grantee,
+        "audience": wc.audience,
+        "scopes": wc.scopes,
+        "issuer": iss,
+        "delegationVerified": ok,
+        "checks": serde_json::Value::Object(checks),
+        "warrantRecord": warrant_uri,
+        "caveat": "Phase 1: the delegation is verified from the published records, but the link from this exact post to the grantee is asserted by the PDS. A grantee signature (bean n78o) will make it unforgeable.",
+    });
+    if want_json {
+        Json(result).into_response()
+    } else {
+        axum::response::Html(verify_html(&result)).into_response()
+    }
+}
+
+async fn fetch_well_known_key(state: &S, domain: &str) -> Option<browserid_core::PublicKey> {
+    let doc: browserid_core::discovery::SupportDocument = state
+        .http
+        .get(format!("https://{domain}/.well-known/browserid"))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    doc.public_key
+}
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn verify_html_err(reason: &str) -> String {
+    format!(
+        "<!doctype html><meta charset=utf-8><title>browserid verify</title>\
+         <div style='font:16px system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem'>\
+         <h1>Not verifiable</h1><p>{}</p></div>",
+        esc(reason)
+    )
+}
+
+fn verify_html(r: &serde_json::Value) -> String {
+    let ok = r["ok"].as_bool().unwrap_or(false);
+    let badge = if ok { "✓ delegation verified" } else { "✗ verification failed" };
+    let color = if ok { "#0a7d33" } else { "#b00020" };
+    let on_behalf = r["onBehalf"].as_bool().unwrap_or(false);
+    let relation = if on_behalf {
+        format!("<b>{}</b> posted <b>on behalf of</b> <b>{}</b>", esc(r["executedBy"].as_str().unwrap_or("")), esc(r["attributedTo"].as_str().unwrap_or("")))
+    } else {
+        format!("<b>{}</b> posted as itself", esc(r["attributedTo"].as_str().unwrap_or("")))
+    };
+    let scopes = r["scopes"].as_array().map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    let rows = r["checks"].as_object().map(|m| {
+        m.iter().map(|(k, v)| format!("<tr><td>{}</td><td>{}</td></tr>", esc(k), if v.as_bool().unwrap_or(false) {"✓"} else {"✗"})).collect::<String>()
+    }).unwrap_or_default();
+    format!(
+        "<!doctype html><meta charset=utf-8><title>browserid verify</title>\
+         <div style='font:16px/1.5 system-ui;max-width:44rem;margin:3rem auto;padding:0 1rem'>\
+         <div style='color:{color};font-weight:700;font-size:1.3rem'>{badge}</div>\
+         <p style='font-size:1.1rem'>{relation}, authorized under <b>{root}</b>.</p>\
+         <p>Audience: <code>{aud}</code><br>Scopes: <code>{scopes}</code><br>IdP: <code>{iss}</code></p>\
+         <table style='border-collapse:collapse' cellpadding=6>{rows}</table>\
+         <p style='color:#666;font-size:.9rem;margin-top:1.5rem'>{caveat}</p>\
+         <p style='color:#999;font-size:.8rem'>Post: <code>{post}</code></p></div>",
+        color = color, badge = badge, relation = relation,
+        root = esc(r["root"].as_str().unwrap_or("")),
+        aud = esc(r["audience"].as_str().unwrap_or("")),
+        scopes = esc(&scopes), iss = esc(r["issuer"].as_str().unwrap_or("")),
+        rows = rows, caveat = esc(r["caveat"].as_str().unwrap_or("")),
+        post = esc(r["post"].as_str().unwrap_or("")),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // /xrpc/* — scoped proxy (bridge tokens) / transparent passthrough (rest)
 // ---------------------------------------------------------------------------
 

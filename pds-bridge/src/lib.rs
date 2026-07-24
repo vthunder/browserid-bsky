@@ -79,6 +79,7 @@ impl BridgeState {
                 axum::routing::get(routes::oauth_metadata),
             )
             .route("/browserid/health", axum::routing::get(|| async { "ok" }))
+            .route("/verify", axum::routing::get(routes::verify))
             .fallback(routes::proxy)
             .with_state(state)
     }

@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-07-24T14:52:18Z
-updated_at: 2026-07-24T15:59:56Z
+updated_at: 2026-07-24T16:22:46Z
 ---
 
 atproto has NO native 'on behalf of' — every post's author is the repo DID. Both warrant shapes post as the same DID; the grantor/grantee distinction lives only in the browserid warrant and must be surfaced as ADDED data.
@@ -40,3 +40,9 @@ Grantee signs the post -> provenance carries the signature. See sibling bean. Th
 
 ### Both paths demo
 Exercise on-behalf (grantor!=grantee, same issuer; cross-issuer needs browserid-ng i9rr) and show the two provenance records differ only by executedBy!=attributedTo.
+
+
+
+## Phase 1 DONE (2026-07-24) — live in production
+
+Sidecar records writing on every warranted post: me.browserid.warrant (once, deduped, holds warrant+config-cert JWS) + me.browserid.provenance (per post, references it, {post, postCid, attributedTo, executedBy}). Verified on the real repo (did:plc:c4arw...). Fixes en route: idempotent tokens.warrant_ref migration; refresh account session on 400 ExpiredToken (not just 401); use refreshed session for provenance writes. Both paths covered by tests (e2e exercises on-behalf). Lexicon doc: docs/lexicons/me.browserid.provenance.md. Next: verifier app (reads these), then in-post link + labeler.
