@@ -19,6 +19,7 @@
 //! the algorithm as a crate (bean browserid-ng-kozn).
 
 pub mod attestation;
+pub mod labeler;
 pub mod pds;
 pub mod routes;
 pub mod scopes;
@@ -67,6 +68,9 @@ pub struct BridgeState {
     pub store: Store,
     pub pds: PdsClient,
     pub http: reqwest::Client,
+    /// The atproto labeler (signs labels for verified posts); None if no
+    /// signing key is configured.
+    pub labeler: Option<crate::labeler::Labeler>,
 }
 
 impl BridgeState {
@@ -82,6 +86,8 @@ impl BridgeState {
             )
             .route("/browserid/health", axum::routing::get(|| async { "ok" }))
             .route("/verify", axum::routing::get(routes::verify))
+            .route("/.well-known/did.json", axum::routing::get(routes::did_json))
+            .route("/xrpc/com.atproto.label.queryLabels", axum::routing::get(routes::query_labels))
             .fallback(routes::proxy)
             .with_state(state)
     }

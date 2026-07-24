@@ -278,6 +278,104 @@ pub async fn oauth_metadata(State(state): State<S>) -> Json<serde_json::Value> {
 }
 
 // ---------------------------------------------------------------------------
+// Labeler: DID doc + com.atproto.label.queryLabels
+// ---------------------------------------------------------------------------
+
+/// GET /.well-known/did.json — the did:web labeler document.
+pub async fn did_json(State(state): State<S>) -> Response {
+    match &state.labeler {
+        Some(l) => Json(l.did_document()).into_response(),
+        None => (StatusCode::NOT_FOUND, "labeler not configured").into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct QueryLabelsParams {
+    #[serde(rename = "uriPatterns", default)]
+    pub uri_patterns: Vec<String>,
+}
+
+/// GET /xrpc/com.atproto.label.queryLabels — return a signed label for each
+/// requested post URI that is fully browserid-verified. bsky.app's AppView
+/// applies these for users who subscribe to this labeler.
+pub async fn query_labels(
+    State(state): State<S>,
+    axum::extract::Query(q): axum::extract::Query<QueryLabelsParams>,
+) -> Response {
+    let Some(labeler) = &state.labeler else {
+        return (StatusCode::NOT_FOUND, "labeler not configured").into_response();
+    };
+    let cts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut labels = Vec::new();
+    for uri in q.uri_patterns.iter().take(200) {
+        // Exact post at-uris only (ignore wildcard patterns for v1).
+        let Some((did, coll, rkey)) = parse_at_uri(uri) else { continue };
+        if coll != "app.bsky.feed.post" {
+            continue;
+        }
+        if fully_verified(&state, &did, &rkey).await {
+            labels.push(labeler.sign_label(uri, crate::labeler::LABEL_VERIFIED, &cts));
+        }
+    }
+    Json(serde_json::json!({ "labels": labels })).into_response()
+}
+
+/// Full public-grade verification of a post: delegation (warrant ← config
+/// cert ← IdP, authoritative for grantor, audience, unexpired) AND the
+/// unforgeable grantee attestation over this exact post. The bar for
+/// emitting a label. (Shares logic with the `/verify` handler; a future
+/// refactor extracts one `evaluate_post` — bean kozn-adjacent.)
+async fn fully_verified(state: &S, did: &str, rkey: &str) -> bool {
+    let Some((pds, _)) = resolve_did_doc(state, did).await else { return false };
+    let Some(prov) = get_record(state, &pds, did, "me.browserid.provenance", rkey).await else {
+        return false;
+    };
+    let Some((wd, wc_, wk)) = prov["warrant"].as_str().and_then(parse_at_uri) else { return false };
+    let Some(wrec) = get_record(state, &pds, &wd, &wc_, &wk).await else { return false };
+    let (Ok(warrant), Ok(cc)) = (
+        browserid_core::device::Warrant::parse(wrec["warrant"].as_str().unwrap_or("")),
+        browserid_core::device::DeviceCert::parse(wrec["configCert"].as_str().unwrap_or("")),
+    ) else {
+        return false;
+    };
+    let w = warrant.claims();
+    let grantor = &w.grantor;
+    let grantee = &w.grantee;
+    // Delegation.
+    if warrant.verify(cc.public_key()).is_err() || !cc.authorizes_identity(grantor) {
+        return false;
+    }
+    if w.audience != state.origin || Utc::now().timestamp() >= w.exp {
+        return false;
+    }
+    match fetch_well_known_key(state, &cc.claims().iss).await {
+        Some(k) if cc.verify(&k).is_ok() => {}
+        _ => return false,
+    }
+    if prov["attributedTo"].as_str() != Some(grantor.as_str())
+        || prov["executedBy"].as_str() != Some(grantee.as_str())
+    {
+        return false;
+    }
+    // Unforgeable attestation over this exact post.
+    let Some(att) = prov.get("attestation") else { return false };
+    let claims: Option<crate::attestation::AttestationClaims> =
+        serde_json::from_value(att["claims"].clone()).ok();
+    let sig = att["sig"].as_str().unwrap_or("");
+    let acc = att["accessCert"].as_str().and_then(|c| browserid_core::device::AccessCert::parse(c).ok());
+    let post = get_record(state, &pds, did, "app.bsky.feed.post", rkey).await;
+    let (Some(cl), Some(a), Some(rec)) = (claims, acc, post) else { return false };
+    let ac = a.claims();
+    let idp_ok = matches!(fetch_well_known_key(state, &ac.iss).await, Some(k) if a.verify(&k).is_ok());
+    cl.verify(&ac.access_key, sig)
+        && ac.identity == *grantee
+        && cl.content_hash == crate::attestation::content_hash(&rec)
+        && cl.iat < ac.exp
+        && prov["nonce"].as_str() == Some(cl.nonce.as_str())
+        && idp_ok
+}
+
+// ---------------------------------------------------------------------------
 // POST /browserid/post — attributed (signed) post (provenance phase 2)
 // ---------------------------------------------------------------------------
 

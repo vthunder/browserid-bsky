@@ -48,6 +48,14 @@ async fn main() {
         .expect("bad broker support document");
     let broker_key = doc.public_key.expect("broker support document has no key");
 
+    // Labeler (optional): k256 signing key → signs labels for verified posts.
+    let labeler = std::env::var("LABELER_K256_PRIVATE_KEY_HEX").ok().map(|hex| {
+        pds_bridge::labeler::Labeler::new(&hex, &origin).expect("bad LABELER_K256_PRIVATE_KEY_HEX")
+    });
+    if let Some(l) = &labeler {
+        tracing::info!("labeler enabled: {}", l.did);
+    }
+
     let state = BridgeState {
         origin: origin.clone(),
         handle_domain,
@@ -58,6 +66,7 @@ async fn main() {
         store: Store::open(&db_path).expect("failed to open bridge db"),
         pds: pds_bridge::pds::PdsClient::new(pds_url, pds_admin_password),
         http,
+        labeler,
     };
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))

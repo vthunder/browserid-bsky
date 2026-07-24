@@ -22,7 +22,10 @@ tracing-subscriber = { workspace = true }
 rusqlite = { workspace = true }
 base64 = { workspace = true }
 rand = { workspace = true }
-sha2 = { workspace = true }
+sha2.workspace = true
+k256 = "0.14.0"
+serde_ipld_dagcbor = "0.6.4"
+bs58 = "0.5.1"
 
 [dev-dependencies]
 axum-test = "16"
