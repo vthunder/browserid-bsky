@@ -5,7 +5,7 @@ status: todo
 type: feature
 priority: high
 created_at: 2026-07-24T20:50:36Z
-updated_at: 2026-07-24T21:02:39Z
+updated_at: 2026-07-24T21:24:53Z
 ---
 
 Dan (2026-07-24): this should be browserid's FLAGSHIP demo. The narrative:
@@ -80,3 +80,30 @@ demo than as-itself.
   AccessPresentation is four parts; sdk/agent/src/protocol.mjs builds three
   and has no access cert. So the JS path can't provision AND can't attest —
   no badge.
+
+## Gap 2 CLOSED 2026-07-24 — the Node path exists
+
+browserid-ng-gu5j done: sdk/agent now speaks the current device-cert
+protocol (four-part presentation, access certs, assertion signed by the
+access key), and sdk/wallet's MCP server is ported to it.
+
+This repo gained agent-cli/ (@browserid-bsky/agent): `setup <handle>` runs
+the consent flow and provisions the account, `post "text"` publishes an
+attested post. bsky.mjs holds the bsky-specific half — canonical JSON,
+content hash, attestation claims, verify-link facet. Cross-implementation
+vector pinned in both attestation.rs and bsky.test.mjs.
+
+The guide (pds-bridge/src/guide.rs, served at the origin) now leads with the
+Node path and keeps Rust as the alternative.
+
+## What is NOT done
+
+- NEITHER package is published to npm with these changes, so the `npx`
+  one-liners in the guide do not work yet — the guide says so and points at
+  the repos. Publishing @browserid-ng/agent + @browserid-ng/wallet +
+  @browserid-bsky/agent is the next concrete step.
+- The Node path has never been run END TO END against production. Every
+  piece is unit-tested against mocks and the wire shapes are checked against
+  the Rust implementation, but the live run (which needs a human to approve)
+  has not happened. Do that before calling the demo real.
+- The on-behalf path still has no live run.
