@@ -5,7 +5,7 @@ status: todo
 type: feature
 priority: high
 created_at: 2026-07-24T20:50:36Z
-updated_at: 2026-07-24T20:50:36Z
+updated_at: 2026-07-24T21:02:39Z
 ---
 
 Dan (2026-07-24): this should be browserid's FLAGSHIP demo. The narrative:
@@ -63,3 +63,20 @@ Related: bean htjb (end-to-end setup guide for any browserid email) is the
 human-facing version of the same walkthrough and should probably merge into
 this. The on-behalf path has still never run live and would make a stronger
 demo than as-itself.
+
+## Progress 2026-07-24
+
+- GAP 1 DONE: the origin is now the front door. GET / serves the verify box
+  first (the label copy tells readers to paste a post link at
+  bsky.browserid.me, so it has to live there) with the setup instructions
+  below it; /llms.txt and any non-HTML Accept get the same text as Markdown.
+  One source of truth in pds-bridge/src/guide.rs so human and agent copies
+  can't drift. The instructions are honest that the JS path isn't ready.
+- GAP 2 DECIDED (Dan): invest in the JS SDK + wallet MCP rather than
+  shipping the Rust tool as a binary — the demo one-liner only works if the
+  agent can install its tooling without a compiler. Tracked as
+  browserid-ng-gu5j (blocks this bean).
+- GAP 2 confirmed as fact, not suspicion: browserid-core's
+  AccessPresentation is four parts; sdk/agent/src/protocol.mjs builds three
+  and has no access cert. So the JS path can't provision AND can't attest —
+  no badge.
