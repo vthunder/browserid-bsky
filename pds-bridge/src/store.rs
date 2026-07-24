@@ -133,6 +133,16 @@ impl Store {
                  outcome  TEXT NOT NULL
              );",
         )?;
+        // Idempotent column adds for DBs created before a column existed
+        // (CREATE TABLE IF NOT EXISTS won't alter an existing table). A
+        // duplicate-column error means it already ran — ignore it.
+        for stmt in ["ALTER TABLE tokens ADD COLUMN warrant_ref TEXT NOT NULL DEFAULT ''"] {
+            if let Err(e) = conn.execute(stmt, []) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(e.into());
+                }
+            }
+        }
         Ok(Self { conn: Mutex::new(conn) })
     }
 
