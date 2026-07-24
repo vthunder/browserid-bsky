@@ -314,8 +314,15 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
         if coll != "app.bsky.feed.post" {
             continue;
         }
-        if fully_verified(&state, &did, &rkey).await {
-            labels.push(labeler.sign_label(uri, crate::labeler::LABEL_VERIFIED, &cts));
+        // Which of the two provenance paths this post took decides the badge;
+        // an unverifiable post gets no label at all (absence is the signal).
+        if let Some(on_behalf) = fully_verified(&state, &did, &rkey).await {
+            let val = if on_behalf {
+                crate::labeler::LABEL_ON_BEHALF
+            } else {
+                crate::labeler::LABEL_VERIFIED
+            };
+            labels.push(labeler.sign_label(uri, val, &cts));
         }
     }
     Json(serde_json::json!({ "labels": labels })).into_response()
@@ -326,54 +333,58 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
 /// unforgeable grantee attestation over this exact post. The bar for
 /// emitting a label. (Shares logic with the `/verify` handler; a future
 /// refactor extracts one `evaluate_post` — bean kozn-adjacent.)
-async fn fully_verified(state: &S, did: &str, rkey: &str) -> bool {
-    let Some((pds, _)) = resolve_did_doc(state, did).await else { return false };
+/// Returns `Some(on_behalf)` when the post fully verifies — `on_behalf` is
+/// true when grantor != grantee (a delegate acted for another identity) —
+/// and `None` when anything fails to check out.
+async fn fully_verified(state: &S, did: &str, rkey: &str) -> Option<bool> {
+    let Some((pds, _)) = resolve_did_doc(state, did).await else { return None };
     let Some(prov) = get_record(state, &pds, did, "me.browserid.provenance", rkey).await else {
-        return false;
+        return None;
     };
-    let Some((wd, wc_, wk)) = prov["warrant"].as_str().and_then(parse_at_uri) else { return false };
-    let Some(wrec) = get_record(state, &pds, &wd, &wc_, &wk).await else { return false };
+    let Some((wd, wc_, wk)) = prov["warrant"].as_str().and_then(parse_at_uri) else { return None };
+    let Some(wrec) = get_record(state, &pds, &wd, &wc_, &wk).await else { return None };
     let (Ok(warrant), Ok(cc)) = (
         browserid_core::device::Warrant::parse(wrec["warrant"].as_str().unwrap_or("")),
         browserid_core::device::DeviceCert::parse(wrec["configCert"].as_str().unwrap_or("")),
     ) else {
-        return false;
+        return None;
     };
     let w = warrant.claims();
     let grantor = &w.grantor;
     let grantee = &w.grantee;
     // Delegation.
     if warrant.verify(cc.public_key()).is_err() || !cc.authorizes_identity(grantor) {
-        return false;
+        return None;
     }
     if w.audience != state.origin || Utc::now().timestamp() >= w.exp {
-        return false;
+        return None;
     }
     match fetch_well_known_key(state, &cc.claims().iss).await {
         Some(k) if cc.verify(&k).is_ok() => {}
-        _ => return false,
+        _ => return None,
     }
     if prov["attributedTo"].as_str() != Some(grantor.as_str())
         || prov["executedBy"].as_str() != Some(grantee.as_str())
     {
-        return false;
+        return None;
     }
     // Unforgeable attestation over this exact post.
-    let Some(att) = prov.get("attestation") else { return false };
+    let Some(att) = prov.get("attestation") else { return None };
     let claims: Option<crate::attestation::AttestationClaims> =
         serde_json::from_value(att["claims"].clone()).ok();
     let sig = att["sig"].as_str().unwrap_or("");
     let acc = att["accessCert"].as_str().and_then(|c| browserid_core::device::AccessCert::parse(c).ok());
     let post = get_record(state, &pds, did, "app.bsky.feed.post", rkey).await;
-    let (Some(cl), Some(a), Some(rec)) = (claims, acc, post) else { return false };
+    let (Some(cl), Some(a), Some(rec)) = (claims, acc, post) else { return None };
     let ac = a.claims();
     let idp_ok = matches!(fetch_well_known_key(state, &ac.iss).await, Some(k) if a.verify(&k).is_ok());
-    cl.verify(&ac.access_key, sig)
+    let ok = cl.verify(&ac.access_key, sig)
         && ac.identity == *grantee
         && cl.content_hash == crate::attestation::content_hash(&rec)
         && cl.iat < ac.exp
         && prov["nonce"].as_str() == Some(cl.nonce.as_str())
-        && idp_ok
+        && idp_ok;
+    ok.then(|| grantor != grantee)
 }
 
 // ---------------------------------------------------------------------------

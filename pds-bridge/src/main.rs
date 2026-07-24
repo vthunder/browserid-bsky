@@ -50,7 +50,8 @@ async fn main() {
 
     // Labeler (optional): k256 signing key → signs labels for verified posts.
     let labeler = std::env::var("LABELER_K256_PRIVATE_KEY_HEX").ok().map(|hex| {
-        pds_bridge::labeler::Labeler::new(&hex, &origin).expect("bad LABELER_K256_PRIVATE_KEY_HEX")
+        let did = std::env::var("LABELER_DID").ok();
+        pds_bridge::labeler::Labeler::new(&hex, &origin, did).expect("bad LABELER_K256_PRIVATE_KEY_HEX")
     });
     if let Some(l) = &labeler {
         tracing::info!("labeler enabled: {}", l.did);

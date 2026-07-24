@@ -17,22 +17,31 @@ use k256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-/// The label value this labeler emits for a browserid-verified post.
+/// Fully verified, acting as itself (grantor == grantee).
 pub const LABEL_VERIFIED: &str = "browserid-verified";
+/// Fully verified, but a delegate acted on behalf of another identity.
+pub const LABEL_ON_BEHALF: &str = "browserid-on-behalf";
 
 /// The labeler's k256 signing key + derived identity material.
 pub struct Labeler {
     signing_key: SigningKey,
-    /// The labeler's DID (did:web:<host>)
+    /// The DID labels are issued under (`src`). Defaults to `did:web:<host>`;
+    /// overridden with `LABELER_DID` to the labeler *account*'s did:plc, which
+    /// is what bsky.app users actually subscribe to (the account carries the
+    /// `app.bsky.labeler.service` record the AppView indexes). The same
+    /// `#atproto_label` key must be published in whichever DID doc is used.
     pub did: String,
+    /// This host's did:web identity, served at `/.well-known/did.json`.
+    pub web_did: String,
     /// Public endpoint base, e.g. https://bsky.browserid.me
     pub origin: String,
 }
 
 impl Labeler {
     /// `secret_hex` = 32-byte k256 private scalar (hex). `origin` is the
-    /// public https base; the DID is `did:web:<host>`.
-    pub fn new(secret_hex: &str, origin: &str) -> Result<Self, String> {
+    /// public https base. `did_override` (env `LABELER_DID`) sets the issuing
+    /// DID; without it, labels are issued as `did:web:<host>`.
+    pub fn new(secret_hex: &str, origin: &str, did_override: Option<String>) -> Result<Self, String> {
         let bytes = hex_decode(secret_hex.trim())?;
         let signing_key = SigningKey::from_slice(&bytes).map_err(|e| format!("bad k256 key: {e}"))?;
         let host = origin
@@ -40,9 +49,11 @@ impl Labeler {
             .strip_prefix("https://")
             .or_else(|| origin.strip_prefix("http://"))
             .ok_or("origin must be an https URL")?;
+        let web_did = format!("did:web:{host}");
         Ok(Self {
             signing_key,
-            did: format!("did:web:{host}"),
+            did: did_override.unwrap_or_else(|| web_did.clone()),
+            web_did,
             origin: origin.trim_end_matches('/').to_string(),
         })
     }
@@ -55,15 +66,17 @@ impl Labeler {
         format!("z{}", bs58::encode(mc).into_string())
     }
 
-    /// The did:web DID document with the label key + labeler service.
+    /// The did:web DID document with the label key + labeler service. Kept
+    /// alongside the did:plc labeler account so `did:web:<host>` remains a
+    /// resolvable, self-hosted view of the same key.
     pub fn did_document(&self) -> serde_json::Value {
         serde_json::json!({
             "@context": ["https://www.w3.org/ns/did/v1", "https://w3id.org/security/multikey/v1"],
-            "id": self.did,
+            "id": self.web_did,
             "verificationMethod": [{
-                "id": format!("{}#atproto_label", self.did),
+                "id": format!("{}#atproto_label", self.web_did),
                 "type": "Multikey",
-                "controller": self.did,
+                "controller": self.web_did,
                 "publicKeyMultibase": self.label_multikey(),
             }],
             "service": [{
@@ -124,7 +137,7 @@ mod tests {
 
     #[test]
     fn multikey_shape() {
-        let l = Labeler::new(&test_key(), "https://bsky.browserid.me").unwrap();
+        let l = Labeler::new(&test_key(), "https://bsky.browserid.me", None).unwrap();
         let mk = l.label_multikey();
         assert!(mk.starts_with('z'), "multibase base58btc prefix");
         assert_eq!(l.did, "did:web:bsky.browserid.me");
@@ -134,8 +147,18 @@ mod tests {
     }
 
     #[test]
+    fn did_override_changes_label_src_but_not_the_did_web_doc() {
+        let plc = "did:plc:iewpoc3kqru4rgqpkojfixhx";
+        let l = Labeler::new(&test_key(), "https://bsky.browserid.me", Some(plc.into())).unwrap();
+        let label = l.sign_label("at://did:plc:abc/app.bsky.feed.post/xyz", LABEL_VERIFIED, "2026-07-24T00:00:00.000Z");
+        assert_eq!(label["src"], plc, "labels issue under the subscribable account DID");
+        // The self-hosted did:web document still describes did:web (same key).
+        assert_eq!(l.did_document()["id"], "did:web:bsky.browserid.me");
+    }
+
+    #[test]
     fn label_signature_verifies() {
-        let l = Labeler::new(&test_key(), "https://bsky.browserid.me").unwrap();
+        let l = Labeler::new(&test_key(), "https://bsky.browserid.me", None).unwrap();
         let uri = "at://did:plc:abc/app.bsky.feed.post/xyz";
         let label = l.sign_label(uri, LABEL_VERIFIED, "2026-07-24T00:00:00.000Z");
 
