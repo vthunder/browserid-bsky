@@ -288,9 +288,48 @@ pub async fn oauth_metadata(State(state): State<S>) -> Json<serde_json::Value> {
 
 #[derive(serde::Deserialize)]
 pub struct VerifyQuery {
-    pub uri: String,
+    /// A post reference: an `at://…` URI or a `https://bsky.app/profile/…/post/…` URL
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// A verification nonce (the form an optional in-post link uses)
+    #[serde(default)]
+    pub n: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
+}
+
+/// Turn a user-pasted post reference into `(did, rkey)`. Accepts an
+/// `at://did/coll/rkey` URI or a `https://bsky.app/profile/<actor>/post/<rkey>`
+/// URL; resolves a handle actor to a DID via the public AppView.
+async fn resolve_post_ref(state: &S, raw: &str) -> Option<(String, String)> {
+    let raw = raw.trim();
+    if let Some((did, _coll, rkey)) = parse_at_uri(raw) {
+        return Some((did, rkey));
+    }
+    // bsky.app / any host: .../profile/<actor>/post/<rkey>
+    let after = raw.split("/profile/").nth(1)?;
+    let mut seg = after.split('/');
+    let actor = seg.next()?;
+    if seg.next()? != "post" {
+        return None;
+    }
+    let rkey = seg.next()?.split(['?', '#']).next()?.to_string();
+    let did = if actor.starts_with("did:") {
+        actor.to_string()
+    } else {
+        let v: serde_json::Value = state
+            .http
+            .get("https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle")
+            .query(&[("handle", actor)])
+            .send()
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        v["did"].as_str()?.to_string()
+    };
+    Some((did, rkey))
 }
 
 /// Resolve a did:plc/did:web to its atproto PDS endpoint (so the verifier
@@ -374,12 +413,26 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
         }
     };
 
-    let Some((did, _coll, rkey)) = parse_at_uri(&q.uri) else {
-        return fail(StatusCode::BAD_REQUEST, "not an at:// post URI");
+    // Resolve the target post from a nonce, a URI (at:// or bsky.app), or
+    // — with neither — serve the paste-a-link page.
+    let (did, rkey) = if let Some(nonce) = q.n.as_deref() {
+        match state.store.resolve_nonce(nonce) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return fail(StatusCode::NOT_FOUND, "unknown verification nonce"),
+            Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+        }
+    } else if let Some(uri) = q.uri.as_deref() {
+        match resolve_post_ref(&state, uri).await {
+            Some(pair) => pair,
+            None => return fail(StatusCode::BAD_REQUEST, "not a recognizable post link (use an at:// URI or a bsky.app post URL)"),
+        }
+    } else {
+        return axum::response::Html(verify_landing()).into_response();
     };
     let Some(pds) = resolve_pds(&state, &did).await else {
         return fail(StatusCode::NOT_FOUND, "could not resolve the account's PDS");
     };
+    let post_uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
 
     let Some(prov) = get_record(&state, &pds, &did, "me.browserid.provenance", &rkey).await else {
         return fail(StatusCode::NOT_FOUND, "no browserid provenance for this post");
@@ -432,7 +485,7 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
     let root = root_identity(&grantor);
     let result = serde_json::json!({
         "ok": ok,
-        "post": q.uri,
+        "post": post_uri,
         "attributedTo": grantor,
         "executedBy": grantee,
         "root": root,
@@ -469,6 +522,21 @@ async fn fetch_well_known_key(state: &S, domain: &str) -> Option<browserid_core:
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn verify_landing() -> String {
+    "<!doctype html><meta charset=utf-8><title>browserid · verify a Bluesky post</title>\
+     <meta name=viewport content='width=device-width,initial-scale=1'>\
+     <div style='font:16px/1.5 system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem'>\
+     <h1>Verify a Bluesky post</h1>\
+     <p>Paste a post link — a <code>bsky.app</code> URL or an <code>at://</code> URI — \
+     to see who authorized it and who acted, verified against browserid.</p>\
+     <form onsubmit=\"event.preventDefault();location='/verify?uri='+encodeURIComponent(document.getElementById('u').value)\">\
+     <input id=u style='width:100%;padding:.6rem;font-size:1rem;box-sizing:border-box' \
+     placeholder='https://bsky.app/profile/…/post/… or at://…'>\
+     <button style='margin-top:.8rem;padding:.6rem 1.2rem;font-size:1rem'>Verify</button>\
+     </form></div>"
+        .to_string()
 }
 
 fn verify_html_err(reason: &str) -> String {
@@ -772,14 +840,24 @@ async fn write_provenance(
         }
     };
 
-    // Per-post provenance, rkey = the post's rkey (1:1, findable).
+    // Per-post provenance, rkey = the post's rkey (1:1, findable by at-uri).
     let rkey = post_uri.rsplit('/').next().unwrap_or_default();
+
+    // A per-post nonce, resolvable via verify?n=<nonce> (the form an
+    // optional in-post link uses). Phase 1: bridge-minted; phase 2 the
+    // agent chooses it as the signed attestation nonce (bean n78o).
+    let mut nb = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut nb);
+    let nonce = URL_SAFE_NO_PAD.encode(nb);
+    let _ = state.store.put_nonce(&nonce, &account.did, rkey);
+
     let mut prov = serde_json::json!({
         "$type": "me.browserid.provenance",
         "post": post_uri,
         "warrant": warrant_record_uri,
         "attributedTo": token.grantor,
         "executedBy": token.grantee,
+        "nonce": nonce,
     });
     if let Some(cid) = post_cid {
         prov["postCid"] = serde_json::Value::String(cid.to_string());

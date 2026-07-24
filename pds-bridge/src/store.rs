@@ -113,6 +113,11 @@ impl Store {
                  warrant_ref    TEXT NOT NULL DEFAULT '',
                  expires_at     TEXT NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS nonces (
+                 nonce  TEXT PRIMARY KEY,
+                 did    TEXT NOT NULL,
+                 rkey   TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS warrants (
                  hash            TEXT PRIMARY KEY,
                  did             TEXT NOT NULL,
@@ -352,6 +357,35 @@ impl Store {
             "DELETE FROM tokens WHERE warrant_uri = ?1 AND warrant_idx = ?2",
             params![uri, idx as i64],
         )?)
+    }
+
+    // -- nonces ------------------------------------------------------------
+    // Map a per-post verification nonce to (did, post rkey) so the verifier
+    // can resolve `verify?n=<nonce>` (the form an optional in-post link
+    // uses). Phase 1: the bridge mints the nonce; phase 2 (bean n78o) the
+    // agent chooses it as the signed attestation nonce.
+
+    pub fn put_nonce(&self, nonce: &str, did: &str, rkey: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO nonces (nonce, did, rkey) VALUES (?1, ?2, ?3)
+             ON CONFLICT(nonce) DO NOTHING",
+            params![nonce, did, rkey],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve a nonce to `(did, rkey)`.
+    pub fn resolve_nonce(&self, nonce: &str) -> Result<Option<(String, String)>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT did, rkey FROM nonces WHERE nonce = ?1",
+                params![nonce],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     // -- audit -------------------------------------------------------------
