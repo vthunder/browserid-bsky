@@ -26,6 +26,18 @@ writing TXT there, and Namecheap gets two manual, one-time records.
 - `dokku domains:add bsky-pds "*.at.browserid.me"` — nginx routes the
   wildcard to the PDS (verified via forced-resolution: returns the DID).
 
+## IMPORTANT: one cert must cover BOTH vhosts
+
+`bsky-pds` answers two vhosts — `pds.bsky.browserid.me` (data plane) and
+`*.at.browserid.me` (handle verification). dokku serves **one cert bundle
+per app**, so `dokku certs:add` replaces the whole cert: a wildcard-only
+cert breaks `pds.bsky.browserid.me` (and thus the bridge→PDS TLS calls).
+The cert MUST be a single SAN cert covering **both** names. Both are
+validated through the same deSEC alias (deSEC holds multiple challenge TXTs
+at one `_acme-challenge` name), so each needs its own Namecheap CNAME
+pointing at the deSEC challenge name. `dokku letsencrypt` is not used for
+this app once the SAN cert is in place.
+
 ## Manual, one-time (Dan)
 
 1. **deSEC:** create a free account at desec.io; create a domain (a free
@@ -33,35 +45,42 @@ writing TXT there, and Namecheap gets two manual, one-time records.
    an **API token** (Token management) — this is the only secret.
 2. **Namecheap `browserid.me` (Advanced DNS), two records:**
 
-   | Type  | Host                | Value                                        |
-   |-------|---------------------|----------------------------------------------|
-   | A     | `*.at`              | `198.199.110.160`                            |
-   | CNAME | `_acme-challenge.at`| `_acme-challenge.browserid-acme.dedyn.io.`   |
+   | Type  | Host                     | Value                                     |
+   |-------|--------------------------|-------------------------------------------|
+   | A     | `*.at`                   | `198.199.110.160`                         |
+   | CNAME | `_acme-challenge.at`     | `_acme-challenge.browserid.dedyn.io.`     |
+   | CNAME | `_acme-challenge.pds.bsky`| `_acme-challenge.browserid.dedyn.io.`    |
 
-   (Use whatever deSEC domain you made in the CNAME target.)
+   (deSEC domain is `browserid.dedyn.io`. The two challenge CNAMEs let one
+   SAN cert cover `*.at.browserid.me` + `pds.bsky.browserid.me`.)
 3. Hand me the deSEC token (it goes in the host's acme.sh env, not any repo).
 
 ## Host side (me, once the above is done)
 
 acme.sh is installed at `/root/.acme.sh` on the host (prep done). Then:
 
-```sh
-# issue the wildcard, challenge delegated to the deSEC zone
-export DEDYN_TOKEN='<deSEC token>'
-/root/.acme.sh/acme.sh --issue --server letsencrypt \
-  --dns dns_desec \
-  --challenge-alias browserid-acme.dedyn.io \
-  -d '*.at.browserid.me'
+acme.sh is installed at `/root/.acme.sh`, deSEC provider present, and a
+deploy helper `/root/.acme.sh/deploy-bsky-pds.sh` tars fullchain+key as
+`server.crt`/`server.key` and pipes to `dokku certs:add bsky-pds`.
 
-# install into the PDS app + reload; the deploy hook re-runs on renewal
-/root/.acme.sh/acme.sh --install-cert -d '*.at.browserid.me' \
-  --key-file       /var/lib/dokku/data/certs/bsky-pds.key \
-  --fullchain-file /var/lib/dokku/data/certs/bsky-pds.crt \
-  --reloadcmd "cat /var/lib/dokku/data/certs/bsky-pds.crt /var/lib/dokku/data/certs/bsky-pds.key | dokku certs:add bsky-pds"
+```sh
+# SAN cert: both names, both challenges delegated to the deSEC zone
+sudo DEDYN_TOKEN='<deSEC token>' /root/.acme.sh/acme.sh --issue --server letsencrypt \
+  --dns dns_desec --challenge-alias browserid.dedyn.io \
+  -d '*.at.browserid.me' -d 'pds.bsky.browserid.me'
+
+# install once to the PDS app; deploy hook re-runs on renewal
+sudo /root/.acme.sh/acme.sh --install-cert -d '*.at.browserid.me' --ecc \
+  --reloadcmd /root/.acme.sh/deploy-bsky-pds.sh
+
+# re-add the wildcard vhost (removed during the single-name-cert stopgap)
+dokku domains:add bsky-pds '*.at.browserid.me'
 ```
 
-acme.sh installs a cron entry; renewal re-runs `--install-cert` →
-`certs:add` → nginx reload. No Namecheap writes ever.
+acme.sh installs a cron entry; renewal re-runs the deploy hook →
+`certs:add` → nginx reload. No Namecheap writes ever. (Interim history:
+a wildcard-only cert was installed then rolled back — it broke
+`pds.bsky.browserid.me`; the SAN cert above is the fix.)
 
 ## Verify
 
