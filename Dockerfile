@@ -2,7 +2,7 @@
 # `git:from-image` (see .github/workflows/deploy-bridge.yml).
 
 # Stage 1: Build
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.93-bookworm AS builder
 
 WORKDIR /build
 
