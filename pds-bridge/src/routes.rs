@@ -524,9 +524,9 @@ async fn resolve_post_ref(state: &S, raw: &str) -> Option<(String, String)> {
     Some((did, rkey))
 }
 
-/// Resolve a did:plc/did:web to its atproto PDS endpoint (so the verifier
-/// works for any account, not only ours).
-async fn resolve_pds(state: &S, did: &str) -> Option<String> {
+/// Resolve a did:plc/did:web to `(pds endpoint, handle)` from its DID doc
+/// (so the verifier works for any account, not only ours).
+async fn resolve_did_doc(state: &S, did: &str) -> Option<(String, Option<String>)> {
     let doc: serde_json::Value = state
         .http
         .get(format!("https://plc.directory/{did}"))
@@ -536,12 +536,42 @@ async fn resolve_pds(state: &S, did: &str) -> Option<String> {
         .json()
         .await
         .ok()?;
-    doc["service"]
+    let pds = doc["service"]
         .as_array()?
         .iter()
         .find(|s| s["id"] == "#atproto_pds")
         .and_then(|s| s["serviceEndpoint"].as_str())
-        .map(String::from)
+        .map(String::from)?;
+    let handle = doc["alsoKnownAs"]
+        .as_array()
+        .and_then(|a| a.iter().find_map(|v| v.as_str()?.strip_prefix("at://")))
+        .map(String::from);
+    Some((pds, handle))
+}
+
+/// If a post record embeds a `…/verify?n=<nonce>` link (in a facet or in the
+/// text), return that nonce — used to flag a post whose own verify link
+/// points at a *different* post.
+fn embedded_verify_nonce(rec: &serde_json::Value) -> Option<String> {
+    let from = |uri: &str| -> Option<String> {
+        uri.split_once("/verify?n=").map(|(_, n)| n.split(['&', ' ', '\n']).next().unwrap_or("").to_string())
+    };
+    // Facet link features.
+    if let Some(facets) = rec["facets"].as_array() {
+        for f in facets {
+            if let Some(feats) = f["features"].as_array() {
+                for feat in feats {
+                    if let Some(uri) = feat["uri"].as_str() {
+                        if let Some(n) = from(uri) {
+                            return Some(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: a bare URL in the text.
+    rec["text"].as_str().and_then(from)
 }
 
 async fn get_record(state: &S, pds: &str, did: &str, collection: &str, rkey: &str) -> Option<serde_json::Value> {
@@ -593,6 +623,23 @@ mod verify_tests {
         assert_eq!(root_identity("dan@sandmill.org"), "dan@sandmill.org");
         assert_eq!(root_identity("weird"), "weird");
     }
+
+    #[test]
+    fn embedded_nonce_from_facet_and_text() {
+        use super::embedded_verify_nonce;
+        let facet = serde_json::json!({
+            "text": "hi 🔗 verify",
+            "facets": [{ "features": [{ "$type": "app.bsky.richtext.facet#link",
+                          "uri": "https://bsky.browserid.me/verify?n=ABC123" }] }],
+        });
+        assert_eq!(embedded_verify_nonce(&facet).as_deref(), Some("ABC123"));
+        // Bare URL in text fallback.
+        let bare = serde_json::json!({ "text": "see https://bsky.browserid.me/verify?n=XYZ now" });
+        assert_eq!(embedded_verify_nonce(&bare).as_deref(), Some("XYZ"));
+        // No verify link.
+        let none = serde_json::json!({ "text": "just a post" });
+        assert_eq!(embedded_verify_nonce(&none), None);
+    }
 }
 
 pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extract::Query<VerifyQuery>) -> Response {
@@ -621,10 +668,16 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
     } else {
         return axum::response::Html(verify_landing()).into_response();
     };
-    let Some(pds) = resolve_pds(&state, &did).await else {
+    let Some((pds, handle)) = resolve_did_doc(&state, &did).await else {
         return fail(StatusCode::NOT_FOUND, "could not resolve the account's PDS");
     };
     let post_uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
+
+    // Fetch the actual post so the receipt SHOWS what was verified — the
+    // reader confirms it's the post they came from, defeating a spoofed
+    // verify link that points at another (passing) post.
+    let post_rec = get_record(&state, &pds, &did, "app.bsky.feed.post", &rkey).await;
+    let post_text = post_rec.as_ref().and_then(|r| r["text"].as_str()).unwrap_or("").to_string();
 
     let Some(prov) = get_record(&state, &pds, &did, "me.browserid.provenance", &rkey).await else {
         return fail(StatusCode::NOT_FOUND, "no browserid provenance for this post");
@@ -684,7 +737,6 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
             serde_json::from_value(att["claims"].clone()).ok();
         let sig = att["sig"].as_str().unwrap_or("");
         let access_cert = att["accessCert"].as_str().and_then(|c| browserid_core::device::AccessCert::parse(c).ok());
-        let post_rec = get_record(&state, &pds, &did, "app.bsky.feed.post", &rkey).await;
         match (&claims, &access_cert, &post_rec) {
             (Some(cl), Some(acc), Some(rec)) => {
                 let acc_claims = acc.claims();
@@ -704,7 +756,17 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
         if !att_ok { ok = false; }
     }
 
+    // Anti-spoof: if the post embeds its OWN `verify?n=` link (facet), that
+    // nonce must be this post's nonce. A post pointing its verify link at a
+    // *different* (passing) post is flagged, and the receipt always shows the
+    // actual post below so a reader can confirm it's the one they came from.
+    let own_nonce = prov["nonce"].as_str().unwrap_or("");
+    if let Some(linked) = post_rec.as_ref().and_then(embedded_verify_nonce) {
+        check("embedded_link_matches_this_post", linked == own_nonce, &mut checks, &mut ok);
+    }
+
     let root = root_identity(&grantor);
+    let post_url = handle.as_ref().map(|h| format!("https://bsky.app/profile/{h}/post/{rkey}"));
     let caveat = if post_binding_verified {
         "Fully verified: the delegation AND the grantee's signature over this exact post's content are cryptographically checked — unforgeable, independent of the PDS."
     } else if prov.get("attestation").is_some() {
@@ -715,6 +777,9 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
     let result = serde_json::json!({
         "ok": ok,
         "post": post_uri,
+        "postText": post_text,
+        "postHandle": handle,
+        "postUrl": post_url,
         "attributedTo": grantor,
         "executedBy": grantee,
         "root": root,
@@ -794,6 +859,19 @@ fn verify_html(r: &serde_json::Value) -> String {
     } else {
         format!("<b>{}</b> posted as itself", esc(r["attributedTo"].as_str().unwrap_or("")))
     };
+    // The verified post itself, shown so the reader confirms it's the post
+    // they came from (anti-spoof).
+    let post_handle = r["postHandle"].as_str().unwrap_or("(unknown handle)");
+    let post_text = r["postText"].as_str().unwrap_or("");
+    let post_link = r["postUrl"].as_str();
+    let post_card = format!(
+        "<div style='border:1px solid #ccc;border-radius:8px;padding:.8rem 1rem;margin:1rem 0;background:#fafafa'>\
+         <div style='color:#555;font-size:.85rem'>verified post{}</div>\
+         <div style='white-space:pre-wrap;margin-top:.3rem'>{}</div>\
+         <div style='margin-top:.4rem;font-size:.85rem'>— <b>{}</b>{}</div></div>",
+        "", esc(post_text), esc(post_handle),
+        post_link.map(|u| format!(" · <a href='{}'>open on bsky.app</a>", esc(u))).unwrap_or_default(),
+    );
     let scopes = r["scopes"].as_array().map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
     let rows = r["checks"].as_object().map(|m| {
         m.iter().map(|(k, v)| format!("<tr><td>{}</td><td>{}</td></tr>", esc(k), if v.as_bool().unwrap_or(false) {"✓"} else {"✗"})).collect::<String>()
@@ -803,12 +881,13 @@ fn verify_html(r: &serde_json::Value) -> String {
          <div style='font:16px/1.5 system-ui;max-width:44rem;margin:3rem auto;padding:0 1rem'>\
          <div style='color:{color};font-weight:700;font-size:1.3rem'>{badge}</div>\
          {binding_line}\
+         {post_card}\
          <p style='font-size:1.1rem'>{relation}, authorized under <b>{root}</b>.</p>\
          <p>Audience: <code>{aud}</code><br>Scopes: <code>{scopes}</code><br>IdP: <code>{iss}</code></p>\
          <table style='border-collapse:collapse' cellpadding=6>{rows}</table>\
          <p style='color:#666;font-size:.9rem;margin-top:1.5rem'>{caveat}</p>\
          <p style='color:#999;font-size:.8rem'>Post: <code>{post}</code></p></div>",
-        color = color, badge = badge, binding_line = binding_line, relation = relation,
+        color = color, badge = badge, binding_line = binding_line, post_card = post_card, relation = relation,
         root = esc(r["root"].as_str().unwrap_or("")),
         aud = esc(r["audience"].as_str().unwrap_or("")),
         scopes = esc(&scopes), iss = esc(r["issuer"].as_str().unwrap_or("")),
