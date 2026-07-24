@@ -1,12 +1,22 @@
 {
   "name": "@browserid-bsky/agent",
   "version": "0.1.0",
-  "description": "Set up a Bluesky account on bsky.browserid.me and post to it with verifiable provenance — for AI agents, no compiler required.",
+  "description": "Set up a Bluesky account on bsky.browserid.me and post to it with verifiable provenance \u2014 for AI agents, no compiler required.",
   "type": "module",
-  "bin": { "browserid-bsky": "./cli.mjs" },
+  "bin": {
+    "browserid-bsky": "./cli.mjs"
+  },
   "main": "./bsky.mjs",
-  "files": ["cli.mjs", "bsky.mjs", "README.md"],
-  "engines": { "node": ">=18" },
-  "dependencies": { "@browserid-ng/agent": "^0.1.0" },
+  "files": [
+    "cli.mjs",
+    "bsky.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@browserid-ng/agent": "^0.2.0"
+  },
   "license": "MPL-2.0"
 }
