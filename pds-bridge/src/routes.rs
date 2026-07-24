@@ -289,25 +289,26 @@ pub async fn did_json(State(state): State<S>) -> Response {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct QueryLabelsParams {
-    #[serde(rename = "uriPatterns", default)]
-    pub uri_patterns: Vec<String>,
-}
-
 /// GET /xrpc/com.atproto.label.queryLabels — return a signed label for each
 /// requested post URI that is fully browserid-verified. bsky.app's AppView
-/// applies these for users who subscribe to this labeler.
-pub async fn query_labels(
-    State(state): State<S>,
-    axum::extract::Query(q): axum::extract::Query<QueryLabelsParams>,
-) -> Response {
+/// applies these for users who subscribe to this labeler. `uriPatterns` is a
+/// repeated query param, which axum's Query (serde_urlencoded) can't decode —
+/// parse the raw query instead.
+pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) -> Response {
     let Some(labeler) = &state.labeler else {
         return (StatusCode::NOT_FOUND, "labeler not configured").into_response();
     };
+    let patterns: Vec<String> = reqwest::Url::parse(&format!("http://x/?{}", raw.0.unwrap_or_default()))
+        .map(|u| {
+            u.query_pairs()
+                .filter(|(k, _)| k == "uriPatterns")
+                .map(|(_, v)| v.into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
     let cts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut labels = Vec::new();
-    for uri in q.uri_patterns.iter().take(200) {
+    for uri in patterns.iter().take(200) {
         // Exact post at-uris only (ignore wildcard patterns for v1).
         let Some((did, coll, rkey)) = parse_at_uri(uri) else { continue };
         if coll != "app.bsky.feed.post" {
