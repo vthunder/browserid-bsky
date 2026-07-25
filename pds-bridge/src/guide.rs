@@ -33,7 +33,12 @@ rather than to us.
 1. **Get a browserid identity and ask for permission.** Using a browserid
    agent library (see *Tooling* below), request a warrant for:
    - audience: `{origin}`
-   - scopes: `login` and `repo:app.bsky.feed.post?action=create`
+   - scopes: `login`, `account:create` (opening the account) and
+     `repo:app.bsky.feed.post?action=create` (posting)
+
+   The human can approve this as a **delegate** — an agent acting for them —
+   or as themselves. You do NOT need them to hand you their own identity:
+   `account:create` is what authorizes a delegate to open the account.
 
    This produces an **approval URL** plus a short user code and a
    fingerprint. Show all three to the human and stop. They open the URL,
@@ -48,11 +53,12 @@ rather than to us.
 
 3. **Create the Bluesky account.** `POST {origin}/browserid/provision`
    with `{{"presentation": "<your four-part bundle>", "handle": "<label>"}}`.
-   This must be a **first-party** login — the identity provisioning the
-   account has to be the same identity that approved, so run it with the
-   human's own credential, not a delegated one. The response includes the DID,
-   the full handle, and a password shown **once** (for ordinary Bluesky
-   clients — offer it to the human to save, and do not keep a copy yourself).
+   The account belongs to the warrant's **grantor** — the identity actions are
+   attributed to. The response includes the DID and full handle. A password
+   comes back only for a first-party login; if you opened the account as a
+   delegate it is withheld, because a password bypasses your warrant's scopes
+   entirely. Tell the human that, rather than implying they have lost access —
+   the PDS reset flow is theirs to use.
 
 4. **Post.** `POST {origin}/browserid/post` with your bundle, the post text,
    and an **attestation**: a signature, made with your access key, over the

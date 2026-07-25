@@ -38,6 +38,7 @@ use crate::store::Store;
 /// vocabulary is the granular-scope grammar (`scopes.rs`); these are the
 /// common grants shown to integrators.
 pub const ADVERTISED_SCOPES: &[&str] = &[
+    "account:create",
     "repo:app.bsky.feed.post?action=create",
     "repo:app.bsky.feed.like",
     "blob:image/*",

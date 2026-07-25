@@ -121,13 +121,19 @@ pub async fn provision(
         Ok(v) => v,
         Err(e) => return e,
     };
-    // Provisioning is a first-party action: the signed-in identity itself,
-    // not a delegated grantee, opens the account.
-    if identity.grantee != identity.grantor {
+    // WHO MAY OPEN THE ACCOUNT. A first-party login always may — it is the
+    // identity itself. A DELEGATE may too, but only with an explicit
+    // `account:create` scope, so the human consents to account creation
+    // specifically. Requiring first-party outright (as this did) forced the
+    // human to issue an AS-ME warrant just to bootstrap, which is a far
+    // broader grant than the thing it was guarding.
+    let first_party = identity.grantee == identity.grantor;
+    let delegated = !first_party;
+    if delegated && !crate::scopes::scopes_allow_account_create(&parse_scopes(&identity.scopes)) {
         return err(
             StatusCode::FORBIDDEN,
             "invalid_grant",
-            "provisioning requires a first-party login (grantee == grantor)",
+            "a delegate needs the `account:create` scope to open the account",
         );
     }
     let email = identity.grantor;
@@ -151,8 +157,13 @@ pub async fn provision(
         }
     }
 
-    // Shown once, never stored: the user's credential for ordinary Bluesky
-    // clients. The bridge keeps only the session pair.
+    // The PDS requires a password at creation. For a first-party login it is
+    // shown ONCE (the human's credential for ordinary Bluesky clients). For a
+    // DELEGATE it is generated and discarded, never returned: a password
+    // bypasses warrant scoping entirely — full account access, no scopes, no
+    // revocation — so handing it to an agent would escalate it far past what
+    // it was granted. (The human can recover access via the PDS's own reset
+    // flow; bean azxl is removing password login altogether.)
     let mut pw = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut pw);
     let password = URL_SAFE_NO_PAD.encode(pw);
@@ -175,15 +186,22 @@ pub async fn provision(
         return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string());
     }
 
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "did": created.did,
-            "handle": created.handle,
-            "password": password,
-        })),
-    )
-        .into_response()
+    let mut body = serde_json::json!({
+        "did": created.did,
+        "handle": created.handle,
+    });
+    if first_party {
+        body["password"] = serde_json::Value::String(password);
+    } else {
+        body["passwordWithheld"] = serde_json::Value::Bool(true);
+        body["note"] = serde_json::Value::String(
+            "Opened by a delegate, so no password is returned — it would bypass \
+             the warrant's scopes. Use the PDS password-reset flow if you want \
+             to sign in with an ordinary Bluesky client."
+                .to_string(),
+        );
+    }
+    (StatusCode::CREATED, Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------

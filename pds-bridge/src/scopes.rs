@@ -10,6 +10,9 @@
 //! - `rpc:<method-nsid>` — call one query/procedure method.
 //! - `blob:<type>/<subtype>` — upload blobs of a mime type; `*` wildcards
 //!   the subtype (`blob:image/*`) or the whole type (`blob:*/*`).
+//! - `account:create` — open the Bluesky account for the grantor. Not an XRPC
+//!   permission: it authorizes `/browserid/provision`, so a DELEGATE can set
+//!   an account up without the human first issuing an as-me warrant.
 //!
 //! Everything here is an allowlist and fail-closed:
 //! - A scope string that doesn't parse grants **nothing** (it is skipped,
@@ -51,6 +54,8 @@ pub enum Scope {
         /// `(type, subtype)`, each possibly `*`
         mime: (String, String),
     },
+    /// Open the account for the grantor (bridge-level, not XRPC).
+    AccountCreate,
 }
 
 /// A permission an XRPC call requires.
@@ -92,6 +97,9 @@ fn parse_mime(s: &str) -> Option<(String, String)> {
 impl Scope {
     /// Parse one scope string. `None` = unrecognized → grants nothing.
     pub fn parse(s: &str) -> Option<Scope> {
+        if s == "account:create" {
+            return Some(Scope::AccountCreate);
+        }
         if let Some(rest) = s.strip_prefix("repo:") {
             let (collection, query) = match rest.split_once('?') {
                 Some((c, q)) => (c, Some(q)),
@@ -143,6 +151,18 @@ impl Scope {
             _ => false,
         }
     }
+
+    /// Whether this scope authorizes opening the account. Kept separate from
+    /// `covers` because provisioning is not an XRPC call — no `Required` maps
+    /// to it, so it can never be granted by accident.
+    pub fn is_account_create(&self) -> bool {
+        matches!(self, Scope::AccountCreate)
+    }
+}
+
+/// Whether a warrant's scopes authorize opening the account for the grantor.
+pub fn scopes_allow_account_create(scopes: &[Scope]) -> bool {
+    scopes.iter().any(Scope::is_account_create)
 }
 
 /// Parse a warrant's scope list. Unparseable entries are dropped (they grant

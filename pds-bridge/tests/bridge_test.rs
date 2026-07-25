@@ -64,8 +64,11 @@ async fn mock_pds(captures: Captures) -> String {
         .route(
             "/xrpc/com.atproto.server.createAccount",
             post(|Json(body): Json<Value>| async move {
+                // A DID per handle: the store enforces uniqueness, so a fixed
+                // DID would make any test that provisions twice collide.
+                let label = body["handle"].as_str().unwrap_or("x").split('.').next().unwrap_or("x").to_string();
                 Json(json!({
-                    "did": "did:plc:testuser",
+                    "did": format!("did:plc:test{label}"),
                     "handle": body["handle"],
                     "accessJwt": "pds-access-1",
                     "refreshJwt": "pds-refresh-1",
@@ -201,7 +204,7 @@ async fn provision_token_post_end_to_end() {
 
     // 1. Provision: browserid login → PDS account + binding.
     let account = provision(&server, &idp, "dan@sandmill.test", "dan").await;
-    assert_eq!(account["did"], "did:plc:testuser");
+    assert_eq!(account["did"], "did:plc:testdan");
     assert_eq!(account["handle"], "dan.at.browserid.test");
     assert!(account["password"].as_str().unwrap().len() >= 32);
 
@@ -222,11 +225,11 @@ async fn provision_token_post_end_to_end() {
     let resp = server
         .post("/xrpc/com.atproto.repo.createRecord")
         .authorization_bearer(&bearer)
-        .json(&json!({ "repo": "did:plc:testuser", "collection": "app.bsky.feed.post",
+        .json(&json!({ "repo": "did:plc:testdan", "collection": "app.bsky.feed.post",
                         "record": { "text": "hello from my agent" } }))
         .await;
     assert_eq!(resp.status_code(), 200, "{}", resp.text());
-    assert!(resp.text().contains("at://did:plc:testuser/app.bsky.feed.post"));
+    assert!(resp.text().contains("at://did:plc:testdan/app.bsky.feed.post"));
 
     // 3b. Sidecar provenance was written (bean 27c0 phase 1): one warrant
     // record (verifiable delegation artifacts) + one per-post provenance
@@ -241,7 +244,7 @@ async fn provision_token_post_end_to_end() {
     let prov = captured(&cap, "me.browserid.provenance");
     assert_eq!(prov.len(), 1, "one provenance record");
     let pr = &prov[0]["record"];
-    assert_eq!(pr["post"], "at://did:plc:testuser/app.bsky.feed.post/rkey1");
+    assert_eq!(pr["post"], "at://did:plc:testdan/app.bsky.feed.post/rkey1");
     assert_eq!(pr["attributedTo"], "dan@sandmill.test", "authorizer / repo owner");
     assert_eq!(pr["executedBy"], "dan+agent@sandmill.test", "on-behalf: delegate differs");
     assert!(pr["warrant"].as_str().unwrap().contains("me.browserid.warrant"), "references the warrant record");
@@ -250,7 +253,7 @@ async fn provision_token_post_end_to_end() {
     let resp = server
         .post("/xrpc/com.atproto.repo.deleteRecord")
         .authorization_bearer(&bearer)
-        .json(&json!({ "repo": "did:plc:testuser", "collection": "app.bsky.feed.post", "rkey": "rkey1" }))
+        .json(&json!({ "repo": "did:plc:testdan", "collection": "app.bsky.feed.post", "rkey": "rkey1" }))
         .await;
     assert_eq!(resp.status_code(), 403);
 
@@ -290,7 +293,7 @@ async fn warrant_revocation_kills_live_tokens() {
         server
             .post("/xrpc/com.atproto.repo.createRecord")
             .authorization_bearer(&bearer)
-            .json(&json!({ "repo": "did:plc:testuser", "collection": "app.bsky.feed.post",
+            .json(&json!({ "repo": "did:plc:testdan", "collection": "app.bsky.feed.post",
                             "record": { "text": "hi" } }))
     };
     assert_eq!(post().await.status_code(), 200);
@@ -346,7 +349,7 @@ async fn provisioning_rules() {
         assert_eq!(resp.status_code(), 400, "label {label:?} must be refused");
     }
 
-    // Delegated (grantee != grantor) presentations cannot provision.
+    // A DELEGATE without `account:create` cannot provision...
     let pres = presentation(
         &idp, "dan@sandmill.test", "dan+agent@sandmill.test", "svc.agent", vec!["login".into()], None,
     );
@@ -355,6 +358,27 @@ async fn provisioning_rules() {
         .json(&json!({ "presentation": pres, "handle": "dan" }))
         .await;
     assert_eq!(resp.status_code(), 403);
+
+    // ...but WITH it, it may — so a human never has to issue an as-me warrant
+    // just to bootstrap an account. The password is WITHHELD, because it would
+    // bypass the warrant's scopes entirely.
+    let pres = presentation(
+        &idp,
+        "del@sandmill.test",
+        "del+agent@sandmill.test",
+        "svc.agent",
+        vec!["login".into(), "account:create".into()],
+        None,
+    );
+    let resp = server
+        .post("/browserid/provision")
+        .json(&json!({ "presentation": pres, "handle": "delegated" }))
+        .await;
+    assert_eq!(resp.status_code(), 201, "delegate with account:create may provision: {:?}", resp.text());
+    let body: serde_json::Value = resp.json();
+    assert_eq!(body["handle"], "delegated.at.browserid.test");
+    assert!(body["password"].is_null(), "a delegate must NOT receive the password");
+    assert_eq!(body["passwordWithheld"], true);
 
     // One account per email; handle uniqueness.
     provision(&server, &idp, "dan@sandmill.test", "dan").await;

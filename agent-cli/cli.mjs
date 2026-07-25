@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // browserid-bsky — set up a Bluesky account an agent can post to, verifiably.
 //
-//   npx -y @browserid-ng/bsky setup <handle>   # human approves a link
-//   npx -y @browserid-ng/bsky post "text"      # attested post
+//   npx -y @browserid-ng/bsky setup <handle>      # human approves a link
+//   npx -y @browserid-ng/bsky post "text"         # attested post
+//   npx -y @browserid-ng/bsky delegate <handle>   # act ON BEHALF OF an
+//                                                 # existing account's owner
 //   npx -y @browserid-ng/bsky whoami
 //
 // State (the device key, the warrant, the account DID) lives in
@@ -18,6 +20,9 @@ const BRIDGE = (process.env.BSKY_BRIDGE || "https://bsky.browserid.me").replace(
 const HOME = process.env.BROWSERID_BSKY_HOME || join(homedir(), ".browserid-bsky");
 const STATE = join(HOME, "state.json");
 const POST_SCOPE = "repo:app.bsky.feed.post?action=create";
+// Lets a DELEGATE open the account, so the human never has to issue an as-me
+// warrant just to bootstrap one.
+const CREATE_SCOPE = "account:create";
 
 mkdirSync(HOME, { recursive: true, mode: 0o700 });
 
@@ -44,16 +49,29 @@ function agentFrom(state) {
   return agent;
 }
 
-async function setup(handleLabel) {
+async function setup(handleLabel, { grantor } = {}) {
   // The handle is public and the human's — agree it with them first, don't
   // invent one on their behalf.
-  if (!handleLabel) die("usage: browserid-bsky setup <handle>   (agree the handle with the human first)");
+  if (!handleLabel) die("usage: browserid-bsky setup <handle> [--for <identity>]   (agree the handle with the human first)");
   if (load()) die(`already set up (${STATE}). Delete that file to start over.`);
 
+  // No `handle` pin here: that field is a BROWSERID identity handle, not the
+  // Bluesky account name — passing the account label would ask the broker for
+  // an identity by that name.
+  //
+  // Omitting `grantee` means as-you (grantee ≡ grantor), which is what
+  // /browserid/provision requires. It does NOT decide WHICH identity fills
+  // both slots: with the grantor left open, approving "with its own handle"
+  // mints a fresh sub-identity and the account ends up owned by that, which
+  // can never later delegate (browserid-ng-y9xm). Pass `--for <identity>` to
+  // pin the owner — the approval must then be made as exactly that identity.
+  // One approval covers both: opening the account AND posting to it. The
+  // human can pick "do things for me" (a delegate acting for them) or "act as
+  // me" — both work, because account:create authorizes the delegate case.
   const pending = await requestProvision(BROKER, {
-    handle: handleLabel,
-    grants: [{ audience: BRIDGE, scopes: ["login", POST_SCOPE] }],
-    label: "Bluesky posting via bsky.browserid.me",
+    grants: [{ audience: BRIDGE, scopes: ["login", CREATE_SCOPE, POST_SCOPE] }],
+    ...(grantor ? { grantor } : {}),
+    label: `Bluesky account ${handleLabel} via bsky.browserid.me`,
   });
 
   // Everything below waits on a human. Print the link FIRST so an agent can
@@ -71,6 +89,13 @@ async function setup(handleLabel) {
 
   const agent = agentFrom({ credential, grants });
   console.log(`approved — acting as ${agent.email}`);
+  const w = JSON.parse(Buffer.from(grants[0].grant.split("~")[0].split(".")[1], "base64url").toString());
+  if (w.grantor !== w.grantee) {
+    console.log(`  attributed to ${w.grantor}, acted by ${w.grantee} (on behalf of)`);
+  }
+  if (grantor && w.grantor.toLowerCase() !== grantor.toLowerCase()) {
+    console.log(`⚠ expected actions to be attributed to ${grantor} — got ${w.grantor}`);
+  }
 
   const { presentation } = await agent.assertionWithAccessKey(BRIDGE);
   const account = await provisionAccount(BRIDGE, { presentation, handle: handleLabel });
@@ -79,10 +104,15 @@ async function setup(handleLabel) {
   console.log(`\nBluesky account created:`);
   console.log(`  handle:   ${account.handle}`);
   console.log(`  did:      ${account.did}`);
-  console.log(`  password: ${account.password}`);
-  console.log(`            ^ shown ONCE — for ordinary Bluesky clients. Save it or discard it deliberately.`);
+  if (account.password) {
+    console.log(`  password: ${account.password}`);
+    console.log(`            ^ shown ONCE — for ordinary Bluesky clients. Offer it to the human.`);
+  } else {
+    console.log(`  password: withheld — you opened this as a delegate, and a password would`);
+    console.log(`            bypass your warrant's scopes. The human can use the PDS reset flow.`);
+  }
   console.log(`\nTwo things to tell the human:`);
-  console.log(`  1. Save that password if they want to use ordinary Bluesky clients.`);
+  console.log(`  1. ${account.password ? "Save that password if they want to use ordinary Bluesky clients." : "No password was issued — nothing to save."}`);
   console.log(`  2. Subscribe to the labeler so the provenance badge actually shows:`);
   console.log(`     https://bsky.app/profile/labeler.at.browserid.me`);
   console.log(`\nNow post:  browserid-bsky post "hello world"`);
@@ -109,21 +139,101 @@ async function post(text) {
   console.log(`  verify: ${result.verifyUrl}`);
 }
 
+/**
+ * Provision a SEPARATE actor identity that posts ON BEHALF OF an existing
+ * account's owner: `grantee: "*"` has the approver mint a distinct actor, so
+ * the warrant's grantor (who the post is attributed to) differs from its
+ * grantee (who wrote it). Posts then carry the `browserid-on-behalf` badge.
+ *
+ * The account itself must already exist — creating one is first-party only.
+ * The approver must pick the identity that OWNS `accountHandle`.
+ */
+async function delegate(accountHandle, { grantor, grantee } = {}) {
+  if (!accountHandle) die("usage: browserid-bsky delegate <account-handle> --for <owner-id> [--as <actor-id>]");
+  if (!grantor) {
+    die(
+      "delegate needs --for <owner-identity>: the identity that OWNS the account, which the post is\n" +
+        "attributed to. Without pinning it, the approval page uses whichever identity the human picks\n" +
+        "for BOTH sides and you get an as-itself warrant instead of on-behalf-of.",
+    );
+  }
+  if (load()) die(`state already exists (${STATE}). Use BROWSERID_BSKY_HOME to keep a separate actor.`);
+
+  const handle = accountHandle.includes(".") ? accountHandle : `${accountHandle}.at.browserid.me`;
+  const did = await resolveHandle(handle);
+
+  const pending = await requestProvision(BROKER, {
+    grants: [{ audience: BRIDGE, scopes: ["login", POST_SCOPE] }],
+    grantor, // who the post is attributed to — the account's owner
+    grantee: grantee ?? "*", // who acts; pin it to keep the two identities apart
+    label: `posting on behalf of ${handle}`,
+  });
+  console.log(`APPROVE_URL: ${pending.verificationUriComplete}`);
+  console.log(`  (or open ${pending.verificationUri} and enter code ${pending.userCode})`);
+  console.log(`  key fingerprint: ${pending.fingerprint}`);
+  console.log(`\nActing ${grantee ? `as ${grantee} ` : ""}ON BEHALF OF ${grantor}`);
+  console.log(`  -> posts land in ${handle} (${did}) attributed to ${grantor}`);
+  console.log(`The human must approve AS ${grantor}.\n`);
+  console.log("waiting for approval...");
+
+  const { credential, grants } = await pending.wait();
+  save({ credential, grants, did, handle });
+
+  const agent = agentFrom({ credential, grants });
+  const claims = JSON.parse(Buffer.from(grants[0].grant.split("~")[0].split(".")[1], "base64url").toString());
+  console.log(`approved — acting as ${agent.email}`);
+  if (claims.grantor === claims.grantee) {
+    console.log(
+      `\n⚠ This warrant is AS-ITSELF (grantor == grantee == ${claims.grantor}), not on-behalf-of.\n` +
+        `  The approver picked the same identity for both. Posts will be labelled\n` +
+        `  browserid-verified, not browserid-on-behalf.`,
+    );
+  } else {
+    console.log(`  attributed to ${claims.grantor}, executed by ${claims.grantee}`);
+  }
+  console.log(`\nNow post:  browserid-bsky post "hello"`);
+}
+
+/** Resolve a handle to its DID through the bridge's atproto passthrough. */
+async function resolveHandle(handle) {
+  const res = await fetch(`${BRIDGE}/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(handle)}`);
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok || !json.did) die(`could not resolve ${handle}: ${json.message || res.status}`);
+  return json.did;
+}
+
 async function whoami() {
   const state = load() || die("no state — run `browserid-bsky setup <handle>` first");
   const agent = agentFrom(state);
   console.log(`identity: ${agent.email} (holder ${agent.holder})`);
   console.log(`warrants: ${agent.warrantedAudiences().join(", ") || "none"}`);
   console.log(`account:  ${state.handle ?? "not provisioned"}${state.did ? ` (${state.did})` : ""}`);
+  const w = state.grants?.[0]?.grant;
+  if (w) {
+    const claims = JSON.parse(Buffer.from(w.split("~")[0].split(".")[1], "base64url").toString());
+    console.log(
+      claims.grantor === claims.grantee
+        ? `acting:   as itself (${claims.grantor})`
+        : `acting:   ${claims.grantee} ON BEHALF OF ${claims.grantor}`,
+    );
+  }
 }
 
 const [cmd, ...rest] = process.argv.slice(2);
 try {
-  if (cmd === "setup") await setup(rest[0]);
+  const flag = (name) => {
+    const i = rest.indexOf(`--${name}`);
+    return i >= 0 ? rest[i + 1] : undefined;
+  };
+  if (cmd === "setup") await setup(rest[0], { grantor: flag("for") });
+  else if (cmd === "delegate") await delegate(rest[0], { grantor: flag("for"), grantee: flag("as") });
   else if (cmd === "post") await post(rest.join(" "));
   else if (cmd === "whoami") await whoami();
   else {
-    console.log("usage: browserid-bsky <setup <handle> | post \"text\" | whoami>");
+    console.log(
+      "usage: browserid-bsky <setup <handle> [--for <identity>] | " +
+        "delegate <account-handle> --for <owner-id> [--as <actor-id>] | post \"text\" | whoami>",
+    );
     process.exit(cmd ? 1 : 0);
   }
 } catch (e) {
