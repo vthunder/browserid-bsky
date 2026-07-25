@@ -5,7 +5,7 @@ status: todo
 type: feature
 priority: high
 created_at: 2026-07-24T20:50:36Z
-updated_at: 2026-07-24T21:24:53Z
+updated_at: 2026-07-25T00:13:14Z
 ---
 
 Dan (2026-07-24): this should be browserid's FLAGSHIP demo. The narrative:
@@ -107,3 +107,36 @@ Node path and keeps Rust as the alternative.
   the Rust implementation, but the live run (which needs a human to approve)
   has not happened. Do that before calling the demo real.
 - The on-behalf path still has no live run.
+
+## ON-BEHALF PROVEN LIVE 2026-07-25 — one approval, no as-me warrant
+
+dan.at.browserid.me / did:plc:ici2zt3u5atflxoeofrjlqp3, post 3mrgl73yizs2z:
+  attributedTo danmills@sandmill.org
+  executedBy   danmills+bsky@sandmill.org
+  onBehalf true, ok true, all 12 checks pass
+  labeler emits browserid-on-behalf
+Driven end to end by the Node CLI (no compiler), one human approval.
+
+Two blockers had to be removed first, both surfaced by Dan pushing back:
+
+1. The registrar collapsed the grantor (agent_provision.rs:953 validated every
+   owned-path warrant as grantor == grantee == agent), so the on-behalf shape
+   was UNREACHABLE regardless of UI. Fixed with three explicit identity_modes
+   (self / handle / standalone) — bean browserid-ng-8v6c.
+
+2. /browserid/provision was first-party only, which forced the human to issue
+   an AS-ME warrant just to bootstrap an account — a broader grant than the
+   thing it guarded. The real hazard was the one-time PDS password (bypasses
+   warrant scoping entirely). Now an explicit `account:create` scope authorizes
+   a delegate, and the password is WITHHELD from a delegate. So one approval
+   covers open-the-account AND post, and nothing ever impersonates the human.
+
+Both provenance paths are now live: claude + claudejs as-itself,
+dan on-behalf.
+
+## Remaining for the flagship demo
+- @browserid-ng/bsky is published; the npx one-liners work.
+- The approval dialog is functional but nearly unusable (Dan). Brief for a
+  redesign: browserid-ng docs/design/2026-07-25-approval-dialog-brief.md.
+- s8lv (cert-level "this is an agent of X" marker) is the remaining protocol
+  gap from the shape discussion.
