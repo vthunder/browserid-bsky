@@ -55,21 +55,23 @@ async function setup(handleLabel, { grantor } = {}) {
   if (!handleLabel) die("usage: browserid-bsky setup <handle> [--for <identity>]   (agree the handle with the human first)");
   if (load()) die(`already set up (${STATE}). Delete that file to start over.`);
 
-  // No `handle` pin here: that field is a BROWSERID identity handle, not the
-  // Bluesky account name — passing the account label would ask the broker for
-  // an identity by that name.
+  // `grantee: "*"` — the approver chooses or mints the agent's identity.
+  // Omitting it instead means "the agent demands the human's own bare
+  // identity", which the approval page rightly renders as a become-you
+  // warning; this tool never needs that. The approver can still pick
+  // on-behalf (the default — account owned by them, posts attributed to
+  // them) or "not in my name" (a standalone sub-identity owns the account);
+  // account:create authorizes the delegate case at /browserid/provision.
   //
-  // Omitting `grantee` means as-you (grantee ≡ grantor), which is what
-  // /browserid/provision requires. It does NOT decide WHICH identity fills
-  // both slots: with the grantor left open, approving "with its own handle"
-  // mints a fresh sub-identity and the account ends up owned by that, which
-  // can never later delegate (browserid-ng-y9xm). Pass `--for <identity>` to
-  // pin the owner — the approval must then be made as exactly that identity.
-  // One approval covers both: opening the account AND posting to it. The
-  // human can pick "do things for me" (a delegate acting for them) or "act as
-  // me" — both work, because account:create authorizes the delegate case.
+  // The requested handle is a SUGGESTION for the agent identity's tag
+  // (`<local>+<tag>@…`), reusing the Bluesky label so the two names rhyme.
+  // Pass `--for <identity>` to pin the owner — the approval must then be
+  // made as exactly that identity. One approval covers both: opening the
+  // account AND posting to it.
   const pending = await requestProvision(BROKER, {
     grants: [{ audience: BRIDGE, scopes: ["login", CREATE_SCOPE, POST_SCOPE] }],
+    grantee: "*",
+    handle: handleLabel,
     ...(grantor ? { grantor } : {}),
     label: `Bluesky account ${handleLabel} via bsky.browserid.me`,
   });

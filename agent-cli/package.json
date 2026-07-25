@@ -1,6 +1,6 @@
 {
   "name": "@browserid-ng/bsky",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Set up a Bluesky account on bsky.browserid.me and post to it with verifiable provenance \u2014 for AI agents, no compiler required.",
   "type": "module",
   "bin": {
