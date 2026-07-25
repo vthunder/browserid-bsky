@@ -392,12 +392,25 @@ pub async fn subscribe_labels(
     ws.on_upgrade(move |socket| stream_labels(state, socket, cursor))
 }
 
-async fn stream_labels(state: S, mut socket: axum::extract::ws::WebSocket, cursor: i64) {
+/// How often to ping an idle consumer. Labels are rare, so without this a
+/// consumer whose TCP connection died without a FIN (NAT timeout, killed
+/// peer) is never written to and so never fails — its socket would be held
+/// until the process restarts.
+const LABEL_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn stream_labels(state: S, socket: axum::extract::ws::WebSocket, cursor: i64) {
     use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
     let labeler = state.labeler.as_ref().expect("checked before upgrade");
     // Subscribe BEFORE backfilling so a label emitted mid-backfill is queued
     // rather than lost in the gap between the two.
     let mut live = state.label_tx.subscribe();
+    // Split so the read half can be polled concurrently with the writes. The
+    // read half is what makes a consumer's disconnect observable at all: a
+    // Close frame — or a bare FIN — is only seen by reading, and this stream
+    // is otherwise write-only for minutes at a time.
+    let (mut tx, mut rx) = socket.split();
     let mut sent_through = cursor;
     loop {
         let batch = match state.store.labels_since(sent_through, 500) {
@@ -411,27 +424,43 @@ async fn stream_labels(state: S, mut socket: axum::extract::ws::WebSocket, curso
             break;
         }
         for l in &batch {
-            if socket.send(Message::Binary(labeler.labels_frame(l))).await.is_err() {
+            if tx.send(Message::Binary(labeler.labels_frame(l))).await.is_err() {
                 return;
             }
             sent_through = l.seq;
         }
     }
+    let mut ping = tokio::time::interval(LABEL_PING_INTERVAL);
+    ping.tick().await; // the first tick is immediate
     loop {
-        match live.recv().await {
-            Ok(l) => {
-                // Skip anything the backfill already covered.
-                if l.seq <= sent_through {
-                    continue;
-                }
-                if socket.send(Message::Binary(labeler.labels_frame(&l))).await.is_err() {
+        tokio::select! {
+            // Peer went away (Close, error, or EOF): drop the connection.
+            // Anything else it sends is not part of this lexicon — reading
+            // it is what keeps the disconnect visible.
+            incoming = rx.next() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            },
+            _ = ping.tick() => {
+                if tx.send(Message::Ping(Vec::new())).await.is_err() {
                     return;
                 }
-                sent_through = l.seq;
             }
-            // Lagged: the consumer will reconnect with its cursor and
-            // backfill the gap from the store, so just drop it.
-            Err(_) => return,
+            l = live.recv() => match l {
+                Ok(l) => {
+                    // Skip anything the backfill already covered.
+                    if l.seq <= sent_through {
+                        continue;
+                    }
+                    if tx.send(Message::Binary(labeler.labels_frame(&l))).await.is_err() {
+                        return;
+                    }
+                    sent_through = l.seq;
+                }
+                // Lagged: the consumer will reconnect with its cursor and
+                // backfill the gap from the store, so just drop it.
+                Err(_) => return,
+            },
         }
     }
 }

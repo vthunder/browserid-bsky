@@ -420,3 +420,68 @@ async fn passthrough_and_metadata() {
     let challenge = resp.headers().get("www-authenticate").unwrap().to_str().unwrap();
     assert!(challenge.starts_with("BrowserID "), "{challenge}");
 }
+
+/// A `subscribeLabels` consumer that goes away must take its connection with
+/// it (bean hfh8). The stream is write-only for minutes at a time, so a
+/// disconnect is only ever noticed by *reading* the socket — without that,
+/// the task parks on the label channel forever and holds the fd. Consumers
+/// reconnect every ~30s, which exhausted the process fd limit in about a day.
+#[tokio::test]
+async fn dropped_label_consumers_release_their_connections() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let idp = KeyPair::generate();
+    let label_tx = pds_bridge::label_channel();
+    let state = BridgeState {
+        origin: ORIGIN.to_string(),
+        handle_domain: "at.browserid.test".to_string(),
+        broker_url: "https://broker.invalid".to_string(),
+        broker_key: idp.public_key(),
+        status_cache: Arc::new(StatusCache::new()),
+        store: Store::open_in_memory().unwrap(),
+        pds: PdsClient::new("http://pds.invalid".to_string(), "admin-secret"),
+        http: reqwest::Client::new(),
+        labeler: Some(
+            pds_bridge::labeler::Labeler::new(&"01".repeat(32), ORIGIN, None).unwrap(),
+        ),
+        label_tx: label_tx.clone(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, state.router()).await.unwrap() });
+
+    // Connect, complete the upgrade, then vanish — exactly what a relay does
+    // between its reconnects.
+    const CONSUMERS: usize = 5;
+    for _ in 0..CONSUMERS {
+        let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        sock.write_all(
+            format!(
+                "GET /xrpc/com.atproto.label.subscribeLabels HTTP/1.1\r\n\
+                 Host: 127.0.0.1:{port}\r\n\
+                 Connection: Upgrade\r\n\
+                 Upgrade: websocket\r\n\
+                 Sec-WebSocket-Version: 13\r\n\
+                 Sec-WebSocket-Key: AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut head = [0u8; 32];
+        let n = sock.read(&mut head).await.unwrap();
+        let head = String::from_utf8_lossy(&head[..n]).to_string();
+        assert!(head.starts_with("HTTP/1.1 101"), "upgrade refused: {head}");
+        drop(sock);
+    }
+
+    // Each live consumer holds a subscription to the label channel, so the
+    // receiver count is a direct read on how many stream tasks are alive.
+    for _ in 0..100 {
+        if label_tx.receiver_count() == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{} label consumers still connected after disconnecting", label_tx.receiver_count());
+}

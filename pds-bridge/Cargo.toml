@@ -12,6 +12,7 @@ browserid-rp = { workspace = true }
 
 axum = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
