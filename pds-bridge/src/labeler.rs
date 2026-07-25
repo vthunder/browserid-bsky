@@ -40,15 +40,42 @@ pub fn is_pair_val(val: &str) -> bool {
     val.starts_with(PAIR_PREFIX_AGENT) || val.starts_with(PAIR_PREFIX_OWNER)
 }
 
+/// `danmills+fable@sandmill.org` → `danmills@sandmill.org`. A `+tag` local
+/// part is a **sub-identity**: same human, separate identity, which is how
+/// an agent gets an identity of its own.
+pub fn base_identity(email: &str) -> String {
+    match email.split_once('@') {
+        Some((local, domain)) => format!("{}@{}", local.split('+').next().unwrap_or(local), domain),
+        None => email.to_string(),
+    }
+}
+
+/// Whether an identity is an agent sub-identity rather than a person's own.
+fn is_sub_identity(email: &str) -> bool {
+    email.split_once('@').map_or(false, |(local, _)| local.contains('+'))
+}
+
+/// Which badge family a (grantor, grantee) earns. An agent shows up two
+/// ways: acting **for** someone else (grantor != grantee), or owning the
+/// account under its own `+tag` sub-identity (grantor == grantee, but that
+/// identity is an agent's). Both read "by agent" — only a person posting as
+/// plainly themselves is "by owner".
+fn is_agent_pair(grantor: &str, grantee: &str) -> bool {
+    grantor != grantee || is_sub_identity(grantor)
+}
+
 /// The pair label value for a (grantor, grantee): the first 8 hex chars of
 /// SHA-256 over `"{grantor}|{grantee}"`, prefixed by which relationship it
 /// is. Stable across restarts and hosts (it is the definition's key), and
 /// well inside the label-val charset (lowercase alphanumerics + hyphen) and
-/// length cap.
+/// length cap. The prefix is part of the classification, so reclassifying a
+/// pair yields a *different* val — which is what lets a stale label be
+/// negated and replaced.
 pub fn pair_val(grantor: &str, grantee: &str) -> String {
     let digest = Sha256::digest(format!("{grantor}|{grantee}").as_bytes());
     let h: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    let prefix = if grantor == grantee { PAIR_PREFIX_OWNER } else { PAIR_PREFIX_AGENT };
+    let prefix =
+        if is_agent_pair(grantor, grantee) { PAIR_PREFIX_AGENT } else { PAIR_PREFIX_OWNER };
     format!("{prefix}{h}")
 }
 
@@ -63,10 +90,12 @@ pub fn pair_name(val: &str) -> &'static str {
 
 /// The click-through text: this is where the identities are actually named.
 pub fn pair_description(grantor: &str, grantee: &str) -> String {
-    let who = if grantor == grantee {
-        format!("Posted by {grantor}, the owner of this handle.")
-    } else {
+    let who = if grantor != grantee {
         format!("Posted by {grantee} on behalf of {grantor}, the owner of this handle.")
+    } else if is_sub_identity(grantor) {
+        format!("Posted by {grantor}, an agent owned by {}.", base_identity(grantor))
+    } else {
+        format!("Posted by {grantor}, the owner of this handle.")
     };
     format!(
         "{who}\nFor more information, copy the link to this post and paste it at bsky.browserid.me"
@@ -199,17 +228,27 @@ impl Labeler {
     /// raw 64-byte signature. The same signature is served two ways: as
     /// `{"$bytes": …}` over JSON (`queryLabels`) and as a CBOR byte string
     /// over the firehose (`subscribeLabels`).
-    pub fn sign(&self, uri: &str, val: &str, cts: &str) -> Vec<u8> {
+    ///
+    /// `neg` marks a **negation** — the retraction of a label previously
+    /// emitted on the same subject. It is part of the signed body, and (per
+    /// the spec) is omitted entirely rather than serialized as `false`, so a
+    /// plain label's bytes are unchanged by this parameter existing.
+    pub fn sign(&self, uri: &str, val: &str, cts: &str, neg: bool) -> Vec<u8> {
         #[derive(Serialize)]
         struct Unsigned<'a> {
             cts: &'a str,
+            // DAG-CBOR map order is by key length then bytewise; every key
+            // here is 3 bytes, so the declaration order IS the encoding.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            neg: Option<bool>,
             src: &'a str,
             uri: &'a str,
             val: &'a str,
             ver: i64,
         }
         // Canonical DAG-CBOR of the sig-less label, then SHA-256, then sign.
-        let unsigned = Unsigned { cts, src: &self.did, uri, val, ver: 1 };
+        let unsigned =
+            Unsigned { cts, neg: neg.then_some(true), src: &self.did, uri, val, ver: 1 };
         let cbor = serde_ipld_dagcbor::to_vec(&unsigned).expect("dag-cbor");
         let digest = Sha256::digest(&cbor);
         let sig: Signature = self.signing_key.sign_prehash(&digest).expect("sign");
@@ -218,20 +257,31 @@ impl Labeler {
     }
 
     /// Build and sign a label, JSON-shaped for `queryLabels`.
-    pub fn sign_label(&self, uri: &str, val: &str, cts: &str) -> serde_json::Value {
-        self.label_json(uri, val, cts, &self.sign(uri, val, cts))
+    pub fn sign_label(&self, uri: &str, val: &str, cts: &str, neg: bool) -> serde_json::Value {
+        self.label_json(&crate::store::EmittedLabel {
+            seq: 0,
+            uri: uri.to_string(),
+            val: val.to_string(),
+            cts: cts.to_string(),
+            neg,
+            sig: self.sign(uri, val, cts, neg),
+        })
     }
 
     /// JSON form of an already-signed label.
-    pub fn label_json(&self, uri: &str, val: &str, cts: &str, sig: &[u8]) -> serde_json::Value {
-        serde_json::json!({
+    pub fn label_json(&self, l: &crate::store::EmittedLabel) -> serde_json::Value {
+        let mut json = serde_json::json!({
             "ver": 1,
             "src": self.did,
-            "uri": uri,
-            "val": val,
-            "cts": cts,
-            "sig": { "$bytes": B64.encode(sig) },
-        })
+            "uri": l.uri,
+            "val": l.val,
+            "cts": l.cts,
+            "sig": { "$bytes": B64.encode(&l.sig) },
+        });
+        if l.neg {
+            json["neg"] = serde_json::Value::Bool(true);
+        }
+        json
     }
 
     /// One `subscribeLabels` message: an atproto event-stream frame, which
@@ -249,6 +299,8 @@ impl Labeler {
             // length, sorted bytewise) — serde_ipld_dagcbor writes struct
             // fields as declared, so the declaration IS the encoding.
             cts: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            neg: Option<bool>,
             #[serde(with = "serde_bytes")]
             sig: &'a [u8],
             src: &'a str,
@@ -266,6 +318,7 @@ impl Labeler {
             seq: l.seq,
             labels: vec![Label {
                 cts: &l.cts,
+                neg: l.neg.then_some(true),
                 sig: &l.sig,
                 src: &self.did,
                 uri: &l.uri,
@@ -319,6 +372,125 @@ mod tests {
             pair_val("a@example.com", "b@example.com"),
             pair_val("b@example.com", "a@example.com")
         );
+    }
+
+    /// An account owned by an agent's own `+tag` sub-identity is "by agent"
+    /// too, even though grantor == grantee — "by owner" would credit the
+    /// agent as the person. The hash input is unchanged, so reclassifying a
+    /// pair changes only the prefix, which is what makes the old val
+    /// identifiable and negatable.
+    #[test]
+    fn a_sub_identity_posting_as_itself_is_an_agent_not_an_owner() {
+        let agent = "danmills+fable@sandmill.org";
+        let human = "danmills@sandmill.org";
+
+        let val = pair_val(agent, agent);
+        assert!(val.starts_with(PAIR_PREFIX_AGENT));
+        assert_eq!(pair_name(&val), PAIR_NAME_AGENT);
+        assert_eq!(
+            pair_description(agent, agent),
+            format!(
+                "Posted by {agent}, an agent owned by {human}.\n\
+                 For more information, copy the link to this post and paste it at bsky.browserid.me"
+            )
+        );
+
+        // Only the prefix moved: same pair, same 8 hex chars.
+        assert_eq!(val[PAIR_PREFIX_AGENT.len()..], {
+            let d = Sha256::digest(format!("{agent}|{agent}").as_bytes());
+            d.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>()
+        });
+
+        // A plain identity as itself is still the owner.
+        let owner = pair_val(human, human);
+        assert!(owner.starts_with(PAIR_PREFIX_OWNER));
+        assert_eq!(pair_description(human, human), format!("Posted by {human}, the owner of this handle.\nFor more information, copy the link to this post and paste it at bsky.browserid.me"));
+
+        // On-behalf is untouched by the reclassification.
+        let on_behalf = pair_val(human, agent);
+        assert!(on_behalf.starts_with(PAIR_PREFIX_AGENT));
+        assert!(pair_description(human, agent)
+            .starts_with(&format!("Posted by {agent} on behalf of {human}, the owner")));
+
+        assert_eq!(base_identity(agent), human);
+        assert_eq!(base_identity(human), human);
+        assert_eq!(base_identity("weird"), "weird");
+    }
+
+    /// A negation is a distinct signed statement: `neg` is inside the signed
+    /// bytes, so a consumer cannot strip it and still verify. A plain label
+    /// must be byte-identical to what the pre-`neg` code signed, which is why
+    /// `neg: false` is omitted rather than encoded.
+    #[test]
+    fn negations_sign_differently_and_omit_neg_when_false() {
+        let l = Labeler::new(&test_key(), "https://bsky.browserid.me", None).unwrap();
+        let (uri, cts) = ("at://did:plc:abc/app.bsky.feed.post/xyz", "2026-07-26T00:00:00.000Z");
+        let val = "by-owner-ea7898db";
+
+        assert_ne!(l.sign(uri, val, cts, false), l.sign(uri, val, cts, true));
+
+        let plain = l.sign_label(uri, val, cts, false);
+        assert!(plain.get("neg").is_none(), "a plain label carries no neg field");
+        let negated = l.sign_label(uri, val, cts, true);
+        assert_eq!(negated["neg"], true);
+        assert_eq!(negated["val"], val, "a negation names the val it retracts");
+
+        // The frame a consumer actually ingests must carry neg too, and the
+        // signature over it must verify.
+        let stored = crate::store::EmittedLabel {
+            seq: 9,
+            uri: uri.into(),
+            val: val.into(),
+            cts: cts.into(),
+            neg: true,
+            sig: l.sign(uri, val, cts, true),
+        };
+        #[derive(serde::Deserialize)]
+        struct DecodedLabel {
+            cts: String,
+            neg: Option<bool>,
+            #[serde(with = "serde_bytes")]
+            sig: Vec<u8>,
+            src: String,
+            uri: String,
+            val: String,
+            ver: i64,
+        }
+        #[derive(serde::Deserialize)]
+        struct Body {
+            labels: Vec<DecodedLabel>,
+        }
+        let mut cur = std::io::Cursor::new(l.labels_frame(&stored));
+        // Skip the header; the body is the second object in the frame.
+        let _: serde_json::Value =
+            serde_ipld_dagcbor::de::from_reader_once(&mut cur).expect("header");
+        let body: Body = serde_ipld_dagcbor::de::from_reader_once(&mut cur).expect("body");
+        let got = &body.labels[0];
+        assert_eq!(got.neg, Some(true));
+
+        #[derive(Serialize)]
+        struct Unsigned<'a> {
+            cts: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            neg: Option<bool>,
+            src: &'a str,
+            uri: &'a str,
+            val: &'a str,
+            ver: i64,
+        }
+        let digest = Sha256::digest(
+            &serde_ipld_dagcbor::to_vec(&Unsigned {
+                cts: &got.cts,
+                neg: got.neg,
+                src: &got.src,
+                uri: &got.uri,
+                val: &got.val,
+                ver: got.ver,
+            })
+            .unwrap(),
+        );
+        let sig = Signature::from_slice(&got.sig).unwrap();
+        assert!(l.signing_key.verifying_key().verify_prehash(&digest, &sig).is_ok());
     }
 
     #[test]
@@ -399,7 +571,7 @@ mod tests {
     fn did_override_changes_label_src_but_not_the_did_web_doc() {
         let plc = "did:plc:iewpoc3kqru4rgqpkojfixhx";
         let l = Labeler::new(&test_key(), "https://bsky.browserid.me", Some(plc.into())).unwrap();
-        let label = l.sign_label("at://did:plc:abc/app.bsky.feed.post/xyz", LABEL_VERIFIED, "2026-07-24T00:00:00.000Z");
+        let label = l.sign_label("at://did:plc:abc/app.bsky.feed.post/xyz", LABEL_VERIFIED, "2026-07-24T00:00:00.000Z", false);
         assert_eq!(label["src"], plc, "labels issue under the subscribable account DID");
         // The self-hosted did:web document still describes did:web (same key).
         assert_eq!(l.did_document()["id"], "did:web:bsky.browserid.me");
@@ -419,7 +591,8 @@ mod tests {
             uri: uri.into(),
             val: LABEL_VERIFIED.into(),
             cts: cts.into(),
-            sig: l.sign(uri, LABEL_VERIFIED, cts),
+            neg: false,
+            sig: l.sign(uri, LABEL_VERIFIED, cts, false),
         };
 
         #[derive(serde::Deserialize)]
@@ -466,7 +639,7 @@ mod tests {
     fn label_signature_verifies() {
         let l = Labeler::new(&test_key(), "https://bsky.browserid.me", None).unwrap();
         let uri = "at://did:plc:abc/app.bsky.feed.post/xyz";
-        let label = l.sign_label(uri, LABEL_VERIFIED, "2026-07-24T00:00:00.000Z");
+        let label = l.sign_label(uri, LABEL_VERIFIED, "2026-07-24T00:00:00.000Z", false);
 
         // Reconstruct the signed bytes and verify against the published key.
         #[derive(Serialize)]

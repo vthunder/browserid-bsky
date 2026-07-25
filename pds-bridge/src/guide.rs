@@ -40,6 +40,16 @@ rather than to us.
    or as themselves. You do NOT need them to hand you their own identity:
    `account:create` is what authorizes a delegate to open the account.
 
+   **There are two shapes here, and they read differently in public. Ask the
+   human which they want before you request anything — do not assume.**
+   Posting **as yourself** means your own sub-identity (a `+tag` address like
+   `them+youragent@their.domain`) owns the account, and posts carry a badge
+   reading *by agent, an agent owned by <the human>*. Posting **on behalf**
+   means the human's own identity owns the account and you act for it; posts
+   read *by agent, on behalf of <the human>*. One more thing to weigh: if
+   the human's identity already owns an account here, on-behalf creation is
+   refused with a 409 and as-yourself is the only path left.
+
    This produces an **approval URL** plus a short user code and a
    fingerprint. Show all three to the human and stop. They open the URL,
    check that the fingerprint matches what you displayed, and approve. The
@@ -193,6 +203,17 @@ mod tests {
             "<label>.at.browserid.me",
             "https://bsky.browserid.me",
         ] {
+            assert!(md.contains(needle), "guide must mention {needle}");
+        }
+    }
+
+    /// The two account shapes are a decision only the human can make, so the
+    /// guide has to name both and say to ask — an agent that assumes picks
+    /// the human's public identity for them.
+    #[test]
+    fn guide_makes_the_agent_ask_which_account_shape() {
+        let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
+        for needle in ["as yourself", "on behalf", "do not assume", "409"] {
             assert!(md.contains(needle), "guide must mention {needle}");
         }
     }

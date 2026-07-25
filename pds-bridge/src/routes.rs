@@ -336,7 +336,7 @@ pub async fn query_labels(State(state): State<S>, raw: axum::extract::RawQuery) 
         // both surfaces always show the same label with the same `cts`.
         emit_label(&state, &did, &rkey).await;
         if let Ok(stored) = state.store.labels_for(uri) {
-            labels.extend(stored.iter().map(|l| labeler.label_json(&l.uri, &l.val, &l.cts, &l.sig)));
+            labels.extend(stored.iter().map(|l| labeler.label_json(l)));
         }
     }
     Json(serde_json::json!({ "labels": labels })).into_response()
@@ -499,24 +499,27 @@ pub async fn backfill_labels(state: S) {
     }
 }
 
-/// Verify a post and, if it earns a label, sign + persist + broadcast one.
-/// Idempotent: a subject that already has a label is left alone, which keeps
-/// firehose sequence numbers stable.
+/// Verify a post and, if it earns labels, sign + persist + broadcast them:
+/// the coarse `browserid-*` one, the per-pair one, and a negation of any
+/// pair label left over from an earlier classification. Idempotent — a post
+/// already carrying the right pair label is left alone, which keeps firehose
+/// sequence numbers stable.
 pub async fn emit_label(state: &S, did: &str, rkey: &str) {
     let Some(labeler) = &state.labeler else { return };
     let uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
-    // Skip only once BOTH families are present — the coarse `browserid-*`
-    // one and the per-pair one (bean ek9u). A post labeled before per-pair
-    // labels existed still needs its pair label, so "has any label" is no
-    // longer a sufficient guard.
-    match state.store.labels_for(&uri) {
-        Ok(existing) if existing.iter().any(|l| crate::labeler::is_pair_val(&l.val)) => return,
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!("label lookup failed: {e}");
-            return;
-        }
+    let live = match live_pair_vals(&state.store, &uri) {
+        Ok(v) => v,
+        Err(e) => return tracing::warn!("label lookup failed: {e}"),
+    };
+    // Skip only a post whose pair label is still the RIGHT one. A val's
+    // classification can change (an identity later recognized as an agent's
+    // `+tag` sub-identity), so "has a pair label" is not enough; re-derive
+    // the val from the identities the val was minted for. Both checks are
+    // local — no network unless something actually needs doing.
+    if live.iter().any(|val| pair_val_is_current(&state.store, val)) {
+        return;
     }
+
     let Some((grantor, grantee)) = fully_verified(state, did, rkey).await else { return };
     let coarse = if grantor != grantee {
         crate::labeler::LABEL_ON_BEHALF
@@ -529,17 +532,67 @@ pub async fn emit_label(state: &S, did: &str, rkey: &str) {
     // The pair val means nothing to a client until its definition is in the
     // service record, so declare it before the label hits the firehose.
     ensure_pair_definition(state, &pair, &grantor, &grantee).await;
+    if let Err(e) = state.store.record_label_pair(&pair, &grantor, &grantee) {
+        tracing::warn!("recording label pair failed: {e}");
+    }
 
+    // Retract any pair label this post carries under the old classification.
+    // A negation is an ordinary label with `neg`, on the same subject, with
+    // its own seq — consumers apply it in stream order.
+    let stale = live.into_iter().filter(|v| *v != pair);
+    for val in stale {
+        publish_label(state, labeler, &uri, &val, &cts, true);
+    }
     for val in [coarse, pair.as_str()] {
-        let sig = labeler.sign(&uri, val, &cts);
-        match state.store.insert_label(&uri, val, &cts, &sig) {
-            Ok(Some(l)) => {
-                tracing::info!("labeled {uri} {val} (seq {})", l.seq);
-                let _ = state.label_tx.send(l); // no subscribers is fine
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("storing label failed: {e}"),
+        publish_label(state, labeler, &uri, val, &cts, false);
+    }
+}
+
+/// Sign, store, and broadcast one label. Storing is idempotent per
+/// (uri, val, neg), so a repeat is a no-op and the firehose never sees it
+/// twice.
+fn publish_label(
+    state: &S,
+    labeler: &crate::labeler::Labeler,
+    uri: &str,
+    val: &str,
+    cts: &str,
+    neg: bool,
+) {
+    let sig = labeler.sign(uri, val, cts, neg);
+    match state.store.insert_label(uri, val, cts, neg, &sig) {
+        Ok(Some(l)) => {
+            let kind = if neg { "retracted" } else { "labeled" };
+            tracing::info!("{kind} {uri} {val} (seq {})", l.seq);
+            let _ = state.label_tx.send(l); // no subscribers is fine
         }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("storing label failed: {e}"),
+    }
+}
+
+/// The pair labels a subject currently carries: emitted and not since
+/// negated.
+fn live_pair_vals(
+    store: &crate::store::Store,
+    uri: &str,
+) -> Result<Vec<String>, crate::store::StoreError> {
+    let all = store.labels_for(uri)?;
+    Ok(all
+        .iter()
+        .filter(|l| !l.neg && crate::labeler::is_pair_val(&l.val))
+        .filter(|l| !all.iter().any(|n| n.neg && n.val == l.val))
+        .map(|l| l.val.clone())
+        .collect())
+}
+
+/// Would this val still be minted today for the identities it stands for?
+/// Unknown identities (a val recorded before the bridge stored them) answer
+/// `false`, which costs one re-verification and then self-heals.
+fn pair_val_is_current(store: &crate::store::Store, val: &str) -> bool {
+    match store.label_def_pair(val) {
+        Ok(Some((grantor, grantee))) => crate::labeler::pair_val(&grantor, &grantee) == val,
+        _ => false,
     }
 }
 
@@ -554,7 +607,7 @@ async fn ensure_pair_definition(state: &S, val: &str, grantor: &str, grantee: &s
         tracing::warn!("no LABELER_ACCOUNT_PASSWORD: cannot declare label value {val}");
         return;
     };
-    match state.store.claim_label_def(val) {
+    match state.store.claim_label_def(val, grantor, grantee) {
         Ok(true) => {}
         Ok(false) => return,
         Err(e) => return tracing::warn!("label def claim failed: {e}"),
@@ -982,6 +1035,53 @@ fn root_identity(email: &str) -> String {
     match email.split_once('@') {
         Some((local, domain)) => format!("{}@{}", local.split('+').next().unwrap_or(local), domain),
         None => email.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod label_guard_tests {
+    use super::{live_pair_vals, pair_val_is_current};
+    use crate::labeler::pair_val;
+    use crate::store::Store;
+
+    const URI: &str = "at://did:plc:xyz/app.bsky.feed.post/abc";
+
+    /// The guard decides, without any network, whether a post is already
+    /// labeled correctly. It must say "no" for a label minted under the old
+    /// classification (so the post is re-verified, negated and relabeled),
+    /// and "yes" once the current val is in place.
+    #[test]
+    fn a_stale_classification_is_not_treated_as_labeled() {
+        let s = Store::open_in_memory().unwrap();
+        let agent = "danmills+fable@sandmill.org";
+        let stale = "by-owner-ea7898db"; // what the old rule minted for (agent, agent)
+        let current = pair_val(agent, agent);
+        assert_ne!(stale, current);
+
+        s.insert_label(URI, "browserid-verified", "t", false, b"s").unwrap();
+        s.insert_label(URI, stale, "t", false, b"s").unwrap();
+        s.record_label_pair(stale, agent, agent).unwrap();
+
+        assert_eq!(live_pair_vals(&s, URI).unwrap(), [stale], "coarse vals are not pair vals");
+        assert!(!pair_val_is_current(&s, stale), "reclassified — must be redone");
+
+        // Do what emit_label would: negate the stale one, add the current one.
+        s.insert_label(URI, stale, "t2", true, b"s").unwrap();
+        s.insert_label(URI, &current, "t2", false, b"s").unwrap();
+        s.record_label_pair(&current, agent, agent).unwrap();
+
+        assert_eq!(live_pair_vals(&s, URI).unwrap(), [current.clone()], "the negated val is gone");
+        assert!(pair_val_is_current(&s, &current), "second pass skips");
+    }
+
+    /// A val whose identities predate the `label_defs` columns is unknown,
+    /// so it is re-verified once rather than trusted — the self-healing path
+    /// for labels already in the wild.
+    #[test]
+    fn an_unknown_pair_is_re_verified_not_trusted() {
+        let s = Store::open_in_memory().unwrap();
+        s.insert_label(URI, "by-owner-ea7898db", "t", false, b"s").unwrap();
+        assert!(!pair_val_is_current(&s, "by-owner-ea7898db"));
     }
 }
 

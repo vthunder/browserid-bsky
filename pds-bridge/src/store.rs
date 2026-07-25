@@ -83,6 +83,10 @@ pub struct EmittedLabel {
     pub uri: String,
     pub val: String,
     pub cts: String,
+    /// A **negation**: retracts an earlier label with the same (uri, val).
+    /// Stored as its own row with its own seq — the stream is append-only,
+    /// so a retraction is an event, not an edit.
+    pub neg: bool,
     /// 64-byte compact k256 signature over the label's DAG-CBOR
     pub sig: Vec<u8>,
 }
@@ -147,11 +151,13 @@ impl Store {
                  val  TEXT NOT NULL,
                  cts  TEXT NOT NULL,
                  sig  BLOB NOT NULL,
-                 UNIQUE (uri, val)
+                 neg  INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS label_defs (
                  val         TEXT PRIMARY KEY,
-                 defined_at  TEXT NOT NULL
+                 defined_at  TEXT NOT NULL,
+                 grantor     TEXT,
+                 grantee     TEXT
              );
              CREATE TABLE IF NOT EXISTS audit_log (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,14 +173,58 @@ impl Store {
         // Idempotent column adds for DBs created before a column existed
         // (CREATE TABLE IF NOT EXISTS won't alter an existing table). A
         // duplicate-column error means it already ran — ignore it.
-        for stmt in ["ALTER TABLE tokens ADD COLUMN warrant_ref TEXT NOT NULL DEFAULT ''"] {
+        for stmt in [
+            "ALTER TABLE tokens ADD COLUMN warrant_ref TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE label_defs ADD COLUMN grantor TEXT",
+            "ALTER TABLE label_defs ADD COLUMN grantee TEXT",
+        ] {
             if let Err(e) = conn.execute(stmt, []) {
                 if !e.to_string().contains("duplicate column name") {
                     return Err(e.into());
                 }
             }
         }
+        // After the migration, so a legacy `labels` table has grown its
+        // `neg` column before the index that mentions it is created.
+        Self::migrate_labels_neg(&conn)?;
+        conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS labels_uri_val_neg ON labels (uri, val, neg);",
+        )?;
         Ok(Self { conn: Mutex::new(conn) })
+    }
+
+    /// Add `neg` to a pre-existing `labels` table. This one cannot be a plain
+    /// `ADD COLUMN`: the old table carries a `UNIQUE (uri, val)` *table*
+    /// constraint, which SQLite cannot drop, and which would reject a
+    /// negation of a label the same subject already carries. So rebuild the
+    /// table, copying `seq` verbatim — those numbers are the firehose cursor
+    /// and renumbering them would rewind or skip every live consumer.
+    fn migrate_labels_neg(conn: &Connection) -> Result<()> {
+        let has_neg = conn
+            .prepare("SELECT 1 FROM pragma_table_info('labels') WHERE name = 'neg'")?
+            .exists([])?;
+        if has_neg {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "BEGIN;
+             CREATE TABLE labels_new (
+                 seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+                 uri  TEXT NOT NULL,
+                 val  TEXT NOT NULL,
+                 cts  TEXT NOT NULL,
+                 sig  BLOB NOT NULL,
+                 neg  INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO labels_new (seq, uri, val, cts, sig, neg)
+                 SELECT seq, uri, val, cts, sig, 0 FROM labels;
+             DROP TABLE labels;
+             ALTER TABLE labels_new RENAME TO labels;
+             CREATE UNIQUE INDEX IF NOT EXISTS labels_uri_val_neg ON labels (uri, val, neg);
+             COMMIT;",
+        )?;
+        tracing::info!("migrated labels table: added neg");
+        Ok(())
     }
 
     // -- accounts ----------------------------------------------------------
@@ -458,12 +508,21 @@ impl Store {
     /// Record a signed label. The `seq` is the labeler firehose cursor, so
     /// labels must be stored exactly once and never renumbered — a consumer
     /// resuming at `cursor` expects everything above it, in order. Returns
-    /// `None` if this (uri, val) was already emitted.
-    pub fn insert_label(&self, uri: &str, val: &str, cts: &str, sig: &[u8]) -> Result<Option<EmittedLabel>> {
+    /// `None` if this (uri, val, neg) was already emitted — a label and its
+    /// later negation are distinct rows, so retracting is always possible,
+    /// but retracting twice is not.
+    pub fn insert_label(
+        &self,
+        uri: &str,
+        val: &str,
+        cts: &str,
+        neg: bool,
+        sig: &[u8],
+    ) -> Result<Option<EmittedLabel>> {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO labels (uri, val, cts, sig) VALUES (?1, ?2, ?3, ?4)",
-            params![uri, val, cts, sig],
+            "INSERT OR IGNORE INTO labels (uri, val, cts, neg, sig) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![uri, val, cts, neg as i64, sig],
         )?;
         if changed == 0 {
             return Ok(None);
@@ -473,34 +532,24 @@ impl Store {
             uri: uri.to_string(),
             val: val.to_string(),
             cts: cts.to_string(),
+            neg,
             sig: sig.to_vec(),
         }))
     }
 
-    /// Whether any label has been emitted for a subject (the cheap check
-    /// that keeps backfill from re-verifying every known post).
-    pub fn label_emitted(&self, uri: &str) -> Result<bool> {
-        Ok(self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row("SELECT 1 FROM labels WHERE uri = ?1 LIMIT 1", params![uri], |_| Ok(()))
-            .optional()?
-            .is_some())
-    }
-
-    /// Every label emitted on a subject.
+    /// Every label emitted on a subject, negations included.
     pub fn labels_for(&self, uri: &str) -> Result<Vec<EmittedLabel>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt =
-            conn.prepare("SELECT seq, uri, val, cts, sig FROM labels WHERE uri = ?1 ORDER BY seq")?;
+            conn.prepare("SELECT seq, uri, val, cts, neg, sig FROM labels WHERE uri = ?1 ORDER BY seq")?;
         let rows = stmt.query_map(params![uri], |r| {
             Ok(EmittedLabel {
                 seq: r.get(0)?,
                 uri: r.get(1)?,
                 val: r.get(2)?,
                 cts: r.get(3)?,
-                sig: r.get(4)?,
+                neg: r.get::<_, i64>(4)? != 0,
+                sig: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -510,7 +559,7 @@ impl Store {
     pub fn labels_since(&self, cursor: i64, limit: i64) -> Result<Vec<EmittedLabel>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT seq, uri, val, cts, sig FROM labels WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
+            "SELECT seq, uri, val, cts, neg, sig FROM labels WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![cursor, limit], |r| {
             Ok(EmittedLabel {
@@ -518,7 +567,8 @@ impl Store {
                 uri: r.get(1)?,
                 val: r.get(2)?,
                 cts: r.get(3)?,
-                sig: r.get(4)?,
+                neg: r.get::<_, i64>(4)? != 0,
+                sig: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -532,13 +582,41 @@ impl Store {
 
     /// Claim `val` for definition. `Ok(true)` = this caller should write the
     /// service record; `Ok(false)` = someone already did (or is doing it).
-    pub fn claim_label_def(&self, val: &str) -> Result<bool> {
+    pub fn claim_label_def(&self, val: &str, grantor: &str, grantee: &str) -> Result<bool> {
         let n = self.conn.lock().unwrap().execute(
-            "INSERT INTO label_defs (val, defined_at) VALUES (?1, ?2)
+            "INSERT INTO label_defs (val, defined_at, grantor, grantee) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(val) DO NOTHING",
-            params![val, Utc::now().to_rfc3339()],
+            params![val, Utc::now().to_rfc3339(), grantor, grantee],
         )?;
         Ok(n == 1)
+    }
+
+    /// Remember which identities a val stands for, even when the definition
+    /// itself was claimed earlier (rows written before this column existed
+    /// have no identities). This is what lets the emit path re-derive a
+    /// stored val's classification without touching the network.
+    pub fn record_label_pair(&self, val: &str, grantor: &str, grantee: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO label_defs (val, defined_at, grantor, grantee) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(val) DO UPDATE SET grantor = ?3, grantee = ?4",
+            params![val, Utc::now().to_rfc3339(), grantor, grantee],
+        )?;
+        Ok(())
+    }
+
+    /// The identities behind a pair val, if known.
+    pub fn label_def_pair(&self, val: &str) -> Result<Option<(String, String)>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT grantor, grantee FROM label_defs
+                 WHERE val = ?1 AND grantor IS NOT NULL AND grantee IS NOT NULL",
+                params![val],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     /// Release a claim whose record write failed, so a later post retries it.
@@ -606,12 +684,87 @@ mod tests {
     #[test]
     fn label_def_claim_is_exclusive_and_releasable() {
         let s = Store::open_in_memory().unwrap();
-        assert!(s.claim_label_def("by-agent-deadbeef").unwrap());
-        assert!(!s.claim_label_def("by-agent-deadbeef").unwrap());
-        assert!(s.claim_label_def("by-owner-deadbeef").unwrap(), "distinct val, own claim");
+        let (g, e) = ("dan@sandmill.org", "dan+fable@sandmill.org");
+        assert!(s.claim_label_def("by-agent-deadbeef", g, e).unwrap());
+        assert!(!s.claim_label_def("by-agent-deadbeef", g, e).unwrap());
+        assert!(s.claim_label_def("by-owner-deadbeef", g, g).unwrap(), "distinct val, own claim");
 
         s.release_label_def("by-agent-deadbeef").unwrap();
-        assert!(s.claim_label_def("by-agent-deadbeef").unwrap(), "retried after a failed write");
+        assert!(s.claim_label_def("by-agent-deadbeef", g, e).unwrap(), "retried after a failed write");
+
+        // The identities behind a val are what the emit path re-classifies
+        // from, so they must survive the claim and be fillable after it.
+        assert_eq!(s.label_def_pair("by-agent-deadbeef").unwrap(), Some((g.into(), e.into())));
+        assert_eq!(s.label_def_pair("by-owner-nosuch").unwrap(), None);
+        s.record_label_pair("by-owner-deadbeef", g, g).unwrap();
+        assert_eq!(s.label_def_pair("by-owner-deadbeef").unwrap(), Some((g.into(), g.into())));
+    }
+
+    /// A label and its negation coexist as separate rows with separate seqs
+    /// (the stream is append-only), but neither can be emitted twice.
+    #[test]
+    fn a_label_can_be_negated_but_not_twice() {
+        let s = Store::open_in_memory().unwrap();
+        let uri = "at://did:plc:xyz/app.bsky.feed.post/abc";
+
+        let first = s.insert_label(uri, "by-owner-dead", "t1", false, b"sig1").unwrap().unwrap();
+        assert!(!first.neg);
+        assert!(s.insert_label(uri, "by-owner-dead", "t1", false, b"sig1").unwrap().is_none());
+
+        let neg = s.insert_label(uri, "by-owner-dead", "t2", true, b"sig2").unwrap().unwrap();
+        assert!(neg.neg && neg.seq > first.seq, "a retraction is a later event");
+        assert!(s.insert_label(uri, "by-owner-dead", "t3", true, b"sig3").unwrap().is_none());
+
+        let all = s.labels_for(uri).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|l| l.neg).count(), 1);
+        // The firehose replays both, in order, with neg intact.
+        let since = s.labels_since(first.seq - 1, 10).unwrap();
+        assert_eq!(since.iter().map(|l| l.neg).collect::<Vec<_>>(), [false, true]);
+    }
+
+    /// The pre-`neg` schema had a `UNIQUE (uri, val)` table constraint that
+    /// would reject any negation. Opening such a DB must rebuild the table,
+    /// keeping every `seq` — they are live consumer cursors.
+    #[test]
+    fn opening_a_pre_neg_database_migrates_it_without_renumbering() {
+        let dir = std::env::temp_dir().join(format!("pds-bridge-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("labels-migration.db");
+        let _ = std::fs::remove_file(&path);
+
+        let old = Connection::open(&path).unwrap();
+        old.execute_batch(
+            "CREATE TABLE labels (
+                 seq  INTEGER PRIMARY KEY AUTOINCREMENT,
+                 uri  TEXT NOT NULL,
+                 val  TEXT NOT NULL,
+                 cts  TEXT NOT NULL,
+                 sig  BLOB NOT NULL,
+                 UNIQUE (uri, val)
+             );
+             INSERT INTO labels (seq, uri, val, cts, sig)
+                 VALUES (41, 'at://a/p/1', 'browserid-verified', 't', x'00'),
+                        (42, 'at://a/p/1', 'by-owner-dead', 't', x'01');",
+        )
+        .unwrap();
+        drop(old);
+
+        let s = Store::open(&path).unwrap();
+        let all = s.labels_for("at://a/p/1").unwrap();
+        assert_eq!(all.iter().map(|l| l.seq).collect::<Vec<_>>(), [41, 42], "cursors preserved");
+        assert!(all.iter().all(|l| !l.neg), "existing labels are not negations");
+
+        // The whole point: the old unique constraint no longer blocks this.
+        let neg = s.insert_label("at://a/p/1", "by-owner-dead", "t2", true, b"s").unwrap();
+        assert!(neg.is_some());
+        assert!(neg.unwrap().seq > 42, "new rows continue the sequence");
+
+        // Re-opening is a no-op, not a second rebuild.
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.labels_for("at://a/p/1").unwrap().len(), 3);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
