@@ -55,6 +55,12 @@ async fn main() {
     });
     if let Some(l) = &labeler {
         tracing::info!("labeler enabled: {}", l.did);
+        if std::env::var("LABELER_ACCOUNT_PASSWORD").is_err() {
+            tracing::warn!(
+                "LABELER_ACCOUNT_PASSWORD unset: per-pair labels will be emitted but their \
+                 labelValueDefinitions cannot be published, so clients render no badge text"
+            );
+        }
     }
 
     let state = BridgeState {
@@ -68,6 +74,7 @@ async fn main() {
         pds: pds_bridge::pds::PdsClient::new(pds_url, pds_admin_password),
         http,
         labeler,
+        labeler_account_password: std::env::var("LABELER_ACCOUNT_PASSWORD").ok(),
         label_tx: pds_bridge::label_channel(),
     };
     let state = Arc::new(state);

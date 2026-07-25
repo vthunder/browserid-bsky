@@ -22,6 +22,114 @@ pub const LABEL_VERIFIED: &str = "browserid-verified";
 /// Fully verified, but a delegate acted on behalf of another identity.
 pub const LABEL_ON_BEHALF: &str = "browserid-on-behalf";
 
+/// Prefixes of the **per-identity-pair** label values (bean ek9u). A label
+/// `val` is an opaque identifier; what a client renders is the matching
+/// `labelValueDefinition`'s locale `name` (the badge) and `description` (the
+/// click-through). So the val carries no email — it is a hash keying a
+/// definition whose *description* names the identities, while many vals
+/// share the one short badge name.
+pub const PAIR_PREFIX_AGENT: &str = "by-agent-";
+pub const PAIR_PREFIX_OWNER: &str = "by-owner-";
+
+/// Badge text (locale `name`) for each pair-label family.
+pub const PAIR_NAME_AGENT: &str = "by agent";
+pub const PAIR_NAME_OWNER: &str = "by owner";
+
+/// Is this a per-identity-pair val (as opposed to a `browserid-*` one)?
+pub fn is_pair_val(val: &str) -> bool {
+    val.starts_with(PAIR_PREFIX_AGENT) || val.starts_with(PAIR_PREFIX_OWNER)
+}
+
+/// The pair label value for a (grantor, grantee): the first 8 hex chars of
+/// SHA-256 over `"{grantor}|{grantee}"`, prefixed by which relationship it
+/// is. Stable across restarts and hosts (it is the definition's key), and
+/// well inside the label-val charset (lowercase alphanumerics + hyphen) and
+/// length cap.
+pub fn pair_val(grantor: &str, grantee: &str) -> String {
+    let digest = Sha256::digest(format!("{grantor}|{grantee}").as_bytes());
+    let h: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    let prefix = if grantor == grantee { PAIR_PREFIX_OWNER } else { PAIR_PREFIX_AGENT };
+    format!("{prefix}{h}")
+}
+
+/// Badge text for a pair val.
+pub fn pair_name(val: &str) -> &'static str {
+    if val.starts_with(PAIR_PREFIX_OWNER) {
+        PAIR_NAME_OWNER
+    } else {
+        PAIR_NAME_AGENT
+    }
+}
+
+/// The click-through text: this is where the identities are actually named.
+pub fn pair_description(grantor: &str, grantee: &str) -> String {
+    let who = if grantor == grantee {
+        format!("Posted by {grantor}, the owner of this handle.")
+    } else {
+        format!("Posted by {grantee} on behalf of {grantor}, the owner of this handle.")
+    };
+    format!(
+        "{who}\nFor more information, copy the link to this post and paste it at bsky.browserid.me"
+    )
+}
+
+/// One `labelValueDefinition`, shaped like the existing `browserid-*` ones
+/// (informational, non-blurring).
+pub fn pair_definition(val: &str, grantor: &str, grantee: &str) -> serde_json::Value {
+    serde_json::json!({
+        "identifier": val,
+        "severity": "inform",
+        "blurs": "none",
+        "adultOnly": false,
+        "defaultSetting": "warn",
+        "locales": [{
+            "lang": "en",
+            "name": pair_name(val),
+            "description": pair_description(grantor, grantee),
+        }],
+    })
+}
+
+/// Read-modify-write of an `app.bsky.labeler.service` record value: append
+/// `val` to `policies.labelValues` and its definition to
+/// `policies.labelValueDefinitions`, replacing any existing entry for the
+/// same identifier. Returns `false` when the record already said exactly
+/// this (nothing to write) — the guard against re-putting on every restart
+/// and against a concurrent append being duplicated.
+pub fn merge_definition(record: &mut serde_json::Value, definition: serde_json::Value) -> bool {
+    let val = definition["identifier"].as_str().unwrap_or_default().to_string();
+    let policies = record
+        .as_object_mut()
+        .expect("service record is an object")
+        .entry("policies")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let mut changed = false;
+
+    let values = policies["labelValues"].as_array().cloned().unwrap_or_default();
+    if !values.iter().any(|v| v.as_str() == Some(val.as_str())) {
+        let mut values = values;
+        values.push(serde_json::Value::String(val.clone()));
+        policies["labelValues"] = serde_json::Value::Array(values);
+        changed = true;
+    }
+
+    let mut defs = policies["labelValueDefinitions"].as_array().cloned().unwrap_or_default();
+    match defs.iter_mut().find(|d| d["identifier"].as_str() == Some(val.as_str())) {
+        Some(existing) if *existing == definition => {}
+        Some(existing) => {
+            *existing = definition;
+            changed = true;
+        }
+        None => {
+            defs.push(definition);
+            changed = true;
+        }
+    }
+    policies["labelValueDefinitions"] = serde_json::Value::Array(defs);
+    changed
+}
+
 /// The labeler's k256 signing key + derived identity material.
 pub struct Labeler {
     signing_key: SigningKey,
@@ -188,6 +296,92 @@ mod tests {
     fn test_key() -> String {
         // A fixed 32-byte scalar (hex).
         "1a".repeat(32)
+    }
+
+    #[test]
+    fn pair_vals_are_stable_and_in_charset() {
+        let owner = pair_val("dan@sandmill.org", "dan@sandmill.org");
+        let agent = pair_val("dan@sandmill.org", "dan+agent@sandmill.org");
+        assert_eq!(owner, pair_val("dan@sandmill.org", "dan@sandmill.org"), "stable");
+        assert!(owner.starts_with(PAIR_PREFIX_OWNER) && agent.starts_with(PAIR_PREFIX_AGENT));
+        assert_ne!(owner[PAIR_PREFIX_OWNER.len()..], agent[PAIR_PREFIX_AGENT.len()..]);
+        for v in [&owner, &agent] {
+            assert_eq!(v.len(), PAIR_PREFIX_OWNER.len() + 8, "prefix + 8 hex chars");
+            assert!(
+                v.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "label vals are lowercase alphanumerics + hyphen: {v}"
+            );
+            assert!(is_pair_val(v));
+        }
+        assert!(!is_pair_val(LABEL_VERIFIED) && !is_pair_val(LABEL_ON_BEHALF));
+        // The hash covers the ordered pair, so a swap is a different val.
+        assert_ne!(
+            pair_val("a@example.com", "b@example.com"),
+            pair_val("b@example.com", "a@example.com")
+        );
+    }
+
+    #[test]
+    fn descriptions_name_the_identities_and_the_fallback() {
+        let d = pair_description("dan@sandmill.org", "dan+agent@sandmill.org");
+        assert!(d.starts_with("Posted by dan+agent@sandmill.org on behalf of dan@sandmill.org,"));
+        let own = pair_description("dan@sandmill.org", "dan@sandmill.org");
+        assert!(own.starts_with("Posted by dan@sandmill.org, the owner"));
+        for d in [&d, &own] {
+            assert!(d.contains("\nFor more information, copy the link to this post and paste it at bsky.browserid.me"));
+        }
+        // Many vals, one badge name.
+        assert_eq!(pair_name(&pair_val("a@example.com", "b@example.com")), PAIR_NAME_AGENT);
+        assert_eq!(pair_name(&pair_val("a@example.com", "a@example.com")), PAIR_NAME_OWNER);
+    }
+
+    /// Merging into a real-shaped service record must append exactly once per
+    /// val, leave the existing `browserid-*` vocabulary alone, and be a no-op
+    /// the second time (that no-op is what stops a re-put per post).
+    #[test]
+    fn merge_definition_is_additive_and_idempotent() {
+        let mut record = serde_json::json!({
+            "$type": "app.bsky.labeler.service",
+            "createdAt": "2026-07-24T20:10:00.000Z",
+            "policies": {
+                "labelValues": ["browserid-verified", "browserid-on-behalf"],
+                "labelValueDefinitions": [{
+                    "identifier": "browserid-verified",
+                    "severity": "inform", "blurs": "none", "adultOnly": false,
+                    "defaultSetting": "warn",
+                    "locales": [{"lang": "en", "name": "browserid verified", "description": "…"}],
+                }],
+            },
+        });
+        let (grantor, grantee) = ("dan@sandmill.org", "dan+agent@sandmill.org");
+        let val = pair_val(grantor, grantee);
+
+        assert!(merge_definition(&mut record, pair_definition(&val, grantor, grantee)));
+        assert!(
+            !merge_definition(&mut record, pair_definition(&val, grantor, grantee)),
+            "second merge changes nothing"
+        );
+
+        let policies = &record["policies"];
+        let values: Vec<&str> =
+            policies["labelValues"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(values, ["browserid-verified", "browserid-on-behalf", val.as_str()]);
+        let defs = policies["labelValueDefinitions"].as_array().unwrap();
+        assert_eq!(defs.len(), 2, "exactly one definition per val");
+        let mine = defs.iter().find(|d| d["identifier"] == val.as_str()).unwrap();
+        assert_eq!(mine["severity"], "inform");
+        assert_eq!(mine["blurs"], "none");
+        assert_eq!(mine["locales"][0]["name"], PAIR_NAME_AGENT);
+        assert!(mine["locales"][0]["description"].as_str().unwrap().contains(grantee));
+        assert_eq!(record["createdAt"], "2026-07-24T20:10:00.000Z", "untouched");
+
+        // A second pair sharing the badge name still gets its own definition.
+        let val2 = pair_val("other@example.com", "other@example.com");
+        assert!(merge_definition(
+            &mut record,
+            pair_definition(&val2, "other@example.com", "other@example.com")
+        ));
+        assert_eq!(record["policies"]["labelValueDefinitions"].as_array().unwrap().len(), 3);
     }
 
     #[test]

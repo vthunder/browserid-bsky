@@ -175,6 +175,7 @@ async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<S
         pds: PdsClient::new(mock_pds(captures.clone()).await, "admin-secret"),
         http: reqwest::Client::new(),
         labeler: None,
+        labeler_account_password: None,
         label_tx: pds_bridge::label_channel(),
     };
     (axum_test::TestServer::new(state.router()).unwrap(), cache, captures)
@@ -444,6 +445,7 @@ async fn dropped_label_consumers_release_their_connections() {
         labeler: Some(
             pds_bridge::labeler::Labeler::new(&"01".repeat(32), ORIGIN, None).unwrap(),
         ),
+        labeler_account_password: None,
         label_tx: label_tx.clone(),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -73,6 +73,12 @@ pub struct BridgeState {
     /// The atproto labeler (signs labels for verified posts); None if no
     /// signing key is configured.
     pub labeler: Option<crate::labeler::Labeler>,
+    /// The labeler *account*'s PDS password (`LABELER_ACCOUNT_PASSWORD`),
+    /// needed only to append per-pair `labelValueDefinition`s to its
+    /// `app.bsky.labeler.service` record. Unset degrades gracefully: labels
+    /// are still emitted, they just render with no badge text until a
+    /// definition exists.
+    pub labeler_account_password: Option<String>,
     /// Fan-out to live `subscribeLabels` consumers. Labels are PUSHED: the
     /// AppView ingests this stream into its own index and serves badges from
     /// there, so an unstreamed label is invisible no matter what

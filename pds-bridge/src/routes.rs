@@ -505,32 +505,111 @@ pub async fn backfill_labels(state: S) {
 pub async fn emit_label(state: &S, did: &str, rkey: &str) {
     let Some(labeler) = &state.labeler else { return };
     let uri = format!("at://{did}/app.bsky.feed.post/{rkey}");
-    match state.store.label_emitted(&uri) {
-        Ok(true) => return,
-        Ok(false) => {}
+    // Skip only once BOTH families are present — the coarse `browserid-*`
+    // one and the per-pair one (bean ek9u). A post labeled before per-pair
+    // labels existed still needs its pair label, so "has any label" is no
+    // longer a sufficient guard.
+    match state.store.labels_for(&uri) {
+        Ok(existing) if existing.iter().any(|l| crate::labeler::is_pair_val(&l.val)) => return,
+        Ok(_) => {}
         Err(e) => {
             tracing::warn!("label lookup failed: {e}");
             return;
         }
     }
-    let Some(on_behalf) = fully_verified(state, did, rkey).await else { return };
-    let val = if on_behalf { crate::labeler::LABEL_ON_BEHALF } else { crate::labeler::LABEL_VERIFIED };
+    let Some((grantor, grantee)) = fully_verified(state, did, rkey).await else { return };
+    let coarse = if grantor != grantee {
+        crate::labeler::LABEL_ON_BEHALF
+    } else {
+        crate::labeler::LABEL_VERIFIED
+    };
+    let pair = crate::labeler::pair_val(&grantor, &grantee);
     let cts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let sig = labeler.sign(&uri, val, &cts);
-    match state.store.insert_label(&uri, val, &cts, &sig) {
-        Ok(Some(l)) => {
-            tracing::info!("labeled {uri} {val} (seq {})", l.seq);
-            let _ = state.label_tx.send(l); // no subscribers is fine
+
+    // The pair val means nothing to a client until its definition is in the
+    // service record, so declare it before the label hits the firehose.
+    ensure_pair_definition(state, &pair, &grantor, &grantee).await;
+
+    for val in [coarse, pair.as_str()] {
+        let sig = labeler.sign(&uri, val, &cts);
+        match state.store.insert_label(&uri, val, &cts, &sig) {
+            Ok(Some(l)) => {
+                tracing::info!("labeled {uri} {val} (seq {})", l.seq);
+                let _ = state.label_tx.send(l); // no subscribers is fine
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("storing label failed: {e}"),
         }
-        Ok(None) => {}
-        Err(e) => tracing::warn!("storing label failed: {e}"),
     }
 }
 
-/// Returns `Some(on_behalf)` when the post fully verifies — `on_behalf` is
-/// true when grantor != grantee (a delegate acted for another identity) —
-/// and `None` when anything fails to check out.
-async fn fully_verified(state: &S, did: &str, rkey: &str) -> Option<bool> {
+/// Declare a per-pair label value in the labeler account's
+/// `app.bsky.labeler.service` record, once per pair. The store claim makes
+/// this at-most-one-writer; a failed write releases the claim so the next
+/// post retries. Missing `LABELER_ACCOUNT_PASSWORD` is not fatal — the
+/// labels still flow, they just render without badge text.
+async fn ensure_pair_definition(state: &S, val: &str, grantor: &str, grantee: &str) {
+    let Some(labeler) = &state.labeler else { return };
+    let Some(password) = &state.labeler_account_password else {
+        tracing::warn!("no LABELER_ACCOUNT_PASSWORD: cannot declare label value {val}");
+        return;
+    };
+    match state.store.claim_label_def(val) {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(e) => return tracing::warn!("label def claim failed: {e}"),
+    }
+    if let Err(e) = put_pair_definition(state, &labeler.did, password, val, grantor, grantee).await {
+        tracing::warn!("declaring label value {val} failed: {e}");
+        let _ = state.store.release_label_def(val);
+    } else {
+        tracing::info!("declared label value {val} in the labeler service record");
+    }
+}
+
+/// Read-modify-write the service record as the labeler account. Read at
+/// write time (not from a cache) so a definition added by another process
+/// is not clobbered.
+async fn put_pair_definition(
+    state: &S,
+    labeler_did: &str,
+    password: &str,
+    val: &str,
+    grantor: &str,
+    grantee: &str,
+) -> Result<(), String> {
+    let session = state
+        .pds
+        .create_session(labeler_did, password)
+        .await
+        .map_err(|e| format!("labeler login: {e}"))?;
+    let mut record = state
+        .pds
+        .get_record(labeler_did, LABELER_SERVICE_NSID, "self")
+        .await
+        .map_err(|e| format!("read service record: {e}"))?["value"]
+        .clone();
+    if !record.is_object() {
+        return Err("service record has no object value".into());
+    }
+    let definition = crate::labeler::pair_definition(val, grantor, grantee);
+    if !crate::labeler::merge_definition(&mut record, definition) {
+        return Ok(()); // already declared by someone else
+    }
+    state
+        .pds
+        .put_record(labeler_did, LABELER_SERVICE_NSID, Some("self"), record, &session.access_jwt)
+        .await
+        .map_err(|e| format!("write service record: {e}"))?;
+    Ok(())
+}
+
+const LABELER_SERVICE_NSID: &str = "app.bsky.labeler.service";
+
+/// Returns `Some((grantor, grantee))` when the post fully verifies — they
+/// differ when a delegate acted for another identity — and `None` when
+/// anything fails to check out.
+async fn fully_verified(state: &S, did: &str, rkey: &str) -> Option<(String, String)> {
     let Some((pds, _)) = resolve_did_doc(state, did).await else { return None };
     let Some(prov) = get_record(state, &pds, did, "me.browserid.provenance", rkey).await else {
         return None;
@@ -578,7 +657,7 @@ async fn fully_verified(state: &S, did: &str, rkey: &str) -> Option<bool> {
         && cl.iat < ac.exp
         && prov["nonce"].as_str() == Some(cl.nonce.as_str())
         && idp_ok;
-    ok.then(|| grantor != grantee)
+    ok.then(|| (grantor.clone(), grantee.clone()))
 }
 
 // ---------------------------------------------------------------------------

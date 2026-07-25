@@ -116,6 +116,41 @@ impl PdsClient {
         Ok(resp.json().await?)
     }
 
+    /// Log in as an existing account (identifier = handle or DID). Used for
+    /// the labeler account, whose password lives in `LABELER_ACCOUNT_PASSWORD`
+    /// — the bridge holds no other account passwords.
+    pub async fn create_session(&self, identifier: &str, password: &str) -> Result<RefreshedSession> {
+        let resp = self
+            .http
+            .post(format!("{}/xrpc/com.atproto.server.createSession", self.base))
+            .json(&serde_json::json!({ "identifier": identifier, "password": password }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Self::refused(resp).await);
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Read a record from any repo on this PDS (public; no auth).
+    pub async fn get_record(
+        &self,
+        did: &str,
+        collection: &str,
+        rkey: &str,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .http
+            .get(format!("{}/xrpc/com.atproto.repo.getRecord", self.base))
+            .query(&[("repo", did), ("collection", collection), ("rkey", rkey)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Self::refused(resp).await);
+        }
+        Ok(resp.json().await?)
+    }
+
     pub async fn refresh_session(&self, refresh_jwt: &str) -> Result<RefreshedSession> {
         let resp = self
             .http

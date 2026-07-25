@@ -149,6 +149,10 @@ impl Store {
                  sig  BLOB NOT NULL,
                  UNIQUE (uri, val)
              );
+             CREATE TABLE IF NOT EXISTS label_defs (
+                 val         TEXT PRIMARY KEY,
+                 defined_at  TEXT NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS audit_log (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
                  at       TEXT NOT NULL,
@@ -520,6 +524,32 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    // -- label definitions -------------------------------------------------
+    // Which per-pair label values have been declared in the labeler account's
+    // `app.bsky.labeler.service` record. Claiming a val here is what keeps
+    // two concurrent posts from both read-modify-writing the record; the
+    // claim is released again if the write fails, so it is retried.
+
+    /// Claim `val` for definition. `Ok(true)` = this caller should write the
+    /// service record; `Ok(false)` = someone already did (or is doing it).
+    pub fn claim_label_def(&self, val: &str) -> Result<bool> {
+        let n = self.conn.lock().unwrap().execute(
+            "INSERT INTO label_defs (val, defined_at) VALUES (?1, ?2)
+             ON CONFLICT(val) DO NOTHING",
+            params![val, Utc::now().to_rfc3339()],
+        )?;
+        Ok(n == 1)
+    }
+
+    /// Release a claim whose record write failed, so a later post retries it.
+    pub fn release_label_def(&self, val: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM label_defs WHERE val = ?1", params![val])?;
+        Ok(())
+    }
+
     // -- audit -------------------------------------------------------------
 
     pub fn audit(&self, t: &BridgeToken, nsid: &str, outcome: &str) -> Result<()> {
@@ -569,6 +599,19 @@ mod tests {
 
         s.update_session("did:plc:xyz", "a2", "r2").unwrap();
         assert_eq!(s.account_by_email("dan@sandmill.org").unwrap().unwrap().access_jwt, "a2");
+    }
+
+    /// Only the first claimant writes the service record; a failed write
+    /// releases the claim so a later post retries it.
+    #[test]
+    fn label_def_claim_is_exclusive_and_releasable() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.claim_label_def("by-agent-deadbeef").unwrap());
+        assert!(!s.claim_label_def("by-agent-deadbeef").unwrap());
+        assert!(s.claim_label_def("by-owner-deadbeef").unwrap(), "distinct val, own claim");
+
+        s.release_label_def("by-agent-deadbeef").unwrap();
+        assert!(s.claim_label_def("by-agent-deadbeef").unwrap(), "retried after a failed write");
     }
 
     #[test]
