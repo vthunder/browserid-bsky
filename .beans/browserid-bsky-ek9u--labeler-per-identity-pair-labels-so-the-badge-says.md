@@ -1,11 +1,11 @@
 ---
 # browserid-bsky-ek9u
 title: 'labeler: per-identity-pair labels so the badge says WHO'
-status: in-progress
+status: completed
 type: feature
 priority: normal
 created_at: 2026-07-25T23:24:47Z
-updated_at: 2026-07-25T23:54:17Z
+updated_at: 2026-07-25T23:59:54Z
 ---
 
 ## Goal
@@ -85,3 +85,7 @@ human before requesting, and that on-behalf creation 409s if the human's
 identity already owns an account.
 
 Tests: 30 unit + 6 integration green.
+
+## Deployed + verified live 2026-07-25
+
+Both phases shipped (commits 7956fc7, 2323405). Live verification: fable and scribe posts each carry browserid-verified, the retracted by-owner-<h> (neg), and the reclassified by-agent-<h>; all five pair definitions are in the service record — 'an agent owned by <base>' for agent-owned accounts, 'on behalf of' for the true delegate pair. The pre-neg labels table migrated in place with seqs preserved. Definition-render lag in bsky.app is AppView caching, self-heals.

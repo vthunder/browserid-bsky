@@ -52,28 +52,31 @@ function agentFrom(state) {
 async function setup(handleLabel, { grantor } = {}) {
   // The handle is public and the human's — agree it with them first, don't
   // invent one on their behalf.
-  if (!handleLabel) die("usage: browserid-bsky setup <handle> [--for <identity>]   (agree the handle with the human first)");
+  if (!handleLabel) die("usage: browserid-bsky setup <handle> [--for <identity|self>]   (agree the handle with the human first)");
   if (load()) die(`already set up (${STATE}). Delete that file to start over.`);
 
   // `grantee: "*"` — the approver chooses or mints the agent's identity.
   // Omitting it instead means "the agent demands the human's own bare
   // identity", which the approval page rightly renders as a become-you
-  // warning; this tool never needs that. The approver can still pick
-  // on-behalf (the default — account owned by them, posts attributed to
-  // them) or "not in my name" (a standalone sub-identity owns the account);
-  // account:create authorizes the delegate case at /browserid/provision.
+  // warning; this tool never needs that.
+  //
+  // `--for` PINS who the posts are attributed to (agent flows v2): an email
+  // pins on-behalf of that identity; `self` pins as-itself (the agent's own
+  // sub-identity owns the account — the shape a returning human needs,
+  // since on-behalf creation 409s when their email already owns an account
+  // here). Unpinned, the human chooses on the approval page's dropdown.
+  // Agree the shape with the human FIRST — the guide says so too.
   //
   // The requested handle is a SUGGESTION for the agent identity's tag
   // (`<local>+<tag>@…`), reusing the Bluesky label so the two names rhyme.
-  // Pass `--for <identity>` to pin the owner — the approval must then be
-  // made as exactly that identity. One approval covers both: opening the
-  // account AND posting to it.
+  // One approval covers both: opening the account AND posting to it.
   const pending = await requestProvision(BROKER, {
     grants: [{ audience: BRIDGE, scopes: ["login", CREATE_SCOPE, POST_SCOPE] }],
     grantee: "*",
     handle: handleLabel,
     ...(grantor ? { grantor } : {}),
-    label: `Bluesky account ${handleLabel} via bsky.browserid.me`,
+    label: `Bluesky ${handleLabel}`,
+    message: `I'll open and run the Bluesky account ${handleLabel} at bsky.browserid.me — create it and post to it, nothing else.`,
   });
 
   // Everything below waits on a human. Print the link FIRST so an agent can
@@ -85,7 +88,16 @@ async function setup(handleLabel, { grantor } = {}) {
   console.log("browserid.me if they haven't, then approve this request.\n");
   console.log("waiting for approval...");
 
-  const { credential, grants } = await pending.wait();
+  const { credential, grants, grantsDenied } = await pending.wait();
+  if (grantsDenied) {
+    // Agent flows v2: identity approved, permission declined. Without the
+    // warrant this tool can do nothing — don't save half a setup.
+    die(
+      `The human approved the identity but declined the permission (${grantsDenied}).\n` +
+        `Nothing was saved. Talk it over and re-run setup — the approval page offers\n` +
+        `reusing the identity that was just created.`,
+    );
+  }
   // Save BEFORE anything else can fail: the approval is delivered ONCE.
   save({ credential, grants });
 
@@ -95,8 +107,9 @@ async function setup(handleLabel, { grantor } = {}) {
   if (w.grantor !== w.grantee) {
     console.log(`  attributed to ${w.grantor}, acted by ${w.grantee} (on behalf of)`);
   }
-  if (grantor && w.grantor.toLowerCase() !== grantor.toLowerCase()) {
-    console.log(`⚠ expected actions to be attributed to ${grantor} — got ${w.grantor}`);
+  const expected = grantor === "self" ? w.grantee : grantor;
+  if (expected && w.grantor.toLowerCase() !== expected.toLowerCase()) {
+    console.log(`⚠ expected actions to be attributed to ${expected} — got ${w.grantor}`);
   }
 
   const { presentation } = await agent.assertionWithAccessKey(BRIDGE);
@@ -174,9 +187,10 @@ async function delegate(accountHandle, { grantor, grantee } = {}) {
 
   const pending = await requestProvision(BROKER, {
     grants: [{ audience: BRIDGE, scopes: ["login", POST_SCOPE] }],
-    grantor, // who the post is attributed to — the account's owner
+    grantor, // who the post is attributed to — the account's owner (pinned)
     grantee: grantee ?? "*", // who acts; pin it to keep the two identities apart
-    label: `posting on behalf of ${handle}`,
+    label: `posting to ${handle}`,
+    message: `I'll post to ${handle} on the owner's behalf. Nothing else.`,
   });
   console.log(`APPROVE_URL: ${pending.verificationUriComplete}`);
   console.log(`  (or open ${pending.verificationUri} and enter code ${pending.userCode})`);
@@ -186,7 +200,13 @@ async function delegate(accountHandle, { grantor, grantee } = {}) {
   console.log(`The human must approve AS ${grantor}.\n`);
   console.log("waiting for approval...");
 
-  const { credential, grants } = await pending.wait();
+  const { credential, grants, grantsDenied } = await pending.wait();
+  if (grantsDenied) {
+    die(
+      `The human approved the identity but declined the permission (${grantsDenied}).\n` +
+        `Nothing was saved — talk it over and re-run delegate.`,
+    );
+  }
   save({ credential, grants, did, handle });
 
   const agent = agentFrom({ credential, grants });
@@ -235,13 +255,13 @@ try {
     const i = rest.indexOf(`--${name}`);
     return i >= 0 ? rest[i + 1] : undefined;
   };
-  if (cmd === "setup") await setup(rest[0], { grantor: flag("for") });
+  if (cmd === "setup") await setup(rest[0], { grantor: flag("for") }); // --for <email|self>
   else if (cmd === "delegate") await delegate(rest[0], { grantor: flag("for"), grantee: flag("as") });
   else if (cmd === "post") await post(rest.join(" "));
   else if (cmd === "whoami") await whoami();
   else {
     console.log(
-      "usage: browserid-bsky <setup <handle> [--for <identity>] | " +
+      "usage: browserid-bsky <setup <handle> [--for <identity|self>] | " +
         "delegate <account-handle> --for <owner-id> [--as <actor-id>] | post \"text\" | whoami>",
     );
     process.exit(cmd ? 1 : 0);

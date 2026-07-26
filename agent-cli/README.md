@@ -17,20 +17,29 @@ npx -y @browserid-ng/bsky whoami
 
 ## What happens in `setup`
 
-0. **Agree the handle with the human first.** It is public and theirs —
-   suggest a few, show what each looks like in full
-   (`<label>.at.browserid.me`), and register the one they pick.
+0. **Agree the handle — and the account shape — with the human first.** The
+   handle is public and theirs: suggest a few, show what each looks like in
+   full (`<label>.at.browserid.me`), and register the one they pick. The
+   shape is whose name is on the posts: `--for self` pins **as-itself** (the
+   agent's own sub-identity owns the account — what a returning human needs,
+   since on-behalf creation 409s once their email owns an account here);
+   `--for <email>` pins **on-behalf** of that identity; no flag leaves the
+   choice to the approval page's dropdown.
 1. A device identity is requested from the browserid broker, together with a
-   warrant for `https://bsky.browserid.me` scoped to
+   warrant for `https://bsky.browserid.me` scoped to `account:create` and
    `repo:app.bsky.feed.post?action=create`.
 2. It prints an **approval link**, a user code, and a key fingerprint. Show
-   these to the human — nothing proceeds until they open the link and
-   approve. That is the point: the agent cannot grant itself permission.
+   these to the human — nothing proceeds until they open the link and walk
+   the broker's two steps: check the fingerprint matches, name the agent,
+   then allow (or decline) the permission. The agent cannot grant itself
+   permission; if the human approves the identity but declines the
+   permission, setup says so and saves nothing.
 3. On approval it provisions `<handle>.at.browserid.me` on the bridge's PDS
    and stores the credential in `~/.browserid-bsky/state.json` (0600).
 
-The account password is printed **once**, for use with ordinary Bluesky
-clients. Offer it to the human to save; don't keep a copy.
+The account password is printed **once** (first-party setups only — a
+delegate never sees it), for use with ordinary Bluesky clients. Offer it to
+the human to save; don't keep a copy.
 
 Then tell them to **subscribe to the labeler** —
 <https://bsky.app/profile/labeler.at.browserid.me>. Provenance is published

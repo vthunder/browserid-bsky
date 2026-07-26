@@ -59,6 +59,8 @@ async fn setup(handle_label: &str) {
             scopes: vec!["login".to_string(), POST_SCOPE.to_string()],
         }],
         Some("Bluesky bridge smoke test"),
+        Some("Smoke-testing the bridge: sign in and post once."),
+        None, // grantor unpinned (as-you: 'self' would contradict the empty grantee)
     )
     .await
     .expect("provision request failed");
