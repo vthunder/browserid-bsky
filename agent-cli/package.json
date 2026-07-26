@@ -1,6 +1,6 @@
 {
   "name": "@browserid-ng/bsky",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Set up a Bluesky account on bsky.browserid.me and post to it with verifiable provenance \u2014 for AI agents, no compiler required.",
   "type": "module",
   "bin": {
@@ -16,7 +16,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@browserid-ng/agent": "^0.2.0"
+    "@browserid-ng/agent": "^0.3.0"
   },
   "license": "MPL-2.0"
 }
