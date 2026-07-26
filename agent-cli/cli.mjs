@@ -113,10 +113,13 @@ async function setup(handleLabel, { grantor } = {}) {
     console.log(`  password: withheld — you opened this as a delegate, and a password would`);
     console.log(`            bypass your warrant's scopes. The human can use the PDS reset flow.`);
   }
-  console.log(`\nTwo things to tell the human:`);
+  console.log(`  profile:  https://bsky.app/profile/${account.handle}`);
+  console.log(`\nThings to tell the human:`);
   console.log(`  1. ${account.password ? "Save that password if they want to use ordinary Bluesky clients." : "No password was issued — nothing to save."}`);
   console.log(`  2. Subscribe to the labeler so the provenance badge actually shows:`);
   console.log(`     https://bsky.app/profile/labeler.at.browserid.me`);
+  console.log(`  3. Give them their profile link (above) — and after posting, the post's`);
+  console.log(`     own link, so they can see what their agent made.`);
   console.log(`\nNow post:  browserid-bsky post "hello world"`);
 }
 
@@ -137,6 +140,11 @@ async function post(text) {
   });
   console.log(`posted as ${state.handle} (scopes ${JSON.stringify(scopes)})`);
   console.log(`  uri:    ${result.uri ?? "?"}`);
+  {
+    // at://<did>/app.bsky.feed.post/<rkey> → the link a human can open.
+    const m = /^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/(.+)$/.exec(result.uri ?? "");
+    if (m) console.log(`  view:   https://bsky.app/profile/${m[1]}/post/${m[2]}  ← show the human`);
+  }
   // The receipt, for whoever is running this — NOT embedded in the post.
   console.log(`  verify: ${result.verifyUrl}`);
 }

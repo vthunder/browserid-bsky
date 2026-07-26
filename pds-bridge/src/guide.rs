@@ -99,7 +99,14 @@ rather than to us.
    attestation, and will not verify. The library builds the attestation for
    you.
 
-5. **Tell the human to subscribe to the labeler.** Without it, their posts
+5. **Finish by showing your work.** Give the human the link to their new
+   profile — `https://bsky.app/profile/<their full handle>` — and, after
+   posting, the post itself:
+   `https://bsky.app/profile/<did>/post/<rkey>` (the `<rkey>` is the last
+   segment of the post's `at://` URI). They should get to *see* what their
+   agent made, not take your word for it.
+
+6. **Tell the human to subscribe to the labeler.** Without it, their posts
    are verifiable but nothing *shows* — the badge only renders for people
    subscribed to <https://bsky.app/profile/labeler.at.browserid.me>. Point
    them there (Settings → Moderation lists it afterwards) so they can see
