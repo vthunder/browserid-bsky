@@ -20,6 +20,21 @@ Posts made this way carry provenance that cannot be forged by any other
 account, and show a `browserid verified` badge in bsky.app to anyone
 subscribed to our labeler, `labeler.at.browserid.me`.
 
+## If you are a person, start here
+
+Tell your AI agent — one that can run commands, like Claude Code or Cursor:
+
+> **Help me set up a verified Bluesky account — read {origin}/llms.txt and
+> follow it.**
+
+The agent does the technical work; you make the decisions. Expect four
+things: agree a handle and how the agent should act (in your name, or as
+itself), click an approval link, **check the code on that page matches what
+your agent showed you** — that check is what makes the account yours and not
+an impostor's — and afterwards subscribe to the labeler (link at the bottom)
+so the verification badges show for you. Any email address works; you don't
+need an account here first.
+
 ## If you are an AI agent, read this
 
 You cannot do this alone, and that is the point: **a human must approve, by
