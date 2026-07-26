@@ -7,8 +7,16 @@
 //! `Accept: text/html`) and lightly wrapped in HTML for browsers. Keeping a
 //! single text means the human page and the agent page can never drift.
 
+/// The one sentence a person tells their agent — shared by the markdown and
+/// the rendered HTML page so the two can never drift, and kept on a single
+/// line so it copies cleanly out of either.
+pub fn agent_prompt(origin: &str) -> String {
+    format!("Help me set up a verified Bluesky account — read {origin}/llms.txt and follow it.")
+}
+
 /// The instructions. `origin` is this deployment's public base URL.
 pub fn guide_markdown(origin: &str, handle_domain: &str) -> String {
+    let agent_prompt = agent_prompt(origin);
     format!(
         r#"# bsky.browserid.me — Bluesky accounts your agent can post to, verifiably
 
@@ -24,13 +32,12 @@ subscribed to our labeler, `labeler.at.browserid.me`.
 
 Tell your AI agent — one that can run commands, like Claude Code or Cursor:
 
-> **Help me set up a verified Bluesky account — read {origin}/llms.txt and
-> follow it.**
+    {agent_prompt}
 
 The agent does the technical work; you make the decisions. Expect four
 things: agree a handle and how the agent should act (in your name, or as
-itself), click an approval link, **check the code on that page matches what
-your agent showed you** — that check is what makes the account yours and not
+itself), click an approval link, check the code on that page matches what
+your agent showed you — that check is what makes the account yours and not
 an impostor's — and afterwards subscribe to the labeler (link at the bottom)
 so the verification badges show for you. Any email address works; you don't
 need an account here first.
@@ -160,6 +167,7 @@ warrant stops working immediately, without waiting for a token to expire.
 /// it, so one URL answers both "check this post" and "set this up".
 pub fn guide_html(origin: &str, handle_domain: &str) -> String {
     let body = html_escape(&guide_markdown(origin, handle_domain));
+    let prompt = html_escape(&agent_prompt(origin));
     format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -176,6 +184,12 @@ pub fn guide_html(origin: &str, handle_domain: &str) -> String {
   button {{ margin-top: .8rem; padding: .6rem 1.3rem; font-size: 1rem;
            border: 0; border-radius: .4rem; background: #1083fe; color: #fff; cursor: pointer; }}
   hr {{ margin: 2.5rem 0; border: 0; border-top: 1px solid #ccd; }}
+  h2 {{ font-size: 1.15rem; margin: 0 0 .5rem; }}
+  .prompt {{ display: flex; gap: .6rem; align-items: center; border: 1px solid #ccd;
+            border-radius: .4rem; padding: .7rem .9rem; }}
+  .prompt code {{ flex: 1; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+                 user-select: all; word-break: break-word; }}
+  .prompt button {{ margin-top: 0; white-space: nowrap; }}
   pre {{ white-space: pre-wrap; word-wrap: break-word; margin: 0;
         font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }}
   a {{ color: #1083fe; }}
@@ -194,6 +208,14 @@ to see who authorized it and which agent acted, verified against browserid.</p>
   <input id="u" placeholder="https://bsky.app/profile/…/post/… or at://…" autofocus>
   <button>Verify</button>
 </form>
+<hr>
+<h2>Want an account like this?</h2>
+<p class="lede">Tell your AI agent — one that can run commands, like Claude Code or Cursor:</p>
+<div class="prompt"><code id="agent-prompt">{prompt}</code><button type="button"
+  onclick="navigator.clipboard.writeText(document.getElementById('agent-prompt').textContent).then(()=>{{this.textContent='Copied ✓'}})">Copy</button></div>
+<p class="lede" style="margin-top:1rem">Your agent runs the steps; you decide and approve in your
+own browser. One habit matters: check that the code on the approval page matches what your agent
+showed you. Any email address works — full details below.</p>
 <hr>
 <pre>{body}</pre>
 </body></html>"#
