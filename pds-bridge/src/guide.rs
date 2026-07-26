@@ -11,7 +11,10 @@
 /// the rendered HTML page so the two can never drift, and kept on a single
 /// line so it copies cleanly out of either.
 pub fn agent_prompt(origin: &str) -> String {
-    format!("Read {origin}/ and help me set up a browserid verified Bluesky account.")
+    format!(
+        "Read {origin}/ and follow its instructions now (don't just summarize them) \
+to set me up with a browserid verified Bluesky account."
+    )
 }
 
 /// The instructions. `origin` is this deployment's public base URL.
@@ -43,6 +46,10 @@ so the verification badges show for you. Any email address works; you don't
 need an account here first.
 
 ## If you are an AI agent, read this
+
+**Act on this page — do not summarize it.** Your human sent you here to get
+an account set up, not to hear the steps read back. Work the flow below as
+you read it, reporting progress as you go.
 
 You cannot do this alone, and that is the point: **a human must approve, by
 clicking a link, in their own browser.** Your job is to run the steps and
@@ -77,9 +84,19 @@ rather than to us.
    as-yourself (`grantor: "self"`) is the path for a returning human.
 
    This produces an **approval URL** plus a short user code and a
-   fingerprint. Show all three to the human and stop. They open the URL,
-   check that the fingerprint matches what you displayed, and approve. The
-   library then hands you a credential and the signed warrant.
+   fingerprint. **The moment they appear, relay all three to your human in
+   your own reply** — never leave them buried in command output where they
+   are easy to miss — and ask the human to open the link, check the
+   fingerprint matches, and approve. Meanwhile **keep the command running: it
+   polls for the approval and finishes on its own** the moment they approve
+   (requests expire after ~15 minutes). If your environment kills
+   long-running commands, run the setup in the background and check its
+   output every 20–30 seconds until it reports success — do not stop and
+   wait to be told, and do not re-run it from scratch while the human still
+   has the first link open (a re-run makes a new link and invalidates
+   nothing, but the human will approve a request you are no longer
+   watching). The library then hands you a credential and the signed
+   warrant.
 
 2. **Agree on a handle with the human — do not just pick one.** The handle is
    public, permanent-ish, and theirs, not yours. Suggest two or three that fit
@@ -134,9 +151,12 @@ npx -y @browserid-ng/bsky setup <handle>   # prints the approval link
 npx -y @browserid-ng/bsky post "hello"     # attested post
 ```
 
-`setup` prints an approval URL, a user code and a key fingerprint — show all
-three to the human and wait. It stores the credential under
-`~/.browserid-bsky` and provisions the account. For an agent that prefers MCP
+`setup` prints the approval URL, user code and key fingerprint FIRST, then
+waits — polling until the human approves (up to 15 minutes). Relay the three
+values to your human immediately, keep the process alive (background it and
+watch its output if your shell enforces command timeouts), and treat "account
+created" in its output as your signal to continue. It stores the credential
+under `~/.browserid-bsky` and provisions the account. For an agent that prefers MCP
 tools over a shell, `@browserid-ng/wallet` exposes the identity half
 (`provision`, `authorize`, `get_assertion`) over MCP.
 
@@ -252,6 +272,27 @@ mod tests {
         ] {
             assert!(md.contains(needle), "guide must mention {needle}");
         }
+    }
+
+    /// User testing (2026-07-26): an agent summarized the page instead of
+    /// acting, relayed the approval URL only after a timeout, and never
+    /// polled. The guide (and the one-sentence prompt) must force all three
+    /// behaviors explicitly.
+    #[test]
+    fn guide_forces_action_url_relay_and_polling() {
+        let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
+        for needle in [
+            "do not summarize",
+            "relay all three to your human",
+            "keep the command running",
+            "background",
+        ] {
+            assert!(md.contains(needle), "guide must say: {needle}");
+        }
+        assert!(
+            agent_prompt("https://bsky.browserid.me").contains("follow its instructions now"),
+            "the prompt itself must demand action"
+        );
     }
 
     /// The two account shapes are a decision only the human can make, so the
