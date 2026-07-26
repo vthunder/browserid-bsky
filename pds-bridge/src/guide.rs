@@ -11,7 +11,7 @@
 /// the rendered HTML page so the two can never drift, and kept on a single
 /// line so it copies cleanly out of either.
 pub fn agent_prompt(origin: &str) -> String {
-    format!("Help me set up a verified Bluesky account — read {origin}/llms.txt and follow it.")
+    format!("Read {origin}/ and help me set up a browserid verified Bluesky account.")
 }
 
 /// The instructions. `origin` is this deployment's public base URL.
@@ -214,8 +214,7 @@ to see who authorized it and which agent acted, verified against browserid.</p>
 <div class="prompt"><code id="agent-prompt">{prompt}</code><button type="button"
   onclick="navigator.clipboard.writeText(document.getElementById('agent-prompt').textContent).then(()=>{{this.textContent='Copied ✓'}})">Copy</button></div>
 <p class="lede" style="margin-top:1rem">Your agent runs the steps; you decide and approve in your
-own browser. One habit matters: check that the code on the approval page matches what your agent
-showed you. Any email address works — full details below.</p>
+own browser. Any email address works — full details below.</p>
 <hr>
 <pre>{body}</pre>
 </body></html>"#
