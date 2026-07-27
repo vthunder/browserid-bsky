@@ -88,14 +88,40 @@ pub fn pair_name(val: &str) -> &'static str {
     }
 }
 
+/// The identity domain of the bsky-handle IdP (bean tw1d). Identities here
+/// are `<bluesky handle>@<this domain>`, and the local part is a name the
+/// reader already knows — so badge copy shows it bare.
+pub const BSKY_HANDLE_DOMAIN: &str = "bsky.browserid.me";
+
+/// How an identity is *displayed*.
+///
+/// For a bsky-handle identity, the domain is noise: `dan.bsky.social` is
+/// the name with the followers and the reputation, and
+/// `dan.bsky.social@bsky.browserid.me` reads like a mouthful of
+/// infrastructure. So badge and click-through copy show the bare local part
+/// — `dan.bsky.social`, `dan.bsky.social+agent` — while the verify receipt
+/// keeps the full identity string, because that is where precision matters
+/// and where someone is checking rather than skimming.
+///
+/// Every other domain is displayed verbatim: an email identity's domain is
+/// load-bearing information about who vouched for it.
+pub fn display_identity(email: &str) -> &str {
+    match email.split_once('@') {
+        Some((local, domain)) if domain.eq_ignore_ascii_case(BSKY_HANDLE_DOMAIN) => local,
+        _ => email,
+    }
+}
+
 /// The click-through text: this is where the identities are actually named.
 pub fn pair_description(grantor: &str, grantee: &str) -> String {
+    let (grantor_shown, grantee_shown) = (display_identity(grantor), display_identity(grantee));
     let who = if grantor != grantee {
-        format!("Posted by {grantee} on behalf of {grantor}, the owner of this handle.")
+        format!("Posted by {grantee_shown} on behalf of {grantor_shown}, the owner of this handle.")
     } else if is_sub_identity(grantor) {
-        format!("Posted by {grantor}, an agent owned by {}.", base_identity(grantor))
+        let owner = base_identity(grantor);
+        format!("Posted by {grantor_shown}, an agent owned by {}.", display_identity(&owner))
     } else {
-        format!("Posted by {grantor}, the owner of this handle.")
+        format!("Posted by {grantor_shown}, the owner of this handle.")
     };
     format!(
         "{who}\nFor more information, copy the link to this post and paste it at bsky.browserid.me"
@@ -505,6 +531,58 @@ mod tests {
         // Many vals, one badge name.
         assert_eq!(pair_name(&pair_val("a@example.com", "b@example.com")), PAIR_NAME_AGENT);
         assert_eq!(pair_name(&pair_val("a@example.com", "a@example.com")), PAIR_NAME_OWNER);
+    }
+
+    #[test]
+    fn bsky_handle_identities_read_as_the_bare_handle() {
+        // The whole point of the bsky-handle IdP is that the grantor is a
+        // name with followers. "on behalf of dan.bsky.social" is that name;
+        // "on behalf of dan.bsky.social@bsky.browserid.me" is plumbing.
+        assert_eq!(display_identity("dan.bsky.social@bsky.browserid.me"), "dan.bsky.social");
+        assert_eq!(
+            display_identity("dan.bsky.social+fable@bsky.browserid.me"),
+            "dan.bsky.social+fable"
+        );
+        // Case-insensitively, since identity strings are lowercased at store
+        // boundaries but may arrive otherwise.
+        assert_eq!(display_identity("dan.bsky.social@BSKY.BROWSERID.ME"), "dan.bsky.social");
+
+        // Every other domain stays verbatim — for an email identity the
+        // domain says who vouched for it, which is not noise.
+        assert_eq!(display_identity("dan@sandmill.org"), "dan@sandmill.org");
+        assert_eq!(display_identity("dan@at.browserid.me"), "dan@at.browserid.me");
+        // A lookalike domain must not be stripped.
+        assert_eq!(
+            display_identity("dan.bsky.social@evil-bsky.browserid.me"),
+            "dan.bsky.social@evil-bsky.browserid.me"
+        );
+    }
+
+    #[test]
+    fn badge_copy_uses_bare_handles_but_pair_vals_do_not_change() {
+        let human = "dan.bsky.social@bsky.browserid.me";
+        let agent = "dan.bsky.social+fable@bsky.browserid.me";
+
+        let delegated = pair_description(human, agent);
+        assert!(
+            delegated.starts_with("Posted by dan.bsky.social+fable on behalf of dan.bsky.social,"),
+            "{delegated}"
+        );
+        assert!(!delegated.contains("@bsky.browserid.me"), "{delegated}");
+
+        let own = pair_description(human, human);
+        assert!(own.starts_with("Posted by dan.bsky.social, the owner"), "{own}");
+
+        let agent_alone = pair_description(agent, agent);
+        assert!(
+            agent_alone.starts_with("Posted by dan.bsky.social+fable, an agent owned by dan.bsky.social."),
+            "{agent_alone}"
+        );
+
+        // Display is presentation only: the val is still keyed on the FULL
+        // identity strings, so two different identities can never collide
+        // onto one definition just because they render alike.
+        assert_ne!(pair_val(human, agent), pair_val("dan.bsky.social", "dan.bsky.social+fable"));
     }
 
     /// Merging into a real-shaped service record must append exactly once per

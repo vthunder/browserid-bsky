@@ -20,6 +20,7 @@
 
 pub mod attestation;
 pub mod guide;
+pub mod idp;
 pub mod labeler;
 pub mod pds;
 pub mod routes;
@@ -84,6 +85,29 @@ pub struct BridgeState {
     /// there, so an unstreamed label is invisible no matter what
     /// `queryLabels` says.
     pub label_tx: tokio::sync::broadcast::Sender<crate::store::EmittedLabel>,
+    /// The bsky-handle IdP (bean tw1d) — this deployment also *is* the
+    /// primary for `bsky.browserid.me` identities. `None` disables the
+    /// whole surface, which is what tests that only exercise the bridge
+    /// use.
+    pub idp: Option<Arc<crate::idp::IdpState>>,
+    /// In-process verifier for presentations issued by our own IdP.
+    ///
+    /// The bridge normally outsources verification to the hosted verifier,
+    /// which resolves issuers through DNSSEC. For D's own identities that
+    /// round trip is pointless — the IdP is *this process*, so its key is
+    /// pinned directly with [`browserid_rp::Verifier::trust_primary`], and
+    /// a login with a Bluesky handle no longer depends on the broker being
+    /// up or DNS having propagated. Everyone else still goes the long way.
+    pub idp_verifier: Option<browserid_rp::Verifier>,
+}
+
+/// Build the in-process verifier that trusts D as a primary for its own
+/// domain and nothing else. Shares the bridge's status cache, so a cert
+/// revoked through D's status list is rejected here too.
+pub fn idp_verifier(idp: &crate::idp::IdpState, state_origin: &str, cache: Arc<StatusCache>) -> browserid_rp::Verifier {
+    browserid_rp::Verifier::new(state_origin)
+        .trust_primary(idp.domain.clone(), idp.keypair.public_key())
+        .with_status_cache(cache)
 }
 
 /// Live-stream backlog per consumer. A slow consumer that overruns this is
@@ -104,7 +128,7 @@ impl BridgeState {
     /// Router over an already-shared state, so callers that need the `Arc`
     /// too (e.g. to spawn the startup label backfill) can keep it.
     pub fn router_from(state: Arc<Self>) -> axum::Router {
-        axum::Router::new()
+        crate::idp::routes(axum::Router::new())
             .route("/browserid/provision", axum::routing::post(routes::provision))
             .route("/browserid/token", axum::routing::post(routes::token))
             .route("/browserid/post", axum::routing::post(routes::attributed_post))

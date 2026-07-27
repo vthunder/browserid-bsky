@@ -106,7 +106,10 @@ Components on D:
 3. DID document → PDS endpoint → `/.well-known/oauth-protected-resource` →
    authorization server metadata (verify `issuer` matches origin).
 4. **OAuth**: PAR → authorize → token, PKCE S256, DPoP with per-server nonce
-   retry (the 401 `use_dpop_nonce` handshake is normal, not an error).
+   retry. The `use_dpop_nonce` handshake is normal, not an error — and the
+   client must branch on that **error code**, not the HTTP status: PAR (and
+   the token family) answer 400, resource servers 401. Observed live: a
+   401-keyed retry would fail at PAR, the mandatory first hop.
 5. **Verify `sub` == the DID from step 2**, then discard the tokens. The
    proof chain is: handle → DID (bidirectional) → auth server (discovered
    from that DID's PDS) → token whose `sub` equals that DID. Any break in
@@ -247,12 +250,13 @@ Landing page forks on one question: **"Already on Bluesky?"**
   fallbacks are `atrium-oauth` 0.1.7 or the official
   `@atproto/oauth-client-node` as a small sidecar (also useful as a debugging
   oracle).
-- **Empirical pre-checks before build** (cheap, load-bearing, both settled by
-  one throwaway confidential client against bsky.social):
-  1. Does the entryway accept `scope=atproto` standalone? (Documented yes;
-     deployment unconfirmed.)
-  2. Does a code-exchange-only flow (no refresh token use) complete cleanly
-     for a confidential client?
+- **Empirical pre-checks**: `scope=atproto` standalone **confirmed**
+  2026-07-27 — PAR against bsky.social returns 201 with a request_uri
+  (`scopes_supported` lists `atproto` first-class; `private_key_jwt`
+  supported; PAR mandatory). Gotchas observed: the request_uri expires in
+  299s, and every DPoP endpoint opens with the 400 `use_dpop_nonce`
+  handshake, nonces tracked per server. Remaining minor check, settled
+  during build: a code-exchange-only confidential-client flow end to end.
 - bsky.social accounts authenticate at the **entryway**, not the individual
   PDS — the protected-resource → auth-server discovery handles this;
   self-hosted PDSes resolve to themselves.

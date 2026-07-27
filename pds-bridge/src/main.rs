@@ -63,19 +63,42 @@ async fn main() {
         }
     }
 
+    // The bsky-handle IdP (bean tw1d): this deployment is also the browserid
+    // primary for its own origin. Off unless IDP_ENABLED is set, because
+    // standing it up means publishing a DNS key and an OAuth client.
+    let status_cache = Arc::new(StatusCache::new());
+    let idp = std::env::var("IDP_ENABLED")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .then(|| {
+            Arc::new(pds_bridge::idp::IdpState::from_env(&origin, &broker_url).expect("IdP configuration"))
+        });
+    let idp_verifier = idp
+        .as_ref()
+        .map(|i| pds_bridge::idp_verifier(i, &origin, status_cache.clone()));
+    if let Some(i) = &idp {
+        tracing::info!(
+            domain = %i.domain,
+            "bsky-handle IdP enabled — publish _browserid.{} TXT with this key: {}",
+            i.domain,
+            i.keypair.public_key().to_base64()
+        );
+    }
+
     let state = BridgeState {
         origin: origin.clone(),
         handle_domain,
         broker_url,
         broker_key,
         // Fail-closed (4lxl): unknown/stale warrant status → reject.
-        status_cache: Arc::new(StatusCache::new()),
+        status_cache,
         store: Store::open(&db_path).expect("failed to open bridge db"),
         pds: pds_bridge::pds::PdsClient::new(pds_url, pds_admin_password),
         http,
         labeler,
         labeler_account_password: std::env::var("LABELER_ACCOUNT_PASSWORD").ok(),
         label_tx: pds_bridge::label_channel(),
+        idp,
+        idp_verifier,
     };
     let state = Arc::new(state);
     // Posts made before the labeler existed still need to reach the

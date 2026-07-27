@@ -49,6 +49,15 @@ pub struct Verified {
 /// are read from the just-verified bundle and cross-checked against the
 /// verifier's answer.
 async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, Response> {
+    // Our own IdP's identities are verified in-process against a pinned
+    // key. The bridge and the IdP are one deployment, so round-tripping
+    // through the hosted verifier (and thus DNSSEC discovery, and thus the
+    // broker being up) to learn a key we are holding would add a
+    // dependency and buy nothing.
+    if let Some(v) = verify_locally(state, presentation).await {
+        return v;
+    }
+
     let resp = state
         .http
         .post(format!("{}/verify-access", state.broker_url))
@@ -90,6 +99,62 @@ async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, 
         warrant_status: wc.status.clone(),
         warrant_jws: pres.warrant.encoded().to_string(),
         config_cert_jws: pres.config_cert.encoded().to_string(),
+    })
+}
+
+/// Verify in-process when the presentation was issued by our own IdP.
+///
+/// `None` means "not ours" — the caller falls through to the hosted
+/// verifier. `Some(Err(..))` means it *was* ours and it was bad, which must
+/// not silently fall back: a presentation claiming D's issuer is only ever
+/// valid under D's key.
+async fn verify_locally(state: &S, presentation: &str) -> Option<Result<Verified, Response>> {
+    let (idp, verifier) = state.idp.as_ref().zip(state.idp_verifier.as_ref())?;
+    let pres = AccessPresentation::parse(presentation).ok()?;
+    if pres.access_cert.claims().iss != idp.domain {
+        return None;
+    }
+
+    // Our certs carry status refs, and the verifier is fail-closed on an
+    // unknown one, so the list has to be in the cache before the (sync)
+    // verify. Refreshing on every presentation is cheap — it is a local
+    // request to ourselves — and bounds revocation latency to one call.
+    let uri = idp.status_list_uri();
+    if state.status_cache.age(&uri).is_none_or(|a| a > STATUS_MAX_AGE) {
+        if let Err(e) = state.status_cache.refresh(&uri, &idp.keypair.public_key()).await {
+            tracing::warn!(%uri, "IdP status list refresh failed: {e}");
+        }
+    }
+
+    // The WARRANT's status ref is a different list under a different key —
+    // the registrar's, signed by the broker. The verifier checks it too, and
+    // it is fail-closed on an unknown list, so without this refresh the
+    // first presentation after every restart is rejected on a cold cache —
+    // and because we answer `Some(Err(..))` there is no fallback to the
+    // hosted verifier to save it.
+    if let Some(r) = &pres.warrant.claims().status {
+        if state.status_cache.age(&r.uri).is_none_or(|a| a > STATUS_MAX_AGE) {
+            if let Err(e) = state.status_cache.refresh(&r.uri, &state.broker_key).await {
+                tracing::warn!(uri = %r.uri, "warrant status list refresh failed: {e}");
+            }
+        }
+    }
+
+    Some(match verifier.verify(presentation) {
+        Ok(v) => Ok(Verified {
+            grantor: v.email,
+            grantee: v.grantee,
+            holder: v.holder.as_str().to_string(),
+            scopes: v.scopes,
+            warrant_status: v.warrant_status,
+            warrant_jws: pres.warrant.encoded().to_string(),
+            config_cert_jws: pres.config_cert.encoded().to_string(),
+        }),
+        Err(e) => Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            format!("assertion rejected: {e}"),
+        )),
     })
 }
 

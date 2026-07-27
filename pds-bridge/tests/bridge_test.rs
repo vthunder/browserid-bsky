@@ -177,6 +177,8 @@ async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<S
         labeler: None,
         labeler_account_password: None,
         label_tx: pds_bridge::label_channel(),
+        idp: None,
+        idp_verifier: None,
     };
     (axum_test::TestServer::new(state.router()).unwrap(), cache, captures)
 }
@@ -447,6 +449,8 @@ async fn dropped_label_consumers_release_their_connections() {
         ),
         labeler_account_password: None,
         label_tx: label_tx.clone(),
+        idp: None,
+        idp_verifier: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -486,4 +490,78 @@ async fn dropped_label_consumers_release_their_connections() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     panic!("{} label consumers still connected after disconnecting", label_tx.receiver_count());
+}
+
+/// Finding #4: the local-verify short-circuit must refresh the **warrant's**
+/// status list, not only D's own.
+///
+/// The two lists are different documents under different keys — D's is signed
+/// by the IdP key, the warrant's by the registrar/broker key. The verifier is
+/// fail-closed on a list it has never seen, and `verify_locally` answers
+/// `Some(Err(..))` rather than falling through to the hosted verifier, so
+/// missing this refresh rejected the first presentation after every restart.
+#[tokio::test]
+async fn a_warrant_status_list_is_refreshed_on_a_cold_cache() {
+    let idp_key = KeyPair::generate();
+
+    // The registrar's list, served over HTTP and signed by the broker key —
+    // nothing seeds it into the cache, so the bridge must go and fetch it.
+    const REGISTRAR_URI_PATH: &str = "/registrar/browserid-status";
+    let list = StatusList::from_revoked(std::iter::empty(), 64);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let registrar_base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let registrar_uri = format!("{registrar_base}{REGISTRAR_URI_PATH}");
+    let token = StatusListToken::create(ISSUER, &registrar_uri, &list, &idp_key).unwrap();
+    let served = token.encoded().to_string();
+    let app = axum::Router::new()
+        .route(REGISTRAR_URI_PATH, get(move || async move { served.clone() }));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    // A bridge that IS its own browserid primary, with a stone-cold cache.
+    let idp = Arc::new(pds_bridge::idp::IdpState {
+        domain: ISSUER.to_string(),
+        origin: registrar_base.clone(),
+        keypair: idp_key.clone(),
+        oauth_key: pds_bridge::idp::oauth::ClientKey::generate(),
+        scope: pds_bridge::idp::OAUTH_SCOPE.to_string(),
+        doh_url: "https://example.invalid/dns-query".to_string(),
+        resolve_cache: Default::default(),
+        trusted_origins: vec!["https://broker.invalid".to_string()],
+    });
+    let cache = Arc::new(StatusCache::new());
+    let captures: Captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let state = BridgeState {
+        origin: ORIGIN.to_string(),
+        handle_domain: "at.browserid.test".to_string(),
+        // Unreachable on purpose: if the local path bailed out, the fallback
+        // to the hosted verifier could not rescue this and the test fails.
+        broker_url: "http://127.0.0.1:1".to_string(),
+        broker_key: idp_key.public_key(),
+        status_cache: cache.clone(),
+        store: Store::open_in_memory().unwrap(),
+        pds: PdsClient::new(mock_pds(captures).await, "admin-secret"),
+        http: reqwest::Client::new(),
+        labeler: None,
+        labeler_account_password: None,
+        label_tx: pds_bridge::label_channel(),
+        idp_verifier: Some(pds_bridge::idp_verifier(&idp, ORIGIN, cache.clone())),
+        idp: Some(idp),
+    };
+    let server = axum_test::TestServer::new(state.router()).unwrap();
+
+    let pres = presentation(
+        &idp_key,
+        "dan.bsky.social@browserid.test",
+        "dan.bsky.social@browserid.test",
+        "svc.main",
+        vec!["login".into()],
+        Some(StatusRef { uri: registrar_uri.clone(), idx: 7 }),
+    );
+    let resp = server
+        .post("/browserid/provision")
+        .json(&json!({ "presentation": pres, "handle": "dan" }))
+        .await;
+    assert_eq!(resp.status_code(), 201, "cold-cache provision must succeed: {}", resp.text());
+    // The refresh is what made it work, and it left the list in the cache.
+    assert!(cache.age(&registrar_uri).is_some(), "the warrant's list was fetched");
 }

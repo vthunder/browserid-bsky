@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in with your Bluesky handle</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 16px/1.6 system-ui, -apple-system, sans-serif; max-width: 26rem;
+      margin: 4rem auto; padding: 0 1.25rem; text-align: center; }
+    h1 { font-size: 1.3rem; }
+    .muted { opacity: .65; }
+    .err { color: #c53030; }
+    .ok { color: #2f855a; }
+    a { color: inherit; }
+    form { display: none; margin-top: 1.5rem; }
+    input { width: 100%; box-sizing: border-box; padding: .6rem .7rem; font: inherit;
+      border: 1px solid rgba(127,127,127,.5); border-radius: 6px; background: transparent;
+      color: inherit; text-align: center; }
+    button { margin-top: .75rem; padding: .6rem 1.2rem; font: inherit; border-radius: 6px;
+      border: 1px solid rgba(127,127,127,.5); background: transparent; color: inherit;
+      cursor: pointer; }
+    button:disabled { opacity: .5; cursor: default; }
+    .spinner { width: 28px; height: 28px; margin: 1.5rem auto; border: 3px solid rgba(127,127,127,.3);
+      border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Sign in with your Bluesky handle</h1>
+  <div class="spinner" id="spin"></div>
+  <p id="msg" class="muted">Checking…</p>
+  <form id="claim">
+    <input id="handle" type="text" autocomplete="username" spellcheck="false"
+           autocapitalize="none" placeholder="you.bsky.social" aria-label="Your Bluesky handle">
+    <button id="go" type="submit">Continue</button>
+    <p class="muted" style="font-size:.85rem">
+      You will approve at your own Bluesky account. This site never sees your password
+      and keeps no access to your account — it only reads who you are.
+    </p>
+  </form>
+
+<script>
+// Device-authorization page (browserid device-cert model), atproto edition.
+//
+// The login dialog opens us with
+// #email=…&device_pubkey=…&config_pubkey=…&return_origin=… and we hand back
+// the two device certs — by postMessage to the opener (popup mode) or via
+// the return_url fragment (redirect mode).
+//
+// The difference from an email IdP: when there is no session we do not send
+// a verification mail, we send the user through atproto OAuth at their own
+// PDS. They come back here signed in, and the certs are issued first-party.
+(function () {
+  'use strict';
+  var KEY = 'browserid_device_authorize';
+  // Server-injected at serve time (see routes::render_device_authorize).
+  // The ONLY origins that may receive issued certs. `return_origin` comes
+  // out of the URL fragment, so it is attacker-controlled; without this
+  // list any site could open this page and collect device+config certs,
+  // bound to keys it chose, for whoever happens to be signed in here.
+  var TRUSTED_ORIGINS = __TRUSTED_ORIGINS__;
+  var msg = document.getElementById('msg');
+  var spin = document.getElementById('spin');
+  var form = document.getElementById('claim');
+  var handleInput = document.getElementById('handle');
+  var goButton = document.getElementById('go');
+
+  function note(text, cls) {
+    spin.style.display = 'none';
+    msg.className = cls || 'muted';
+    msg.textContent = text;
+  }
+  // Everything this page reports is built from fragment or network data, so
+  // it goes in as text. Never innerHTML — see the `switch` link below for
+  // the one place that needs an element, and builds it as one.
+  function fail(text) {
+    spin.style.display = 'none';
+    msg.className = 'err';
+    msg.textContent = text;
+  }
+  function working(text) {
+    spin.style.display = '';
+    msg.className = 'muted';
+    msg.textContent = text;
+  }
+
+  // Capture fragment params. sessionStorage survives the OAuth round trip;
+  // the fragment itself never reaches the server.
+  var frag = location.hash.length > 1 ? location.hash.slice(1) : '';
+  if (frag) {
+    var p = new URLSearchParams(frag);
+    if (p.get('email') && p.get('device_pubkey') && p.get('config_pubkey') && p.get('return_origin')) {
+      try {
+        sessionStorage.setItem(KEY, JSON.stringify({
+          email: p.get('email'),
+          device_pubkey: p.get('device_pubkey'),
+          config_pubkey: p.get('config_pubkey'),
+          // The client broker's stable browser holder — passthrough.
+          holder: p.get('holder') || null,
+          // Hold mode (cold logins): stay open after posting the certs so
+          // the dialog can request ONE re-issue under the account's
+          // canonical holder once its session join reveals it.
+          hold: p.get('hold') || null,
+          return_origin: p.get('return_origin'),
+          // Redirect mode (popup-hostile browsers).
+          return_url: p.get('return_url') || null
+        }));
+      } catch (e) {}
+    } else if (p.get('agent_email') && p.get('agent_pubkey') && p.get('holder') && p.get('return_origin')) {
+      // Agent mode (merged provisioning): sign an AGENT device cert for a
+      // `<handle>+<tag>` sub-address of the signed-in handle. Combined mode
+      // also issues the user's own pair when the broker has none yet.
+      try {
+        sessionStorage.setItem(KEY, JSON.stringify({
+          agent_email: p.get('agent_email'),
+          agent_pubkey: p.get('agent_pubkey'),
+          holder: p.get('holder'),
+          user_email: p.get('email') || null,
+          user_device_pubkey: p.get('device_pubkey') || null,
+          user_config_pubkey: p.get('config_pubkey') || null,
+          user_holder: p.get('user_holder') || null,
+          return_origin: p.get('return_origin')
+        }));
+      } catch (e) {}
+    }
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
+  // Status handed back by the OAuth callback redirect.
+  var query = new URLSearchParams(location.search);
+  var callbackError = query.get('error');
+  var retired = query.get('retired');
+  if (location.search) history.replaceState(null, '', location.pathname);
+
+  if (retired !== null) {
+    return note(retired
+      ? 'Released: ' + retired + '. That handle can now be claimed by whoever holds it.'
+      : 'That account holds no handle bindings here.', 'ok');
+  }
+
+  var params = null;
+  try { params = JSON.parse(sessionStorage.getItem(KEY) || 'null'); } catch (e) {}
+  if (!params) return fail('This page is opened by the browserid sign-in dialog; open it from there.');
+
+  var returnOrigin;
+  try {
+    returnOrigin = new URL(params.return_origin).origin;
+    if (!/^https?:$/.test(new URL(returnOrigin).protocol)) throw new Error('bad scheme');
+  } catch (e) { return fail('Invalid return origin.'); }
+  // Fail closed BEFORE anything is issued or sent: an origin that is not on
+  // the server's allowlist gets no certs and no error message it could read
+  // as a signal.
+  if (TRUSTED_ORIGINS.indexOf(returnOrigin) === -1) {
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    return fail('This page cannot return a sign-in to ' + returnOrigin + '.');
+  }
+
+  function send(payload) {
+    // Redirect mode: hand the result back by navigating to the dialog's
+    // resume URL. The resume URL must belong to the return origin — the
+    // same containment postMessage's targetOrigin gives us in popup mode.
+    if (params.return_url) {
+      var ok = false;
+      try { ok = new URL(params.return_url).origin === returnOrigin; } catch (e) {}
+      if (!ok) return fail('Invalid return URL.');
+      try { sessionStorage.removeItem(KEY); } catch (e) {}
+      var f = payload.type === 'browserid:device_certs'
+        ? '#device_cert=' + encodeURIComponent(payload.device_cert) +
+          '&config_cert=' + encodeURIComponent(payload.config_cert)
+        : '#device_error=' + encodeURIComponent(payload.reason || 'refused');
+      location.replace(params.return_url + f);
+      return;
+    }
+    if (!window.opener) return fail('The sign-in dialog window is gone — close this and retry.');
+    window.opener.postMessage(payload, returnOrigin);
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    window.close();
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body || {})
+    }).then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); });
+  }
+
+  // ---- the claim: send the browser to their own PDS -----------------------
+  function offerClaim(prefill, problem) {
+    if (problem) { msg.className = 'err'; msg.textContent = problem; }
+    else { msg.className = 'muted'; msg.textContent = 'Enter your Bluesky handle to continue.'; }
+    spin.style.display = 'none';
+    form.style.display = 'block';
+    if (prefill && !handleInput.value) handleInput.value = prefill;
+    handleInput.focus();
+  }
+
+  form.addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    var identifier = handleInput.value.trim();
+    if (!identifier) return;
+    goButton.disabled = true;
+    form.style.display = 'none';
+    working('Finding your account…');
+    post('/idp/oauth/start', { identifier: identifier }).then(function (res) {
+      if (!res.ok || !res.body.authorize_url) {
+        goButton.disabled = false;
+        return offerClaim(identifier, (res.body && res.body.error) || 'Could not start sign-in.');
+      }
+      working('Taking you to your Bluesky account…');
+      // Top-level navigation. No iframes anywhere in this flow.
+      location.href = res.body.authorize_url;
+    }).catch(function (e) {
+      goButton.disabled = false;
+      offerClaim(identifier, 'Could not start sign-in: ' + (e && e.message ? e.message : e));
+    });
+  });
+
+  // The handle to pre-fill: the local part of the identity the dialog asked
+  // for (`dan.bsky.social@bsky.browserid.me` → `dan.bsky.social`).
+  function requestedHandle() {
+    var email = params.email || params.user_email || '';
+    var at = email.lastIndexOf('@');
+    return at > 0 ? email.slice(0, at) : '';
+  }
+
+  // ---- issuance -----------------------------------------------------------
+  function issuePair(holder) {
+    return post('/idp/device_cert', Object.assign({
+      device_pubkey: { algorithm: 'Ed25519', publicKey: params.device_pubkey },
+      config_pubkey: { algorithm: 'Ed25519', publicKey: params.config_pubkey }
+    }, holder ? { holder: holder } : {}));
+  }
+
+  function runAgentMode(who) {
+    var agentEmail = String(params.agent_email).toLowerCase();
+    var selfIdentity = String(who.identity).toLowerCase();
+    var expectPrefix = (who.handle + '+').toLowerCase();
+    if (agentEmail !== selfIdentity && agentEmail.indexOf(expectPrefix) !== 0) {
+      return fail('This browser is signed in as ' + selfIdentity +
+        ', which cannot authorize the agent ' + agentEmail + '.');
+    }
+    working('Certifying agent ' + agentEmail + '…');
+    // Combined mode: issue the user's own pair first when the broker has no
+    // config cert for them yet, so the approval can sign the warrant without
+    // a second round trip.
+    var userCerts = Promise.resolve(null);
+    if (params.user_email && params.user_device_pubkey && params.user_config_pubkey) {
+      if (String(params.user_email).toLowerCase() !== selfIdentity) {
+        return fail('This browser is signed in as ' + selfIdentity + ', not ' + params.user_email + '.');
+      }
+      userCerts = post('/idp/device_cert', Object.assign({
+        device_pubkey: { algorithm: 'Ed25519', publicKey: params.user_device_pubkey },
+        config_pubkey: { algorithm: 'Ed25519', publicKey: params.user_config_pubkey }
+      }, params.user_holder ? { holder: params.user_holder } : {})).then(function (res) {
+        if (!res.ok || !res.body.device_cert || !res.body.config_cert) {
+          throw new Error((res.body && res.body.error) || 'user cert issuance failed');
+        }
+        return res.body;
+      });
+    }
+    return userCerts.then(function (user) {
+      return post('/idp/agent_device_cert', {
+        agent_pubkey: { algorithm: 'Ed25519', publicKey: params.agent_pubkey },
+        agent_email: agentEmail,
+        holder: params.holder
+      }).then(function (res) {
+        if (!res.ok || !res.body.device_cert) {
+          var reason = (res.body && res.body.error) || 'issuance failed';
+          send({ type: 'browserid:device_error', reason: reason });
+          return fail('Could not certify the agent: ' + reason);
+        }
+        working('Agent certified — returning…');
+        send(Object.assign(
+          { type: 'browserid:agent_device_cert', device_cert: res.body.device_cert },
+          user ? { user_device_cert: user.device_cert, user_config_cert: user.config_cert } : {}
+        ));
+      });
+    }).catch(function (e) {
+      var reason = (e && e.message) ? e.message : String(e);
+      send({ type: 'browserid:device_error', reason: reason });
+      fail('Could not authorize: ' + reason);
+    });
+  }
+
+  function runUserMode(who) {
+    var identity = String(who.identity).toLowerCase();
+    if (params.email && identity !== String(params.email).toLowerCase()) {
+      fail('This browser is signed in as ' + identity + ', but the sign-in requested ' +
+        params.email + '. ');
+      var link = document.createElement('a');
+      link.href = '#';
+      link.id = 'switch';
+      link.textContent = 'Use a different handle';
+      msg.appendChild(link);
+      msg.appendChild(document.createTextNode('.'));
+      return;
+    }
+    working('Authorizing this device…');
+    return issuePair(params.holder).then(function (res) {
+      if (!res.ok || !res.body.device_cert || !res.body.config_cert) {
+        var reason = (res.body && res.body.error) || 'issuance failed';
+        send({ type: 'browserid:device_error', reason: reason });
+        return fail('Could not authorize this device: ' + reason);
+      }
+      var payload = {
+        type: 'browserid:device_certs',
+        device_cert: res.body.device_cert,
+        config_cert: res.body.config_cert
+      };
+      // Hold mode (popup only): post the certs but stay open for one
+      // optional re-issue under the account's canonical holder, which the
+      // dialog only learns after its session join (cold login).
+      if (params.hold && !params.return_url && window.opener) {
+        working('Signed in — finishing…');
+        window.opener.postMessage(payload, returnOrigin);
+        var closer = setTimeout(function () { window.close(); }, 60 * 1000);
+        window.addEventListener('message', function onHold(ev) {
+          if (ev.origin !== returnOrigin) return;
+          var d = ev.data;
+          if (!d || typeof d !== 'object') return;
+          if (d.type === 'browserid:done') {
+            clearTimeout(closer);
+            window.removeEventListener('message', onHold);
+            try { sessionStorage.removeItem(KEY); } catch (e) {}
+            window.close();
+          } else if (d.type === 'browserid:reissue' && d.holder) {
+            clearTimeout(closer);
+            window.removeEventListener('message', onHold);
+            working('Updating device registration…');
+            issuePair(String(d.holder)).then(function (res2) {
+              if (!res2.ok || !res2.body.device_cert || !res2.body.config_cert) {
+                window.opener.postMessage({
+                  type: 'browserid:device_error',
+                  reason: (res2.body && res2.body.error) || 'issuance failed'
+                }, returnOrigin);
+              } else {
+                window.opener.postMessage({
+                  type: 'browserid:device_certs',
+                  device_cert: res2.body.device_cert,
+                  config_cert: res2.body.config_cert
+                }, returnOrigin);
+              }
+              try { sessionStorage.removeItem(KEY); } catch (e) {}
+              window.close();
+            });
+          }
+        });
+        return;
+      }
+      working('Device authorized — returning…');
+      send(payload);
+    });
+  }
+
+  fetch('/idp/whoami', { credentials: 'same-origin', headers: { accept: 'application/json' } })
+    .then(function (r) { return r.json(); })
+    .then(function (who) {
+      if (!who || !who.authenticated || !who.handle) {
+        // No session: the claim IS the sign-in. One OAuth hop, no email.
+        return offerClaim(requestedHandle(), callbackError);
+      }
+      if (params.agent_email) return runAgentMode(who);
+      return runUserMode(who);
+    })
+    .catch(function (e) { fail('Error: ' + (e && e.message ? e.message : e)); });
+
+  // "Use a different handle" from the identity-mismatch message.
+  document.addEventListener('click', function (ev) {
+    if (!ev.target || ev.target.id !== 'switch') return;
+    ev.preventDefault();
+    post('/idp/logout').then(function () { offerClaim(requestedHandle()); });
+  });
+})();
+</script>
+</body>
+</html>

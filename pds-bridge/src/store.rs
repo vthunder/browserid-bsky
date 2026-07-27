@@ -96,6 +96,65 @@ pub fn warrant_hash(warrant_jws: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(warrant_jws.as_bytes()))
 }
 
+/// 32 bytes of URL-safe randomness — session ids and OAuth `state`.
+fn random_token() -> String {
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// A handle bound to the DID that proved it (bean tw1d). The DID is the
+/// identity's real anchor; the handle is the label it wears.
+#[derive(Debug, Clone)]
+pub struct HandlePin {
+    pub handle: String,
+    pub did: String,
+    pub first_claimed: DateTime<Utc>,
+    /// Last time the public handle↔DID binding was re-confirmed — updated
+    /// at every issuance and every access-cert mint.
+    pub last_verified: DateTime<Utc>,
+    /// The handle moved to another DID. No new certs; the outstanding ones
+    /// are already revoked in the status list.
+    pub suspended: bool,
+}
+
+/// A first-party IdP session. `handle` is `None` for a DID-only sign-in
+/// (the retirement path, where the user authenticated as the pinned DID
+/// rather than as a handle).
+#[derive(Debug, Clone)]
+pub struct IdpSession {
+    pub handle: Option<String>,
+    pub did: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// An OAuth flow waiting for the browser to come back. Holds the PKCE
+/// verifier and the flow's ephemeral DPoP key — and, once the code is
+/// exchanged, is deleted. No access token, refresh token, or long-lived
+/// DPoP key ever reaches this table; that absence is the zero-custody
+/// promise made structural.
+#[derive(Debug, Clone)]
+pub struct PendingOauthFlow {
+    pub state: String,
+    /// The handle being claimed; `None` when the user signed in with a DID.
+    pub handle: Option<String>,
+    /// The DID resolved *before* the redirect. The token's `sub` must equal
+    /// this, or the OAuth hop proved nothing about the handle.
+    pub did: String,
+    pub issuer: String,
+    pub token_endpoint: String,
+    pub code_verifier: String,
+    pub dpop_secret: String,
+    /// This flow is a voluntary retirement, not a claim.
+    pub retire: bool,
+    /// Ties the flow to the browser that started it: the value of the
+    /// `bsky_idp_flow` cookie set at `/idp/oauth/start`. The callback must
+    /// present it, so a `state` captured from someone else's flow cannot be
+    /// redeemed in the attacker's browser (login CSRF / session fixation).
+    pub browser_binding: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -168,6 +227,54 @@ impl Store {
                  holder   TEXT NOT NULL,
                  nsid     TEXT NOT NULL,
                  outcome  TEXT NOT NULL
+             );
+             -- IdP (bean tw1d): the bsky-handle identity provider's own
+             -- state. Prefixed `idp_` because it shares the bridge's
+             -- database but not its concerns.
+             CREATE TABLE IF NOT EXISTS idp_pins (
+                 handle        TEXT PRIMARY KEY,
+                 did           TEXT NOT NULL,
+                 first_claimed TEXT NOT NULL,
+                 last_verified TEXT NOT NULL,
+                 suspended     INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idp_pins_did ON idp_pins (did);
+             CREATE TABLE IF NOT EXISTS idp_reassignment_attempts (
+                 handle     TEXT NOT NULL,
+                 did        TEXT NOT NULL,
+                 first_seen TEXT NOT NULL,
+                 PRIMARY KEY (handle, did)
+             );
+             -- One row per issued cert: its bit index in D's status list.
+             -- AUTOINCREMENT so an index is never recycled onto a new cert.
+             CREATE TABLE IF NOT EXISTS idp_status (
+                 idx       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 identity  TEXT NOT NULL,
+                 issued_at TEXT NOT NULL,
+                 revoked   INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE INDEX IF NOT EXISTS idp_status_identity ON idp_status (identity);
+             CREATE TABLE IF NOT EXISTS idp_sessions (
+                 sid        TEXT PRIMARY KEY,
+                 handle     TEXT,
+                 did        TEXT NOT NULL,
+                 expires_at TEXT NOT NULL
+             );
+             -- A pending OAuth flow. Holds the PKCE verifier and the
+             -- EPHEMERAL DPoP key across the browser round trip; deleted
+             -- the moment the code is exchanged, so nothing token-shaped
+             -- ever rests here.
+             CREATE TABLE IF NOT EXISTS idp_oauth_flows (
+                 state         TEXT PRIMARY KEY,
+                 handle        TEXT,
+                 did           TEXT NOT NULL,
+                 issuer        TEXT NOT NULL,
+                 token_endpoint TEXT NOT NULL,
+                 code_verifier TEXT NOT NULL,
+                 dpop_secret   TEXT NOT NULL,
+                 retire        INTEGER NOT NULL DEFAULT 0,
+                 browser_binding TEXT NOT NULL DEFAULT '',
+                 expires_at    TEXT NOT NULL
              );",
         )?;
         // Idempotent column adds for DBs created before a column existed
@@ -177,6 +284,7 @@ impl Store {
             "ALTER TABLE tokens ADD COLUMN warrant_ref TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE label_defs ADD COLUMN grantor TEXT",
             "ALTER TABLE label_defs ADD COLUMN grantee TEXT",
+            "ALTER TABLE idp_oauth_flows ADD COLUMN browser_binding TEXT NOT NULL DEFAULT ''",
         ] {
             if let Err(e) = conn.execute(stmt, []) {
                 if !e.to_string().contains("duplicate column name") {
@@ -638,6 +746,295 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // -- IdP: DID pins -----------------------------------------------------
+    // The identity anchor for `<handle>@bsky.browserid.me`. Policy lives in
+    // `idp::pins`; this is storage only.
+
+    pub fn idp_pin(&self, handle: &str) -> Result<Option<HandlePin>> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT handle, did, first_claimed, last_verified, suspended
+                 FROM idp_pins WHERE handle = ?1",
+                params![handle],
+                |r| {
+                    Ok(HandlePin {
+                        handle: r.get(0)?,
+                        did: r.get(1)?,
+                        first_claimed: parse_time(&r.get::<_, String>(2)?),
+                        last_verified: parse_time(&r.get::<_, String>(3)?),
+                        suspended: r.get::<_, i64>(4)? != 0,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Bind `handle` to `did`, clearing any suspension. Re-binding preserves
+    /// `first_claimed` only when the DID is unchanged — a reassignment is a
+    /// new identity's tenure, and dating it from the old owner's first claim
+    /// would misreport how long this account has held the handle.
+    pub fn idp_upsert_pin(&self, handle: &str, did: &str, now: DateTime<Utc>) -> Result<()> {
+        let now = now.to_rfc3339();
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO idp_pins (handle, did, first_claimed, last_verified, suspended)
+             VALUES (?1, ?2, ?3, ?3, 0)
+             ON CONFLICT(handle) DO UPDATE SET
+                 did = excluded.did,
+                 first_claimed = CASE WHEN idp_pins.did = excluded.did
+                                      THEN idp_pins.first_claimed ELSE excluded.first_claimed END,
+                 last_verified = excluded.last_verified,
+                 suspended = 0",
+            params![handle, did, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn idp_touch_pin(&self, handle: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE idp_pins SET last_verified = ?2 WHERE handle = ?1",
+            params![handle, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn idp_set_pin_suspended(&self, handle: &str, suspended: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE idp_pins SET suspended = ?2 WHERE handle = ?1",
+            params![handle, i64::from(suspended)],
+        )?;
+        Ok(())
+    }
+
+    pub fn idp_delete_pin(&self, handle: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM idp_pins WHERE handle = ?1", params![handle])?;
+        Ok(())
+    }
+
+    /// Every handle currently pinned to `did` — the voluntary-retirement
+    /// path's working set.
+    pub fn idp_pins_for_did(&self, did: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT handle FROM idp_pins WHERE did = ?1 ORDER BY handle")?;
+        let rows = stmt.query_map(params![did], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Record (idempotently) that `did` tried to claim `handle`, and return
+    /// when it *first* tried. That timestamp is the seasoning clock, so the
+    /// insert must never overwrite an earlier one.
+    pub fn idp_note_reassignment_attempt(
+        &self,
+        handle: &str,
+        did: &str,
+        now: DateTime<Utc>,
+    ) -> Result<DateTime<Utc>> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO idp_reassignment_attempts (handle, did, first_seen) VALUES (?1, ?2, ?3)
+             ON CONFLICT(handle, did) DO NOTHING",
+            params![handle, did, now.to_rfc3339()],
+        )?;
+        let seen: String = conn.query_row(
+            "SELECT first_seen FROM idp_reassignment_attempts WHERE handle = ?1 AND did = ?2",
+            params![handle, did],
+            |r| r.get(0),
+        )?;
+        Ok(parse_time(&seen))
+    }
+
+    pub fn idp_clear_reassignment_attempts(&self, handle: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "DELETE FROM idp_reassignment_attempts WHERE handle = ?1",
+            params![handle],
+        )?;
+        Ok(())
+    }
+
+    /// Move an attempt's clock back, so a test can exercise the 30-day
+    /// seasoning path without waiting 30 days.
+    #[cfg(test)]
+    pub fn idp_backdate_reassignment_attempt(
+        &self,
+        handle: &str,
+        did: &str,
+        when: DateTime<Utc>,
+    ) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE idp_reassignment_attempts SET first_seen = ?3 WHERE handle = ?1 AND did = ?2",
+            params![handle, did, when.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    // -- IdP: status list --------------------------------------------------
+
+    /// Allocate this identity's next status-list index. Every cert D issues
+    /// gets one, which is what lets a suspended binding's certs be killed in
+    /// status-list time (minutes) instead of at their TTL (up to 90 days).
+    pub fn idp_allocate_status_idx(&self, identity: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO idp_status (identity, issued_at) VALUES (?1, ?2)",
+            params![identity, Utc::now().to_rfc3339()],
+        )?;
+        Ok(conn.last_insert_rowid() as u64)
+    }
+
+    /// Revoke every cert issued for `handle` — the identity itself and all
+    /// its `+tag` agent sub-identities, which is the whole point: suspending
+    /// a person's handle must not leave their agents able to act.
+    pub fn idp_revoke_status_for_handle(&self, handle: &str) -> Result<usize> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE idp_status SET revoked = 1
+             WHERE revoked = 0 AND (identity LIKE ?1 || '@%' OR identity LIKE ?1 || '+%')",
+            params![handle],
+        )?;
+        if n > 0 {
+            tracing::info!(%handle, revoked = n, "revoked issued certs via the IdP status list");
+        }
+        Ok(n)
+    }
+
+    /// The revoked indices and the highest index ever allocated — the two
+    /// inputs to a `StatusList`.
+    pub fn idp_revoked_status_indices(&self) -> Result<(Vec<u64>, u64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT idx FROM idp_status WHERE revoked = 1")?;
+        let revoked = stmt
+            .query_map([], |r| r.get::<_, i64>(0).map(|i| i as u64))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let max: i64 =
+            conn.query_row("SELECT COALESCE(MAX(idx), 0) FROM idp_status", [], |r| r.get(0))?;
+        Ok((revoked, max as u64))
+    }
+
+    // -- IdP: first-party sessions ----------------------------------------
+    // Our own cookie, not an atproto session: it holds a handle and a DID
+    // and no token material whatsoever.
+
+    pub fn idp_create_session(
+        &self,
+        handle: Option<&str>,
+        did: &str,
+        ttl_hours: i64,
+    ) -> Result<String> {
+        let sid = random_token();
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO idp_sessions (sid, handle, did, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                sid,
+                handle,
+                did,
+                (Utc::now() + chrono::Duration::hours(ttl_hours)).to_rfc3339()
+            ],
+        )?;
+        Ok(sid)
+    }
+
+    /// The live session behind a cookie, or `None` if it is unknown or
+    /// expired.
+    pub fn idp_session(&self, sid: &str) -> Result<Option<IdpSession>> {
+        let session = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT handle, did, expires_at FROM idp_sessions WHERE sid = ?1",
+                params![sid],
+                |r| {
+                    Ok(IdpSession {
+                        handle: r.get(0)?,
+                        did: r.get(1)?,
+                        expires_at: parse_time(&r.get::<_, String>(2)?),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(session.filter(|s| s.expires_at > Utc::now()))
+    }
+
+    pub fn idp_delete_session(&self, sid: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM idp_sessions WHERE sid = ?1", params![sid])?;
+        Ok(())
+    }
+
+    // -- IdP: pending OAuth flows -----------------------------------------
+
+    pub fn idp_put_oauth_flow(&self, f: &PendingOauthFlow) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO idp_oauth_flows
+                 (state, handle, did, issuer, token_endpoint, code_verifier, dpop_secret,
+                  retire, browser_binding, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                f.state,
+                f.handle,
+                f.did,
+                f.issuer,
+                f.token_endpoint,
+                f.code_verifier,
+                f.dpop_secret,
+                i64::from(f.retire),
+                f.browser_binding,
+                f.expires_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Consume a pending flow: read it and delete it in one shot, so a
+    /// replayed `state` finds nothing. Expired rows are dropped too.
+    pub fn idp_take_oauth_flow(&self, state: &str) -> Result<Option<PendingOauthFlow>> {
+        let conn = self.conn.lock().unwrap();
+        let flow = conn
+            .query_row(
+                "SELECT state, handle, did, issuer, token_endpoint, code_verifier, dpop_secret,
+                        retire, browser_binding, expires_at
+                 FROM idp_oauth_flows WHERE state = ?1",
+                params![state],
+                |r| {
+                    Ok(PendingOauthFlow {
+                        state: r.get(0)?,
+                        handle: r.get(1)?,
+                        did: r.get(2)?,
+                        issuer: r.get(3)?,
+                        token_endpoint: r.get(4)?,
+                        code_verifier: r.get(5)?,
+                        dpop_secret: r.get(6)?,
+                        retire: r.get::<_, i64>(7)? != 0,
+                        browser_binding: r.get(8)?,
+                        expires_at: parse_time(&r.get::<_, String>(9)?),
+                    })
+                },
+            )
+            .optional()?;
+        conn.execute("DELETE FROM idp_oauth_flows WHERE state = ?1", params![state])?;
+        conn.execute(
+            "DELETE FROM idp_oauth_flows WHERE expires_at < ?1",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(flow.filter(|f| f.expires_at > Utc::now()))
+    }
+}
+
+/// Parse an RFC 3339 timestamp written by this module. A malformed value
+/// means the row was corrupted; treat it as epoch, which fails every
+/// freshness check rather than passing one.
+fn parse_time(s: &str) -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(s).map(|t| t.with_timezone(&Utc)).unwrap_or_else(|_| {
+        tracing::warn!(value = %s, "unparseable timestamp in the store");
+        DateTime::UNIX_EPOCH
+    })
 }
 
 #[cfg(test)]
