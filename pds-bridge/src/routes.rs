@@ -398,6 +398,15 @@ pub async fn subscribe_labels(
 /// until the process restarts.
 const LABEL_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How stale a cached status list may be on an authenticated path. The list's
+/// own ttl (5 min) plus the RP cache's grace (10 min) would let a revoked
+/// warrant keep posting for ~15 minutes; the guide promises revocation is
+/// re-checked on every use, and the demo has a human revoke a warrant and
+/// watch the very next post fail. The registrar re-signs the list on every
+/// GET, so this costs one cheap refetch per burst of activity.
+const STATUS_MAX_AGE_SECONDS: u64 = 15;
+const STATUS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(STATUS_MAX_AGE_SECONDS);
+
 async fn stream_labels(state: S, socket: axum::extract::ws::WebSocket, cursor: i64) {
     use axum::extract::ws::Message;
     use futures_util::{SinkExt, StreamExt};
@@ -750,7 +759,10 @@ async fn authorize_token(state: &S, headers: &HeaderMap) -> Result<crate::store:
     };
     if let Some((uri_s, idx)) = &token.warrant_status {
         let r = StatusRef { uri: uri_s.clone(), idx: *idx };
-        let mut verdict = state.status_cache.check(&r);
+        // Bounded staleness: anything older than STATUS_MAX_AGE reads Unknown
+        // and forces a refetch. The fallback `check` is deliberately unbounded
+        // so a failed refresh degrades to the ttl+grace window, not a 403.
+        let mut verdict = state.status_cache.check_within(&r, STATUS_MAX_AGE);
         if verdict == StatusVerdict::Unknown {
             let _ = state.status_cache.refresh(&r.uri, &state.broker_key).await;
             verdict = state.status_cache.check(&r);
@@ -1436,12 +1448,14 @@ async fn scoped_call(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     };
 
-    // Live revocation: re-check the warrant ref on every use (≤5 min cache).
-    // Warrant lists come from the broker's registry, so its published key
-    // verifies them (a status-list client, not verification logic).
+    // Live revocation: re-check the warrant ref on every use, against a status
+    // list no more than STATUS_MAX_AGE_SECONDS old. Warrant lists come from the
+    // broker's registry, so its published key verifies them (a status-list
+    // client, not verification logic). The fallback `check` is deliberately
+    // unbounded: a failed refresh degrades to the ttl+grace window, not a 403.
     if let Some((uri_s, idx)) = &token.warrant_status {
         let r = StatusRef { uri: uri_s.clone(), idx: *idx };
-        let mut verdict = state.status_cache.check(&r);
+        let mut verdict = state.status_cache.check_within(&r, STATUS_MAX_AGE);
         if verdict == StatusVerdict::Unknown {
             if let Err(e) = state.status_cache.refresh(&r.uri, &state.broker_key).await {
                 tracing::warn!(uri = %r.uri, "status refresh failed: {e}");

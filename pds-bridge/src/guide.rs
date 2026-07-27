@@ -133,6 +133,28 @@ rather than to us.
    them there (Settings → Moderation lists it afterwards) so they can see
    their own provenance, and so they know what a reader would see.
 
+7. **Offer them the off switch.** Once they have seen the post, ask — offer,
+   do not insist — whether they want to watch the permission end. If they
+   do, send them to <https://browserid.me/account>: sign in, open
+   **Authorized sites**, pick `{origin}`, and click **Revoke** on the grant
+   they gave you. The moment they say they have, post again:
+
+   ```sh
+   npx -y @browserid-ng/bsky post "still here?"
+   ```
+
+   It fails: `401 invalid_token — warrant revoked`. **Show them that line
+   verbatim and stop there.** This is not an error to debug, not a reason to
+   retry, and not your cue to ask for permission again — it is the point of
+   the whole exercise, arriving on schedule. Then say what just happened, in
+   one breath: they shut you out instantly, from a web page, without
+   changing a single password — because you never had one. (The same wall
+   stands in the small: ask you to delete that post or edit the profile and
+   you cannot, because the warrant only ever said create-post.)
+
+   Revocation is final for that warrant. If they want you posting again, run
+   the setup flow from the top and have them approve a fresh one.
+
 Note that posts carry **no in-post verify link**. The labeler is the trust
 surface; a link inside post content is written by the author, so it can point
 at a convincing fake verifier — do not add one.
@@ -186,9 +208,15 @@ proof.
 verified posts. Absence of a badge means no provenance was found, which is
 the normal state for the rest of the network.
 
-**Taking permission away.** Revoke the warrant at your browserid broker.
-The service re-checks revocation on every use, and fails closed — a revoked
-warrant stops working immediately, without waiting for a token to expire.
+**Taking permission away.** Your grants live at
+<https://browserid.me/account>, under **Authorized sites** — open
+`{origin}` and click **Revoke** on the grant you want gone. This service
+re-checks revocation on every use and fails closed, so the agent's very next
+post is refused rather than expiring quietly some minutes later. Try it while
+your agent is still at the keyboard: that refusal, read out loud, is the
+difference between a warrant and a password. Revoking is permanent for that
+grant; to let the agent back in, run the setup flow again and approve a new
+one.
 "#
     )
 }
@@ -303,6 +331,24 @@ mod tests {
         let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
         for needle in ["as yourself", "on behalf", "do not assume", "409"] {
             assert!(md.contains(needle), "guide must mention {needle}");
+        }
+    }
+
+    /// The demo's last beat is revocation *felt*, not described: the agent
+    /// must hand over a concrete revoke URL, retry once, and report the
+    /// refusal instead of treating it as a bug to fix.
+    #[test]
+    fn guide_ends_with_the_revocation_kill_switch() {
+        let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
+        for needle in [
+            "https://browserid.me/account",
+            "Authorized sites",
+            "Revoke",
+            "warrant revoked",
+            "not an error to debug",
+            "Revocation is final",
+        ] {
+            assert!(md.contains(needle), "guide must say: {needle}");
         }
     }
 

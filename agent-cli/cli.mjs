@@ -133,6 +133,9 @@ async function setup(handleLabel, { grantor } = {}) {
   console.log(`     https://bsky.app/profile/labeler.at.browserid.me`);
   console.log(`  3. Give them their profile link (above) — and after posting, the post's`);
   console.log(`     own link, so they can see what their agent made.`);
+  console.log(`  4. Then offer them the off switch: https://browserid.me/account →`);
+  console.log(`     Authorized sites → this service → Revoke. Post once more afterwards;`);
+  console.log(`     it fails 401 "warrant revoked". Show them that line — don't debug it.`);
   console.log(`\nNow post:  browserid-bsky post "hello world"`);
 }
 
