@@ -5,7 +5,7 @@ status: completed
 type: bug
 priority: high
 created_at: 2026-07-27T17:38:22Z
-updated_at: 2026-07-27T18:26:51Z
+updated_at: 2026-07-27T20:38:54Z
 parent: browserid-bsky-tw1d
 ---
 
@@ -84,3 +84,25 @@ Deploy to id app gated on fixing:
 - Add the missing coverage: a test with two concurrent primaryPopupFlow windows + a single broadcast (catches both).
 
 Clean on the other 4 areas: normal postMessage handback, redirect-mode stale-pending discard (encodings verified byte-identical), the 2.5s wait (only when a cert actually arrived), the ?resume= watchdog guard.
+
+## REOPENED — deployed fix fails the real round trip
+
+Live cold-session test: after OAuth the resume popup shows 'Finishing sign-in...' then 'Sign-in state was lost' — handoffResume got no ack in 2.5s. The synthetic Playwright tests never drove a real OAuth redirect, so the reviewer's flagged gap bit. Three indistinguishable silent causes: (A) no waiting dialog window, (B) window present but certKeyMatchesStrict mismatch (device-key encoding), (C) no certs in fragment. Adding a diagnostic build (a 'seen-but-not-mine' nack + reason code in the error) to bisect A/B/C on the next retry.
+
+## Redesign 2026-07-27: IdP owns the bsky roundtrip via a child popup (user direction)
+
+Root cause of [no-window] confirmed: the IdP page self-navigates to bsky.social; bsky's COOP severs the IdP-page<->dialog window handle (popup.closed false-fires -> dialog tears down its listener). The handoff-via-browserid-resume-page was a workaround for delivering the cert ACROSS the origin gap (bsky.browserid.me IdP vs browserid.me dialog) and the user rightly rejects it.
+
+New shape (user's 'popup' option = old Option B): the IdP page does NOT navigate. It opens a throwaway child popup for the bsky OAuth; that popup returns to the IdP callback (same bridge origin), signals the IdP page (same-origin BroadcastChannel) and closes; the IdP page — which never moved, so its window.opener to the dialog is intact — re-checks /whoami, signs the cert, and postMessages it to the dialog via the NORMAL path. Bridge-only.
+
+- [ ] Revert browserid-ng dialog.js to pristine (remove handoff listener, handoffResume, resumeDeviceAuth handoff branch, diagnostics, helpers) + remove the new e2e spec
+- [ ] Revert the bridge resume-redirect fallback in device-authorize.html
+- [ ] device-authorize: 'Continue with Bluesky' gesture -> open child popup -> /idp/oauth/start -> set popup location to authorize_url
+- [ ] /idp/oauth/callback: establish session, then serve a tiny page that signals the opener IdP page (BroadcastChannel, same bridge origin) and closes the popup
+- [ ] IdP page: on the signal, re-check /whoami and proceed to issue+postMessage to the dialog (reuse the already-signed-in path)
+- [ ] Popup-blocker safety: open the child popup synchronously on the click, blank first, then set location
+- [ ] Tests + live cold-session verify
+
+## Fix landed 2026-07-27: announce-pending watchdog
+
+Real root cause: the dialog's popup.closed poll false-fired when the IdP popup went cross-origin to bsky.social (COOP severs the handle -> popup.closed true), tearing down the handoff listener before certs returned. Fix: IdP announces via window.opener.postMessage (cross-origin; NOT BroadcastChannel) before navigating; dialog suppresses the closed-reject for that key and waits for the resume handoff. No third popup anywhere (IdP self-navigates), so no grandchild-popup-block. browserid-ng 395bef3 (dialog + e2e), bridge device-authorize.html + routes.rs. Desktop popup path fixed; mobile uses redirect fallback (RP watch+request). Diagnostic build removed.

@@ -489,6 +489,29 @@ mod tests {
         assert!(page.contains("TRUSTED_ORIGINS.indexOf(returnOrigin) === -1"));
     }
 
+    /// The OAuth hop makes the popup look CLOSED to the dialog (COOP severs
+    /// the handle), so the page must announce the coming handoff before it
+    /// navigates — over postMessage to the opener, since the dialog is a
+    /// different origin than this page and BroadcastChannel would never reach
+    /// it — and the announcement must precede the navigation, not follow it.
+    #[test]
+    fn the_page_announces_the_pending_handoff_before_the_oauth_navigation() {
+        let page = render_device_authorize(&["https://broker.example".to_string()]);
+        let announce = page
+            .find("type: 'browserid:device_auth_pending'")
+            .expect("the page announces the pending handoff");
+        let navigate = page
+            .find("location.href = res.body.authorize_url;")
+            .expect("the page navigates to the authorize URL");
+        assert!(announce < navigate, "the announcement must precede the navigation");
+        // It rides window.opener.postMessage, aimed at the validated origin.
+        assert!(page.contains("window.opener.postMessage("));
+        assert!(page.contains("{ type: 'browserid:device_auth_pending', device_pubkey: params.device_pubkey },"));
+        // The dialog pairs on the device key, so it must carry one, and agent
+        // mode (no resume handoff) must not announce.
+        assert!(page.contains("if (window.opener && params.device_pubkey && !params.agent_email) {"));
+    }
+
     /// browserid-bsky-3l4g. The OAuth hop navigates the popup itself, and the
     /// PDS's COOP severs `window.opener` — so the return leg must hand the
     /// certs back by redirecting to the dialog's resume URL instead of giving

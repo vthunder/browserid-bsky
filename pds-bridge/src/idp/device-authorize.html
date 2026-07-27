@@ -240,6 +240,19 @@
         return offerClaim(identifier, (res.body && res.body.error) || 'Could not start sign-in.');
       }
       working('Taking you to your Bluesky account…');
+      // Announce the handoff BEFORE we navigate. The PDS's COOP severs this
+      // popup's opener, which makes the dialog's `popup.closed` poll read true
+      // and look like the user cancelled; hearing this first, it keeps waiting
+      // for the resume handoff instead. Must be postMessage, not
+      // BroadcastChannel: the dialog is a different origin.
+      if (window.opener && params.device_pubkey && !params.agent_email) {
+        try {
+          window.opener.postMessage(
+            { type: 'browserid:device_auth_pending', device_pubkey: params.device_pubkey },
+            returnOrigin
+          );
+        } catch (e) { /* no opener (redirect mode): nothing to tell */ }
+      }
       // Top-level navigation. No iframes anywhere in this flow.
       location.href = res.body.authorize_url;
     }).catch(function (e) {
