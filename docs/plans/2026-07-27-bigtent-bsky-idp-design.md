@@ -257,23 +257,27 @@ Landing page forks on one question: **"Already on Bluesky?"**
   PDS — the protected-resource → auth-server discovery handles this;
   self-hosted PDSes resolve to themselves.
 
-## Open questions
+## Decisions (review 2026-07-27)
 
-1. **The identity domain D.** `bsky.browserid.me` needs zero new
-   infrastructure (and the badge shows the bare handle anyway, hiding the
-   mouthful); a short dedicated domain reads better on consent screens but
-   adds DNSSEC + ops. Identity strings are permanent-ish — decide before
-   launch, not before build start.
-2. **Status list for D's own certs in v1?** Without it, a suspended
-   (handle-moved) identity's access certs live ≤24h and device certs ≤90d.
-   With it, minutes. Lean yes — the machinery exists in browserid-core and
-   the demo's whole thesis is fast revocation.
-3. **Reassignment cooloff** before a new DID may claim a retired handle
-   binding.
-4. **Badge copy**: bare handle vs full identity string (lean bare handle;
-   full string in the receipt).
-5. **Device-cert TTL**: keep the 90-day reference constant or drop to ~30
-   days for a tighter interactive re-proof cadence (see Assurance cadence).
-6. **v2 linked session**: offer an *optional* stored OAuth session so the
-   user's PDS app-connections page becomes an additional IdP kill switch —
-   advisory at mint time, never a hard dependency.
+1. **Identity domain D = `bsky.browserid.me`.** Zero new infrastructure; the
+   `browserid.me` zone is DNSSEC-signed (DS + DNSKEY verified), so D's
+   discovery records slot in. Badge copy hides the mouthful (decision 4).
+2. **Status list for D's own certs: yes, in v1.** A suspended (handle-moved)
+   identity's certs die in minutes, not cert-TTL. Served at D's
+   `/.well-known/browserid-status`, same machinery as the registrar's.
+3. **Reassignment seasoning: 30 days.** A handle previously bound to a
+   different DID may be re-claimed once the new DID has held it for 30 days,
+   measured from the first re-claim attempt (record `(handle, new_did,
+   first_seen)` on the failed attempt; grant when 30 days later the handle
+   still resolves to that DID). Early-out: the old owner can retire the
+   binding voluntarily by authenticating as the pinned DID — atproto OAuth
+   accepts a DID as the account identifier — so graceful renames need no
+   waiting.
+4. **Badge copy: bare handle.** The labeler special-cases
+   `@bsky.browserid.me` identities and displays the bare handle
+   (`dan.bsky.social`, `dan.bsky.social+agent`); the full identity string
+   stays in the verify receipt.
+5. **Device-cert TTL: keep the 90-day reference constant for now.** A global
+   drop to 30 days (all IdPs, not just this one) is a separate conversation.
+6. **Linked session: dropped.** Not pursuing the optional stored OAuth
+   session; mint-time public re-verification is the assurance mechanism.
