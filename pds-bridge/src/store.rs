@@ -875,11 +875,36 @@ impl Store {
 
     // -- IdP: status list --------------------------------------------------
 
-    /// Allocate this identity's next status-list index. Every cert D issues
-    /// gets one, which is what lets a suspended binding's certs be killed in
-    /// status-list time (minutes) instead of at their TTL (up to 90 days).
-    pub fn idp_allocate_status_idx(&self, identity: &str) -> Result<u64> {
+    /// This identity's status-list index, allocated on first use and reused
+    /// for every cert it ever gets — device, config, access, and every
+    /// renewal of each.
+    ///
+    /// One index per *identity*, not per cert, for two reasons. It bounds
+    /// the list: access certs are minted daily, per RP, per device, so a
+    /// per-cert index let any client inflate a bitmap that is re-signed on
+    /// every `/.well-known/browserid-status` fetch, forever. And it is the
+    /// revocation granularity we actually want — suspending a binding must
+    /// kill all of that identity's certs at once, which one shared bit does
+    /// by construction. `<handle>+tag` agents are separate identities and so
+    /// keep separate bits, staying independently revocable while
+    /// [`Self::idp_revoke_status_for_handle`] still sweeps them all.
+    ///
+    /// Backward-safe on an existing database: rows from the per-cert era
+    /// simply collapse onto the lowest index an identity already holds, and
+    /// nothing renumbers.
+    pub fn idp_status_idx(&self, identity: &str) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(idx) FROM idp_status WHERE identity = ?1",
+                params![identity],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(idx) = existing {
+            return Ok(idx as u64);
+        }
         conn.execute(
             "INSERT INTO idp_status (identity, issued_at) VALUES (?1, ?2)",
             params![identity, Utc::now().to_rfc3339()],

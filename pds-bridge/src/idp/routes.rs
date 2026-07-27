@@ -192,11 +192,11 @@ pub async fn oauth_start(
         r
     };
 
-    let auth_server = oauth::discover_auth_server(&state.http, &resolved.pds).await?;
+    let auth_server = oauth::discover_auth_server(&resolved.pds).await?;
     // Hint with whatever the user typed: entryways accept a handle or a DID,
     // and the retirement path depends on the latter.
     let prepared =
-        oauth::push_authorization_request(st, &state.http, &auth_server, identifier).await?;
+        oauth::push_authorization_request(st, &auth_server, identifier).await?;
 
     // Bind the flow to this browser. The callback is a plain GET the
     // authorization server redirects to, so without this marker anyone who
@@ -327,7 +327,7 @@ async fn callback_inner(
     };
     let dpop = oauth::DpopKey::from_secret_b64(&flow.dpop_secret)?;
     let sub =
-        oauth::exchange_code(st, &state.http, &auth_server, &code, &flow.code_verifier, &dpop)
+        oauth::exchange_code(st, &auth_server, &code, &flow.code_verifier, &dpop)
             .await?;
 
     // THE check. The chain is handle → DID (bidirectional) → that DID's PDS

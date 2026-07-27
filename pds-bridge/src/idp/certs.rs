@@ -119,10 +119,11 @@ fn holder_for_device(device_pub: &PublicKey) -> String {
     format!("br{pre}.{id}")
 }
 
-/// Allocate this identity's slot in D's status list and return the ref to
-/// embed in the cert.
+/// This identity's slot in D's status list, as a ref to embed in a cert.
+/// The index is per identity and reused across every cert and renewal, so
+/// one flipped bit revokes the lot — see `Store::idp_status_idx`.
 fn status_ref(st: &IdpState, state: &S, identity: &str) -> Result<StatusRef, IdpError> {
-    let idx = state.store.idp_allocate_status_idx(identity)?;
+    let idx = state.store.idp_status_idx(identity)?;
     Ok(StatusRef { uri: st.status_list_uri(), idx })
 }
 
@@ -180,6 +181,10 @@ pub async fn device_cert(
     let holder =
         Holder::new(holder_str).map_err(|e| IdpError::BadRequest(format!("holder: {e}")))?;
 
+    // One status slot, carried by both certs: they belong to one identity
+    // and are revoked together or not at all.
+    let status = status_ref(st, &state, &identity)?;
+
     let device_cert = DeviceCert::create(
         &st.domain,
         &device_pub,
@@ -188,7 +193,7 @@ pub async fn device_cert(
         vec![identity.clone()],
         validity,
         &st.keypair,
-        Some(status_ref(st, &state, &identity)?),
+        Some(status.clone()),
     )
     .map_err(|e| IdpError::Internal(format!("device cert: {e}")))?;
 
@@ -202,7 +207,7 @@ pub async fn device_cert(
         vec![identity.clone(), format!("{handle}+*@{}", st.domain)],
         validity,
         &st.keypair,
-        Some(status_ref(st, &state, &identity)?),
+        Some(status),
     )
     .map_err(|e| IdpError::Internal(format!("config cert: {e}")))?;
 
@@ -652,8 +657,8 @@ mod tests {
     fn status_list_reflects_revocations_and_verifies_under_ds_key() {
         let st = test_state();
         let store = crate::store::Store::open_in_memory().unwrap();
-        let live = store.idp_allocate_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
-        let doomed = store.idp_allocate_status_idx("moved.bsky.social@bsky.browserid.test").unwrap();
+        let live = store.idp_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
+        let doomed = store.idp_status_idx("moved.bsky.social@bsky.browserid.test").unwrap();
         store.idp_revoke_status_for_handle("moved.bsky.social").unwrap();
 
         let (revoked, max) = store.idp_revoked_status_indices().unwrap();
@@ -671,14 +676,58 @@ mod tests {
         assert!(parsed.verify(&KeyPair::generate().public_key(), &st.status_list_uri()).is_err());
     }
 
+    /// Finding #7: the status list is bounded by identities, not by certs.
+    /// Access certs are minted daily, per RP, per device — allocating a
+    /// fresh index each time grew a re-signed bitmap without limit.
+    #[test]
+    fn one_status_index_per_identity_reused_across_every_mint() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let dan = "dan.bsky.social@bsky.browserid.test";
+        let first = store.idp_status_idx(dan).unwrap();
+        // The device, config and every renewed access cert land in one slot.
+        for _ in 0..5 {
+            assert_eq!(store.idp_status_idx(dan).unwrap(), first);
+        }
+        // Distinct identities still get distinct bits…
+        let eve = store.idp_status_idx("eve.bsky.social@bsky.browserid.test").unwrap();
+        assert_ne!(first, eve);
+        // …including a `+tag` agent, which must stay independently revocable.
+        let agent = store.idp_status_idx("dan.bsky.social+fable@bsky.browserid.test").unwrap();
+        assert_ne!(first, agent);
+
+        // Two identities plus one agent, after eleven allocations.
+        let (_, max) = store.idp_revoked_status_indices().unwrap();
+        assert_eq!(max, 3);
+    }
+
+    /// The point of sharing the bit: one revocation kills the identity's
+    /// device cert and its access certs together, rather than leaving live
+    /// access certs behind on separate indices.
+    #[test]
+    fn revoking_an_identity_kills_its_device_and_access_certs_at_once() {
+        let store = crate::store::Store::open_in_memory().unwrap();
+        let dan = "dan.bsky.social@bsky.browserid.test";
+        let device = store.idp_status_idx(dan).unwrap();
+        let config = store.idp_status_idx(dan).unwrap();
+        let access = store.idp_status_idx(dan).unwrap();
+        let agent = store.idp_status_idx("dan.bsky.social+fable@bsky.browserid.test").unwrap();
+
+        store.idp_revoke_status_for_handle("dan.bsky.social").unwrap();
+        let (revoked, max) = store.idp_revoked_status_indices().unwrap();
+        let list = StatusList::from_revoked(revoked, max);
+        for idx in [device, config, access, agent] {
+            assert!(list.is_revoked(idx), "index {idx} should be revoked");
+        }
+    }
+
     #[test]
     fn revoking_a_handle_takes_its_agents_with_it() {
         // Suspending a person must not leave their agents able to act.
         let store = crate::store::Store::open_in_memory().unwrap();
-        let person = store.idp_allocate_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
+        let person = store.idp_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
         let agent =
-            store.idp_allocate_status_idx("dan.bsky.social+fable@bsky.browserid.test").unwrap();
-        let other = store.idp_allocate_status_idx("dan.bsky.social.evil@x.test").unwrap();
+            store.idp_status_idx("dan.bsky.social+fable@bsky.browserid.test").unwrap();
+        let other = store.idp_status_idx("dan.bsky.social.evil@x.test").unwrap();
 
         store.idp_revoke_status_for_handle("dan.bsky.social").unwrap();
         let (revoked, _) = store.idp_revoked_status_indices().unwrap();

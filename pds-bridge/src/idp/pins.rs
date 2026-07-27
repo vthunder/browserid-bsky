@@ -260,7 +260,7 @@ mod tests {
     fn mint_verification_refuses_a_moved_handle_and_suspends_it() {
         let store = Store::open_in_memory().unwrap();
         claim(&store, "dan.bsky.social", "did:plc:a").unwrap();
-        let idx = store.idp_allocate_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
+        let idx = store.idp_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
 
         // Still bound: fine, and nothing is revoked.
         verify_still_bound(&store, "dan.bsky.social", "did:plc:a").unwrap();
@@ -282,7 +282,7 @@ mod tests {
     fn retirement_releases_the_binding_immediately() {
         let store = Store::open_in_memory().unwrap();
         claim(&store, "dan.bsky.social", "did:plc:a").unwrap();
-        let idx = store.idp_allocate_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
+        let idx = store.idp_status_idx("dan.bsky.social@bsky.browserid.test").unwrap();
 
         let retired = retire_for_did(&store, "did:plc:a").unwrap();
         assert_eq!(retired, vec!["dan.bsky.social".to_string()]);

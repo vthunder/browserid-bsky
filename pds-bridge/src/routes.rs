@@ -111,7 +111,14 @@ async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, 
 async fn verify_locally(state: &S, presentation: &str) -> Option<Result<Verified, Response>> {
     let (idp, verifier) = state.idp.as_ref().zip(state.idp_verifier.as_ref())?;
     let pres = AccessPresentation::parse(presentation).ok()?;
-    if pres.access_cert.claims().iss != idp.domain {
+    // Both certs must be ours. The local path checks against a D-only trust
+    // table, and answering `Some(Err(..))` is final by contract — so a mixed
+    // bundle (a @D grantee with a broker-issued grantor config cert, say)
+    // would hard-fail here with no fallback. Mixed issuers are the hosted
+    // verifier's job; fall through.
+    if pres.access_cert.claims().iss != idp.domain
+        || pres.config_cert.claims().iss != idp.domain
+    {
         return None;
     }
 
@@ -1199,6 +1206,75 @@ mod verify_tests {
         // No verify link.
         let none = serde_json::json!({ "text": "just a post" });
         assert_eq!(embedded_verify_nonce(&none), None);
+    }
+
+    /// Finding #8: the local short-circuit is answered `Some(Err(..))` on
+    /// failure and that is final — no fallback to the hosted verifier. So it
+    /// must trigger only when the *whole* bundle is ours. A bundle whose
+    /// config cert some other IdP issued gets checked against a D-only trust
+    /// table and would hard-fail; it belongs to the hosted verifier.
+    #[tokio::test]
+    async fn a_bundle_with_a_foreign_config_cert_falls_through_to_the_hosted_verifier() {
+        use browserid_core::device::*;
+        use browserid_core::keys::KeyPair;
+        use browserid_core::Assertion;
+
+        let state = crate::idp::tests::test_bridge();
+        let idp = state.idp.clone().unwrap();
+        let domain = idp.domain.clone();
+        let identity = format!("dan.bsky.social@{domain}");
+        let audience = state.origin.clone();
+
+        let access_key = KeyPair::generate();
+        let config_key = KeyPair::generate();
+        let holder = Holder::new("br.main").unwrap();
+        let day = chrono::Duration::days(1);
+
+        let bundle = |config_issuer_key: &KeyPair, config_iss: &str| {
+            let access_cert = AccessCert::create(
+                &domain,
+                &identity,
+                holder.clone(),
+                &access_key.public_key(),
+                day,
+                &idp.keypair,
+                None,
+            )
+            .unwrap();
+            let config_cert = DeviceCert::create(
+                config_iss,
+                &config_key.public_key(),
+                Purpose::Authorization,
+                holder.clone(),
+                vec![identity.clone()],
+                day,
+                config_issuer_key,
+                None,
+            )
+            .unwrap();
+            let warrant = Warrant::create(
+                &identity,
+                &identity,
+                HolderMatcher::new("br.*").unwrap(),
+                &audience,
+                vec!["login".into()],
+                day,
+                &config_key,
+                None,
+            )
+            .unwrap();
+            let assertion = Assertion::create(&audience, day, &access_key).unwrap();
+            AccessPresentation { access_cert, assertion, warrant, config_cert }.encode()
+        };
+
+        // Mixed issuers: ours on the access cert, a broker's on the config
+        // cert. Not ours to judge — fall through.
+        let mixed = bundle(&KeyPair::generate(), "broker.invalid");
+        assert!(super::verify_locally(&state, &mixed).await.is_none());
+
+        // All-D still takes the local path (and answers there, pass or fail).
+        let ours = bundle(&idp.keypair, &domain);
+        assert!(super::verify_locally(&state, &ours).await.is_some());
     }
 }
 

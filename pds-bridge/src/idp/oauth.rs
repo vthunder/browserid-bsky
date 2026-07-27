@@ -295,16 +295,19 @@ pub struct AuthServer {
 /// self-hosted PDS simply names itself. The `issuer` check is the security
 /// property — metadata that claims a different issuer than the origin it
 /// came from is an authorization-server mix-up attack.
-pub async fn discover_auth_server(
-    http: &reqwest::Client,
-    pds: &str,
-) -> Result<AuthServer, IdpError> {
-    let prm: serde_json::Value = http
-        .get(format!("{}/.well-known/oauth-protected-resource", pds.trim_end_matches('/')))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| IdpError::BadRequest(format!("{pds} publishes no OAuth metadata: {e}")))?
+pub async fn discover_auth_server(pds: &str) -> Result<AuthServer, IdpError> {
+    // Everything fetched here is externally named: the PDS came out of a
+    // DID document, and the issuer out of the PDS's own metadata. Each URL
+    // runs the SSRF guard before it is fetched, and no transport error is
+    // echoed back — see `idp::net`.
+    let prm_url = format!("{}/.well-known/oauth-protected-resource", pds.trim_end_matches('/'));
+    let prm: serde_json::Value = super::net::get_guarded(&prm_url)
+        .await?
+        .error_for_status()
+        .map_err(|e| {
+            tracing::warn!(%pds, "protected-resource metadata unreachable: {e}");
+            IdpError::BadRequest(format!("{pds} publishes no OAuth metadata"))
+        })?
         .json()
         .await
         .map_err(|e| IdpError::BadRequest(format!("{pds} protected-resource metadata: {e}")))?;
@@ -318,17 +321,25 @@ pub async fn discover_auth_server(
         .trim_end_matches('/')
         .to_string();
 
-    let meta: serde_json::Value = http
-        .get(format!("{issuer}/.well-known/oauth-authorization-server"))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| IdpError::BadRequest(format!("{issuer} metadata unreachable: {e}")))?
+    let meta_url = format!("{issuer}/.well-known/oauth-authorization-server");
+    let meta: serde_json::Value = super::net::get_guarded(&meta_url)
+        .await?
+        .error_for_status()
+        .map_err(|e| {
+            tracing::warn!(%issuer, "authorization-server metadata unreachable: {e}");
+            IdpError::BadRequest(format!("{issuer} metadata unreachable"))
+        })?
         .json()
         .await
         .map_err(|e| IdpError::BadRequest(format!("{issuer} metadata: {e}")))?;
 
-    parse_auth_server(&issuer, &meta)
+    let server = parse_auth_server(&issuer, &meta)?;
+    // The metadata names three more URLs we will POST to; guard them here,
+    // once, rather than at each call site.
+    for url in [&server.par_endpoint, &server.authorization_endpoint, &server.token_endpoint] {
+        super::net::guard_external_url(url).await?;
+    }
+    Ok(server)
 }
 
 /// Validate authorization-server metadata against the origin it was served
@@ -375,7 +386,6 @@ pub struct PreparedAuth {
 /// handle the user typed, or the DID for the retirement path.
 pub async fn push_authorization_request(
     st: &IdpState,
-    http: &reqwest::Client,
     auth_server: &AuthServer,
     login_hint: &str,
 ) -> Result<PreparedAuth, IdpError> {
@@ -399,7 +409,9 @@ pub async fn push_authorization_request(
         ("client_assertion".to_string(), client_assertion(st, &auth_server.issuer)),
     ];
 
-    let body = with_dpop_nonce_retry(http, &dpop, "POST", &auth_server.par_endpoint, |req, proof| {
+    // The no-redirect client: a 3xx from PAR is never chased.
+    let client = super::net::guarded_client();
+    let body = with_dpop_nonce_retry(client, &dpop, "POST", &auth_server.par_endpoint, |req, proof| {
         req.header("DPoP", proof).form(&form)
     })
     .await?;
@@ -433,7 +445,6 @@ pub async fn push_authorization_request(
 /// signature, not a policy we remember to follow.
 pub async fn exchange_code(
     st: &IdpState,
-    http: &reqwest::Client,
     auth_server: &AuthServer,
     code: &str,
     code_verifier: &str,
@@ -452,7 +463,7 @@ pub async fn exchange_code(
         ("client_assertion".to_string(), client_assertion(st, &auth_server.issuer)),
     ];
 
-    let body = with_dpop_nonce_retry(http, dpop, "POST", &auth_server.token_endpoint, |req, proof| {
+    let body = with_dpop_nonce_retry(super::net::guarded_client(), dpop, "POST", &auth_server.token_endpoint, |req, proof| {
         req.header("DPoP", proof).form(&form)
     })
     .await?;
@@ -513,7 +524,10 @@ where
         let resp = build(http.post(url), proof)
             .send()
             .await
-            .map_err(|e| IdpError::BadRequest(format!("{url}: {e}")))?;
+            .map_err(|e| {
+                tracing::warn!(%url, "authorization-server request failed: {e}");
+                IdpError::BadRequest("could not reach the authorization server".into())
+            })?;
 
         let server_nonce =
             resp.headers().get("dpop-nonce").and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -701,7 +715,6 @@ mod tests {
 
         let sub = exchange_code(
             &st,
-            &reqwest::Client::new(),
             &auth_server,
             "the-code",
             "the-verifier",
@@ -739,7 +752,6 @@ mod tests {
         };
         let sub = exchange_code(
             &st,
-            &reqwest::Client::new(),
             &auth_server,
             "c",
             "v",

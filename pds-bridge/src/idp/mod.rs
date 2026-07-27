@@ -34,6 +34,7 @@
 //!   binding's certs die in minutes rather than at cert TTL.
 
 pub mod certs;
+pub mod net;
 pub mod oauth;
 pub mod pins;
 pub mod resolve;
@@ -339,7 +340,7 @@ pub fn require_idp(state: &crate::BridgeState) -> Result<&Arc<IdpState>, IdpErro
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]

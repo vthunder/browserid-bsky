@@ -217,14 +217,11 @@ async fn dns_atproto_did(st: &IdpState, http: &reqwest::Client, handle: &str) ->
 }
 
 /// `https://<handle>/.well-known/atproto-did` — the plain-text DID.
-async fn well_known_atproto_did(http: &reqwest::Client, handle: &str) -> Option<String> {
-    let resp = http
-        .get(format!("https://{handle}/.well-known/atproto-did"))
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?;
+async fn well_known_atproto_did(_http: &reqwest::Client, handle: &str) -> Option<String> {
+    // The handle is user-supplied, so this URL is externally named: it goes
+    // through the guard, on the no-redirect client, every hop checked.
+    let url = format!("https://{handle}/.well-known/atproto-did");
+    let resp = super::net::get_guarded(&url).await.ok()?.error_for_status().ok()?;
     let body = resp.text().await.ok()?;
     let did = body.trim().to_string();
     is_did(&did).then_some(did)
@@ -235,6 +232,9 @@ async fn well_known_atproto_did(http: &reqwest::Client, handle: &str) -> Option<
 /// out of scope (and, per the design's non-goals, DID local parts stay out
 /// of identity strings precisely because other methods are case-sensitive).
 pub async fn did_document(http: &reqwest::Client, did: &str) -> Result<serde_json::Value, IdpError> {
+    // `did:web` names its own host, so that URL runs the SSRF guard; the
+    // PLC directory is our own configuration, not attacker-chosen.
+    let mut externally_named = false;
     let url = if let Some(rest) = did.strip_prefix("did:plc:") {
         let directory = std::env::var("IDP_PLC_DIRECTORY")
             .unwrap_or_else(|_| "https://plc.directory".to_string());
@@ -248,6 +248,7 @@ pub async fn did_document(http: &reqwest::Client, did: &str) -> Result<serde_jso
         if host.is_empty() || host.contains(':') || host.contains('/') {
             return Err(IdpError::BadRequest(format!("unsupported did:web form: {did}")));
         }
+        externally_named = true;
         format!("https://{host}/.well-known/did.json")
     } else {
         return Err(IdpError::BadRequest(format!(
@@ -255,11 +256,15 @@ pub async fn did_document(http: &reqwest::Client, did: &str) -> Result<serde_jso
         )));
     };
 
-    let resp = http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| IdpError::BadRequest(format!("could not fetch the DID document: {e}")))?;
+    let resp = if externally_named {
+        super::net::get_guarded(&url).await?
+    } else {
+        http.get(&url).send().await.map_err(|e| {
+            // The transport error is a reachability oracle — log, don't echo.
+            tracing::warn!(%did, "could not fetch the DID document: {e}");
+            IdpError::BadRequest("could not fetch the DID document".into())
+        })?
+    };
     if !resp.status().is_success() {
         return Err(IdpError::BadRequest(format!(
             "DID document for {did}: HTTP {}",
