@@ -20,6 +20,11 @@ to set me up with a browserid verified Bluesky account."
 /// The instructions. `origin` is this deployment's public base URL.
 pub fn guide_markdown(origin: &str, handle_domain: &str) -> String {
     let agent_prompt = agent_prompt(origin);
+    // The IdP identity domain — a Bluesky handle claimed here reads as
+    // `<handle>@<idp_domain>` (e.g. dan.bsky.social@bsky.browserid.me).
+    let idp_domain = origin
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
     format!(
         r#"# bsky.browserid.me — Bluesky accounts your agent can post to, verifiably
 
@@ -38,12 +43,15 @@ Tell your AI agent — one that can run commands, like Claude Code or Cursor:
     {agent_prompt}
 
 The agent does the technical work; you make the decisions. Expect four
-things: agree a handle and how the agent should act (in your name, or as
-itself), click an approval link, check the code on that page matches what
-your agent showed you — that check is what makes the account yours and not
-an impostor's — and afterwards subscribe to the labeler (link at the bottom)
-so the verification badges show for you. Any email address works; you don't
-need an account here first.
+things: agree how the agent should act — **if you're on Bluesky, under your
+own handle** (you'll sign in with Bluesky to approve, and every post will say
+*on behalf of* your handle); otherwise under any email address, in your name
+or as the agent itself — agree a handle for the new account, click an
+approval link, check the code on that page matches what your agent showed
+you (that check is what makes the account yours and not an impostor's), and
+afterwards subscribe to the labeler (link at the bottom) so the verification
+badges show for you. No account here is needed first — a Bluesky handle or
+any email is enough.
 
 ## If you are an AI agent, read this
 
@@ -59,29 +67,36 @@ rather than to us.
 
 ### The flow
 
-1. **Get a browserid identity and ask for permission.** Using a browserid
-   agent library (see *Tooling* below), request a warrant for:
-   - audience: `{origin}`
-   - scopes: `login`, `account:create` (opening the account) and
-     `repo:app.bsky.feed.post?action=create` (posting)
+1. **First, decide who the posts speak for — ask the human.** This is public
+   and lasting, so settle it before you request anything. The deciding
+   question: **do they have a Bluesky account?**
 
-   The human can approve this as a **delegate** — an agent acting for them —
-   or as themselves. You do NOT need them to hand you their own identity:
+   - **They do.** Their real handle becomes the authority. Ask for it (say,
+     `dan.bsky.social`) and pin the grantor to `<handle>@{idp_domain}`. Every
+     post then reads *on behalf of @<handle>* — their name, with their
+     followers behind it, not a throwaway identity. At the approval step they
+     **sign in with their Bluesky handle** (an atproto login — no email,
+     nothing to create here first). Be straight with them about what this is
+     today: the *authority* is their real handle, but the posts land on a new
+     verified account you open here (step 3), not yet on their own timeline.
+   - **They don't, or would rather not use it.** Fall back to a browserid
+     email — **any address works, no account here first.** Two shapes, and
+     they read differently in public; agree which before requesting.
+     **As yourself:** your own sub-identity (a `+tag` like
+     `them+youragent@their.domain`) owns the account, badge *by agent, an
+     agent owned by <the human>*. **On behalf:** their email identity owns it
+     and you act for it, badge *by agent, on behalf of <the human>*. If their
+     email already owns an account here, on-behalf is refused with a 409 —
+     as-yourself is the returning-human path.
+
+   Then **request the warrant** with a browserid agent library (see *Tooling*
+   below): audience `{origin}`; scopes `login`, `account:create` (opening the
+   account) and `repo:app.bsky.feed.post?action=create` (posting); with the
+   **grantor pinned** to what you agreed — the handle identity
+   `<handle>@{idp_domain}`, an email, or `"self"`. Pinning makes the approval
+   a plain approve/deny, so the human can't land on the wrong shape by
+   accident. You do NOT need them to hand you their own identity;
    `account:create` is what authorizes a delegate to open the account.
-
-   **There are two shapes here, and they read differently in public. Ask the
-   human which they want before you request anything — do not assume.**
-   Posting **as yourself** means your own sub-identity (a `+tag` address like
-   `them+youragent@their.domain`) owns the account, and posts carry a badge
-   reading *by agent, an agent owned by <the human>*. Posting **on behalf**
-   means the human's own identity owns the account and you act for it; posts
-   read *by agent, on behalf of <the human>*. Once you've agreed, **pin the
-   shape in the request** (`grantor: "self"` for as-yourself, or the owner's
-   email for on-behalf): pinned requests render as a plain approve/deny on
-   the approval page, so the human can't accidentally pick the other shape
-   from the dropdown. One more thing to weigh: if the human's identity
-   already owns an account here, on-behalf creation is refused with a 409 —
-   as-yourself (`grantor: "self"`) is the path for a returning human.
 
    This produces an **approval URL** plus a short user code and a
    fingerprint. **The moment they appear, relay all three to your human in
@@ -98,11 +113,13 @@ rather than to us.
    watching). The library then hands you a credential and the signed
    warrant.
 
-2. **Agree on a handle with the human — do not just pick one.** The handle is
+2. **Agree on a handle for the new account — do not just pick one.** This is
+   the handle of the account you open *here* (`<label>.{handle_domain}`) — a
+   separate thing from any Bluesky handle they brought as the authority. It is
    public, permanent-ish, and theirs, not yours. Suggest two or three that fit
-   what the account is for, say what each would look like in full
-   (`<label>.{handle_domain}`), and let them choose or write their own. Then
-   register the one they picked.
+   what the account is for (if they brought a Bluesky handle, a label that
+   echoes it is a natural default), say what each looks like in full, and let
+   them choose or write their own. Then register the one they picked.
 
 3. **Create the Bluesky account.** `POST {origin}/browserid/provision`
    with `{{"presentation": "<your four-part bundle>", "handle": "<label>"}}`.
@@ -169,9 +186,15 @@ pinned to their repo; without one, traffic passes through untouched.
 flow, including the attestation in step 4:
 
 ```sh
-npx -y @browserid-ng/bsky setup <handle>   # prints the approval link
-npx -y @browserid-ng/bsky post "hello"     # attested post
+npx -y @browserid-ng/bsky setup <label>                              # prints the approval link
+npx -y @browserid-ng/bsky setup <label> --for dan.bsky.social@{idp_domain}  # on behalf of a Bluesky handle
+npx -y @browserid-ng/bsky setup <label> --for self                   # as the agent itself
+npx -y @browserid-ng/bsky post "hello"                               # attested post
 ```
+
+`<label>` is the new account's handle; `--for` pins the grantor — a Bluesky
+handle identity (`<handle>@{idp_domain}`), a plain email, or `self`. Leave it
+off and the human picks the shape on the approval page.
 
 `setup` prints the approval URL, user code and key fingerprint FIRST, then
 waits — polling until the human approves (up to 15 minutes). Relay the three
@@ -323,13 +346,22 @@ mod tests {
         );
     }
 
-    /// The two account shapes are a decision only the human can make, so the
-    /// guide has to name both and say to ask — an agent that assumes picks
-    /// the human's public identity for them.
+    /// Who the posts speak for is a decision only the human can make, so the
+    /// guide has to open with the Bluesky-account fork (real handle as
+    /// grantor, approved by signing in with Bluesky) and still name both email
+    /// shapes for people not on Bluesky — an agent that assumes picks the
+    /// human's public identity for them.
     #[test]
-    fn guide_makes_the_agent_ask_which_account_shape() {
+    fn guide_makes_the_agent_ask_who_the_posts_speak_for() {
         let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
-        for needle in ["as yourself", "on behalf", "do not assume", "409"] {
+        for needle in [
+            "do they have a Bluesky account",       // the fork
+            "@bsky.browserid.me",                    // handle identity as grantor
+            "sign in with their Bluesky handle",     // how the handle path is approved
+            "As yourself",                           // email shape
+            "On behalf",                             // email shape
+            "409",                                   // returning-human note
+        ] {
             assert!(md.contains(needle), "guide must mention {needle}");
         }
     }

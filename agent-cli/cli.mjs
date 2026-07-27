@@ -84,8 +84,10 @@ async function setup(handleLabel, { grantor } = {}) {
   console.log(`APPROVE_URL: ${pending.verificationUriComplete}`);
   console.log(`  (or open ${pending.verificationUri} and enter code ${pending.userCode})`);
   console.log(`  key fingerprint: ${pending.fingerprint}`);
-  console.log("\nShow that link to the human and wait — they add their email at");
-  console.log("browserid.me if they haven't, then approve this request.\n");
+  const approveHint = grantor && grantor.endsWith("@" + new URL(BRIDGE).host)
+    ? "they sign in with their Bluesky handle, then approve this request."
+    : "they add their email at browserid.me if they haven't, then approve this request.";
+  console.log(`\nShow that link to the human and wait — ${approveHint}\n`);
   console.log("waiting for approval...");
 
   const { credential, grants, grantsDenied } = await pending.wait();
