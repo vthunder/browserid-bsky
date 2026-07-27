@@ -5,7 +5,7 @@ status: in-progress
 type: epic
 priority: normal
 created_at: 2026-07-27T12:44:49Z
-updated_at: 2026-07-27T12:53:40Z
+updated_at: 2026-07-27T16:07:30Z
 ---
 
 Give users something at stake: let them connect the Bluesky handle they already own instead of (only) minting <label>.at.browserid.me accounts. Design space discussed 2026-07-27, two composable pieces:
@@ -24,3 +24,9 @@ Open questions: which piece first (IdP-first avoids custody and kills email fric
 User confirmed: this is identity bridging as implemented in Persona's BigTent. **IdP-first is chosen** — spec and build the bsky-handle browserid IdP, and rework the demo around it (as a new path). Users without an existing Bluesky handle keep the current mint-a-handle shapes, so the demo grows two entry paths rather than replacing one with the other. The OAuth *write* relay (piece 1 above) is deferred to its own child bean.
 
 Children: spec → build → demo rework, plus deferred OAuth-write relay.
+
+## IdP LIVE 2026-07-27
+
+The bsky-handle browserid IdP is deployed and ENABLED on bsky.browserid.me. Verified: /.well-known/browserid serves the signing key matching the DNS TXT (ESy5b9bn…); client-metadata.json is the identity-only atproto profile (scope=atproto, private_key_jwt/ES256, authorization_code only, dpop-bound); jwks + status-list serve; boot log clean; the browserid.me broker's issuer-resolver is up (primary-rooted warrants will verify). dokku config: IDP_SECRET, IDP_OAUTH_KEY, IDP_ENABLED=1 all set on bsky-bridge. Security gates qqsv + npp9 cleared before enable.
+
+Remaining: a real end-to-end claim (human atproto OAuth with a live Bluesky handle) is the only untested-in-anger path — the first claim is the real test. Then demo-v2 (browserid-bsky-90ut).

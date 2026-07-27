@@ -489,6 +489,32 @@ mod tests {
         assert!(page.contains("TRUSTED_ORIGINS.indexOf(returnOrigin) === -1"));
     }
 
+    /// browserid-bsky-3l4g. The OAuth hop navigates the popup itself, and the
+    /// PDS's COOP severs `window.opener` — so the return leg must hand the
+    /// certs back by redirecting to the dialog's resume URL instead of giving
+    /// up, and that redirect must go to the ALLOWLISTED return origin with the
+    /// certs in the fragment (a query would put them in server logs).
+    #[test]
+    fn the_page_hands_certs_back_by_resume_redirect_when_the_opener_is_gone() {
+        let page = render_device_authorize(&["https://broker.example".to_string()]);
+        assert!(page.contains("var RESUME_PATH = '/dialog/dialog.html?resume=device_auth';"));
+        // The fallback is reached exactly when there is no opener...
+        assert!(page.contains("location.replace(returnOrigin + RESUME_PATH + resultFragment(payload));"));
+        // ...and it targets the validated origin, not the raw fragment value.
+        assert!(!page.contains("params.return_origin + RESUME_PATH"));
+        // Certs ride the fragment.
+        assert!(page.contains("return '#device_cert=' + encodeURIComponent(payload.device_cert) +"));
+        // A failure carries no cert, so it names the device key it was given —
+        // without that the dialog cannot tell which of its concurrent sign-in
+        // windows the failure belongs to, and would tear down the wrong one.
+        assert!(page.contains(
+            "return '#device_error=' + encodeURIComponent(payload.reason || 'refused') +"
+        ));
+        assert!(page.contains("&device_pubkey=' + encodeURIComponent(params.device_pubkey)"));
+        // The dead-opener message survives for payloads with no resume form.
+        assert!(page.contains("The sign-in dialog window is gone"));
+    }
+
     /// Finding #2. Every string this page shows comes from the URL fragment
     /// or the network, so none of it may reach the DOM as markup.
     #[test]

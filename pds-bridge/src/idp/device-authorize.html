@@ -156,6 +156,25 @@
     return fail('This page cannot return a sign-in to ' + returnOrigin + '.');
   }
 
+  // The dialog's resume entry point, on the validated return origin. Used
+  // both by redirect mode (the dialog passes it as return_url) and by the
+  // popup return leg below.
+  var RESUME_PATH = '/dialog/dialog.html?resume=device_auth';
+
+  // A success fragment identifies its flow by the device cert, which certifies
+  // the device key the dialog generated. A failure has no cert, so it carries
+  // the device pubkey itself — without it the dialog cannot tell WHICH of its
+  // windows this failure belongs to, and a browser with two sign-ins in
+  // flight would tear down the wrong one. It is a public value either way.
+  function resultFragment(payload) {
+    if (payload.type === 'browserid:device_certs') {
+      return '#device_cert=' + encodeURIComponent(payload.device_cert) +
+        '&config_cert=' + encodeURIComponent(payload.config_cert);
+    }
+    return '#device_error=' + encodeURIComponent(payload.reason || 'refused') +
+      (params.device_pubkey ? '&device_pubkey=' + encodeURIComponent(params.device_pubkey) : '');
+  }
+
   function send(payload) {
     // Redirect mode: hand the result back by navigating to the dialog's
     // resume URL. The resume URL must belong to the return origin — the
@@ -165,14 +184,25 @@
       try { ok = new URL(params.return_url).origin === returnOrigin; } catch (e) {}
       if (!ok) return fail('Invalid return URL.');
       try { sessionStorage.removeItem(KEY); } catch (e) {}
-      var f = payload.type === 'browserid:device_certs'
-        ? '#device_cert=' + encodeURIComponent(payload.device_cert) +
-          '&config_cert=' + encodeURIComponent(payload.config_cert)
-        : '#device_error=' + encodeURIComponent(payload.reason || 'refused');
-      location.replace(params.return_url + f);
+      location.replace(params.return_url + resultFragment(payload));
       return;
     }
-    if (!window.opener) return fail('The sign-in dialog window is gone — close this and retry.');
+    // Popup mode, return leg from atproto OAuth. Sending this popup to the
+    // user's PDS is a cross-origin top-level navigation, and the PDS's COOP
+    // severs `window.opener`: we come back holding certs with no window to
+    // post them to. Fall back to the same handback redirect mode uses —
+    // certs in the FRAGMENT (never the query, so they stay out of server
+    // logs) to the dialog's resume URL, on the already-allowlisted return
+    // origin. Only the pair-issuance payloads have a resume representation;
+    // agent mode has none, so it still reports the dead opener.
+    if (!window.opener) {
+      if (payload.type === 'browserid:device_certs' || payload.type === 'browserid:device_error') {
+        try { sessionStorage.removeItem(KEY); } catch (e) {}
+        location.replace(returnOrigin + RESUME_PATH + resultFragment(payload));
+        return;
+      }
+      return fail('The sign-in dialog window is gone — close this and retry.');
+    }
     window.opener.postMessage(payload, returnOrigin);
     try { sessionStorage.removeItem(KEY); } catch (e) {}
     window.close();
