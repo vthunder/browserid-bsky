@@ -128,3 +128,33 @@ one tester vs opening to all is the same exposure today. Added an explicit
 open. Enabled in prod: WRITE_RELAY_ALLOWLIST=* + WRITE_SESSION_KEY set on the
 bsky-bridge dokku app. Still un-observed in prod: the first real
 connect/post/refresh/expiry cycle — that is the live test this unblocks.
+
+## 2026-07-28: agent tooling — CLI shares the wallet's identity store
+
+Feedback from a real agent run (~/browserid-setup-transcript.md): an MCP-first
+agent can get the warrant via @browserid-ng/wallet but the wallet has no tool
+to sign a Bluesky post (only sign_guestbook, hardcoded), so it dead-ends; and
+the @browserid-ng/bsky CLI kept a SEPARATE identity store, forcing a duplicate
+approval + a second identity.
+
+Fix (user's design — don't bake bsky into the MCP server; make the CLI consume
+wallet-managed identities):
+- @browserid-ng/bsky (agent-cli) now reads/writes the SHARED
+  ~/.browserid/agent-credential.json (wallet's exact {credential,grants}
+  format). Both tools use @browserid-ng/agent, so the formats already matched.
+  Minted-account did/handle moved to a bsky-account.json sidecar so wallet
+  writes can't clobber them. BROWSERID_HOME shared; BROWSERID_BSKY_HOME still
+  overrides for a separate actor.
+- setup/delegate now REUSE an existing wallet credential (add a warrant via
+  requestWarrants) instead of provisioning a second identity / refusing.
+- New no-mint relay post: `post` derives the target repo from
+  /browserid/whoami and posts to the REAL account when the grantor connected
+  write access — no provisioned account needed. Backend-aware output; whoami
+  shows relay-vs-bridge. New bsky.mjs `bridgeWhoami` + tests (7 pass).
+- So the MCP flow is now: wallet authorize+get_assertion → shell
+  `browserid-bsky post` reusing that approval. No bsky tools in the MCP server.
+- Wallet `authorize` grantor doc (F1): document the <handle>@bsky.browserid.me
+  shape + "pass it VERBATIM, don't normalise to an email".
+
+To publish (needs npm OTP): @browserid-ng/bsky 0.2.0 (agent-cli),
+@browserid-ng/wallet 0.4.2 (browserid-ng/sdk/wallet).

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { canonicalJson, contentHash, buildPostRecord, attestationClaims, signAttestation, attestedPost } from "./bsky.mjs";
+import { canonicalJson, contentHash, buildPostRecord, attestationClaims, signAttestation, attestedPost, bridgeWhoami } from "./bsky.mjs";
 
 // THE cross-implementation vector. The identical record, canonical string and
 // hash are pinned in pds-bridge/src/attestation.rs
@@ -88,4 +88,29 @@ test("attestedPost sends the record, its attestation, and the access cert", asyn
   assert.ok(attestation.claims.nonce, "the nonce still guards replay and keys the receipt");
   assert.ok(PublicKey.fromB64u(accessKey.publicKeyB64).verify(canonicalJson(attestation.claims), attestation.sig));
   assert.equal(out.uri, "at://did:plc:abc/app.bsky.feed.post/xyz");
+});
+
+test("bridgeWhoami reports the target repo and backend under a bridge token", async () => {
+  let seen = null;
+  const http = async (url, init) => {
+    seen = { url, init };
+    return new Response(
+      JSON.stringify({ did: "did:plc:real", grantor: "danmills.bsky.social@bsky.browserid.me", backend: "relay" }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+  const who = await bridgeWhoami("https://bridge.test", { token: "bidb_tok", http });
+  assert.equal(seen.url, "https://bridge.test/browserid/whoami");
+  assert.equal(seen.init.headers.authorization, "Bearer bidb_tok");
+  assert.equal(who.did, "did:plc:real");
+  assert.equal(who.backend, "relay");
+});
+
+test("bridgeWhoami surfaces a bridge refusal as an error", async () => {
+  const http = async () =>
+    new Response(JSON.stringify({ error: "invalid_token", error_description: "missing bridge token" }), {
+      status: 401,
+      headers: { "content-type": "application/json" },
+    });
+  await assert.rejects(() => bridgeWhoami("https://bridge.test", { token: "x", http }), /whoami refused \(401\)/);
 });

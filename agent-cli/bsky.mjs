@@ -99,6 +99,24 @@ export async function provisionAccount(bridge, { presentation, handle, http = fe
   return json; // { did, handle, password }
 }
 
+/**
+ * Ask the bridge which repo an attested post will land in, and via which
+ * backend, using a bridge token from {@link exchangeToken}. Returns
+ * `{ did, grantor, grantee, scopes, backend }`, where `backend` is `"relay"`
+ * (the grantor's own real Bluesky account, connected on the dashboard) or
+ * `"bridge"` (an account provisioned here). The attestation MUST be signed
+ * over the `did` this reports — for a connected handle that is the human's
+ * real DID, which the caller cannot otherwise know without provisioning.
+ */
+export async function bridgeWhoami(bridge, { token, http = fetch }) {
+  const res = await http(`${bridge}/browserid/whoami`, {
+    headers: { authorization: `Bearer ${token}` },
+  });
+  const json = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`whoami refused (${res.status}): ${json.error_description || json.error || ""}`);
+  return json; // { did, grantor, grantee, scopes, backend }
+}
+
 /** Exchange the four-part presentation for a scoped bridge token (RFC 7521). */
 export async function exchangeToken(bridge, { presentation, http = fetch }) {
   const { res, json } = await callJson(http, `${bridge}/browserid/token`, {
