@@ -108,7 +108,10 @@ async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, 
 /// verifier. `Some(Err(..))` means it *was* ours and it was bad, which must
 /// not silently fall back: a presentation claiming D's issuer is only ever
 /// valid under D's key.
-async fn verify_locally(state: &S, presentation: &str) -> Option<Result<Verified, Response>> {
+pub(crate) async fn verify_locally(
+    state: &S,
+    presentation: &str,
+) -> Option<Result<Verified, Response>> {
     let (idp, verifier) = state.idp.as_ref().zip(state.idp_verifier.as_ref())?;
     let pres = AccessPresentation::parse(presentation).ok()?;
     // Both certs must be ours. The local path checks against a D-only trust
@@ -495,7 +498,8 @@ const LABEL_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(
 /// watch the very next post fail. The registrar re-signs the list on every
 /// GET, so this costs one cheap refetch per burst of activity.
 const STATUS_MAX_AGE_SECONDS: u64 = 15;
-const STATUS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(STATUS_MAX_AGE_SECONDS);
+pub(crate) const STATUS_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(STATUS_MAX_AGE_SECONDS);
 
 async fn stream_labels(state: S, socket: axum::extract::ws::WebSocket, cursor: i64) {
     use axum::extract::ws::Message;

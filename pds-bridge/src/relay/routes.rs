@@ -50,7 +50,9 @@ const CONNECT_COOKIE: &str = "bsky_write_connect";
 /// running neither does not advertise a half-present feature. A relay-less
 /// deployment should be indistinguishable from one that never heard of the
 /// relay.
-fn require_relay(state: &BridgeState) -> Result<(&Arc<IdpState>, &RelayState), IdpError> {
+pub(crate) fn require_relay(
+    state: &BridgeState,
+) -> Result<(&Arc<IdpState>, &RelayState), IdpError> {
     let idp = crate::idp::require_idp(state)?;
     let relay = state.relay.as_ref().ok_or(IdpError::NotConfigured)?;
     Ok((idp, relay))
@@ -82,7 +84,7 @@ fn require_relay(state: &BridgeState) -> Result<(&Arc<IdpState>, &RelayState), I
 ///    which a cross-site HTML form cannot produce and a cross-site `fetch`
 ///    cannot send without a CORS preflight we never answer. So the escape
 ///    hatch for non-browsers is not an escape hatch for attackers.
-fn require_same_origin(st: &IdpState, headers: &HeaderMap) -> Result<(), IdpError> {
+pub(crate) fn require_same_origin(st: &IdpState, headers: &HeaderMap) -> Result<(), IdpError> {
     let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::trim);
 
     if let Some(site) = get("sec-fetch-site") {
@@ -114,6 +116,7 @@ pub fn routes(
     router: axum::Router<Arc<BridgeState>>,
 ) -> axum::Router<Arc<BridgeState>> {
     use axum::routing::{get, post};
+    use super::dashboard;
     router
         .route("/idp/write-client-metadata.json", get(write_client_metadata))
         .route("/idp/connect", get(connect_page))
@@ -121,6 +124,40 @@ pub fn routes(
         .route("/idp/connect/callback", get(connect_callback))
         .route("/idp/connect/status", get(connect_status))
         .route("/idp/connect/disconnect", post(disconnect))
+        .route("/dashboard", get(dashboard::page))
+        .route("/dashboard/login", post(dashboard::login))
+        .route("/dashboard/logout", post(dashboard::logout))
+        .route("/dashboard/me", get(dashboard::me))
+        .route("/dashboard/agents", get(dashboard::agents))
+}
+
+/// The human behind this request — from the dashboard's own session
+/// (phase 2, the normal way in) or, failing that, from the IdP session the
+/// device-authorize page sets. Both are first-party proofs of the same
+/// identity class; the connect flow accepts either so a person who just
+/// signed into the dashboard is not asked to authenticate a second time on
+/// the very next click.
+pub(crate) fn require_human_session(
+    state: &BridgeState,
+    headers: &HeaderMap,
+) -> Result<crate::store::IdpSession, IdpError> {
+    // Precedence note: a live dashboard cookie wins outright, even if an IdP
+    // session cookie for a *different* handle is also present — the connect
+    // endpoints then act on the dashboard identity. Both cookies are the
+    // same person's first-party proofs, and every downstream step re-derives
+    // authority from that identity's pin and allowlist, so this is a UX
+    // surprise (which handle a stray old cookie picks), never a boundary
+    // crossing.
+    if let Some(sid) = crate::idp::routes::cookie(headers, super::dashboard::DASHBOARD_COOKIE) {
+        if let Some(s) = state.store.dashboard_session(&sid)? {
+            return Ok(crate::store::IdpSession {
+                handle: Some(s.handle),
+                did: s.did,
+                expires_at: s.expires_at,
+            });
+        }
+    }
+    crate::idp::routes::require_session(state, headers)
 }
 
 /// `GET /idp/write-client-metadata.json` — the **write** client's metadata
@@ -157,7 +194,7 @@ pub async fn connect_status(State(state): State<S>, headers: HeaderMap) -> Respo
     let Ok((_, relay)) = require_relay(&state) else {
         return IdpError::NotConfigured.into_response();
     };
-    let Ok(session) = crate::idp::routes::require_session(&state, &headers) else {
+    let Ok(session) = require_human_session(&state, &headers) else {
         return Json(ConnectStatus {
             authenticated: false,
             handle: None,
@@ -206,7 +243,14 @@ pub async fn connect_page(State(state): State<S>) -> Response {
     if require_relay(&state).is_err() {
         return IdpError::NotConfigured.into_response();
     }
-    Html(include_str!("connect.html")).into_response()
+    // Deny framing (parity with the dashboard page): clickjacking on the
+    // consent button is already defanged by the SameSite cookie, but this
+    // is free.
+    (
+        [(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")],
+        Html(include_str!("connect.html")),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -243,9 +287,9 @@ pub async fn connect_start(
 ) -> Result<Response, IdpError> {
     let (idp, relay) = require_relay(&state)?;
     // Before the session is even looked at: this POST carries no body, and
-    // the session cookie is SameSite=None.
+    // the IdP session cookie is SameSite=None.
     require_same_origin(idp, &headers)?;
-    let session = crate::idp::routes::require_session(&state, &headers)?;
+    let session = require_human_session(&state, &headers)?;
     let handle = session.handle.clone().ok_or_else(|| {
         IdpError::BadRequest(
             "connecting write access needs a handle sign-in, not a DID-only session".into(),
@@ -511,7 +555,7 @@ pub(crate) async fn connect_callback_inner(
 pub async fn disconnect(State(state): State<S>, headers: HeaderMap) -> Result<Response, IdpError> {
     let (idp, _) = require_relay(&state)?;
     require_same_origin(idp, &headers)?;
-    let session = crate::idp::routes::require_session(&state, &headers)?;
+    let session = require_human_session(&state, &headers)?;
     state.store.write_session_delete(&session.did)?;
     Ok((StatusCode::OK, Json(serde_json::json!({ "disconnected": true }))).into_response())
 }

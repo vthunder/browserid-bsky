@@ -130,6 +130,45 @@ pub struct IdpSession {
     pub expires_at: DateTime<Utc>,
 }
 
+/// The dashboard's first-party RP session (write-relay phase 2). Always a
+/// handle identity — the dashboard signs in `<handle>@<D>` and nothing else.
+#[derive(Debug, Clone)]
+pub struct DashboardSession {
+    /// The full browserid identity string, `<handle>@<D>` — what a
+    /// warrant's grantor field says.
+    pub identity: String,
+    pub handle: String,
+    pub did: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// A warrant as the management surface lists it: who may act, under which
+/// published record.
+#[derive(Debug, Clone)]
+pub struct GrantorWarrant {
+    pub grantee: String,
+    pub warrant_jws: String,
+    pub record_uri: Option<String>,
+}
+
+/// An unexpired bridge token, i.e. an agent that can post right now.
+#[derive(Debug, Clone)]
+pub struct GrantorToken {
+    pub grantee: String,
+    pub holder: String,
+    pub scopes: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// One audit-log line, as shown to the grantor it belongs to.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    pub at: String,
+    pub grantee: String,
+    pub nsid: String,
+    pub outcome: String,
+}
+
 /// An OAuth flow waiting for the browser to come back. Holds the PKCE
 /// verifier and the flow's ephemeral DPoP key — and, once the code is
 /// exchanged, is deleted. No access token, refresh token, or long-lived
@@ -400,7 +439,20 @@ impl Store {
                  last_refresh      TEXT NOT NULL,
                  state             TEXT NOT NULL DEFAULT 'live'
              );
-             CREATE INDEX IF NOT EXISTS write_sessions_handle ON write_sessions (handle);",
+             CREATE INDEX IF NOT EXISTS write_sessions_handle ON write_sessions (handle);
+             -- The dashboard's own RP session (write-relay phase 2). The
+             -- dashboard authenticates as an ordinary browserid RP, so its
+             -- session is deliberately SEPARATE from idp_sessions: that
+             -- table serves the IdP's device-authorize page across the
+             -- OAuth redirect; this one serves a human reading a first-party
+             -- management page. Same non-secret shape — identity, no tokens.
+             CREATE TABLE IF NOT EXISTS dashboard_sessions (
+                 sid        TEXT PRIMARY KEY,
+                 identity   TEXT NOT NULL,
+                 handle     TEXT NOT NULL,
+                 did        TEXT NOT NULL,
+                 expires_at TEXT NOT NULL
+             );",
         )?;
         // Idempotent column adds for DBs created before a column existed
         // (CREATE TABLE IF NOT EXISTS won't alter an existing table). A
@@ -1116,6 +1168,140 @@ impl Store {
             .unwrap()
             .execute("DELETE FROM idp_sessions WHERE sid = ?1", params![sid])?;
         Ok(())
+    }
+
+    // -- dashboard: RP sessions --------------------------------------------
+    // The dashboard's own first-party session (write-relay phase 2),
+    // separate from idp_sessions by decision. Holds an identity and nothing
+    // token-shaped.
+
+    pub fn dashboard_create_session(
+        &self,
+        identity: &str,
+        handle: &str,
+        did: &str,
+        ttl_hours: i64,
+    ) -> Result<String> {
+        let sid = random_token();
+        let conn = self.conn.lock().unwrap();
+        // Sweep expired rows on each sign-in — the same "purge on write"
+        // pattern the OAuth-flow tables use, so the table does not grow
+        // without bound. Expiry is already enforced at read time; this is
+        // hygiene, not an auth control.
+        conn.execute(
+            "DELETE FROM dashboard_sessions WHERE expires_at < ?1",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        conn.execute(
+            "INSERT INTO dashboard_sessions (sid, identity, handle, did, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                sid,
+                identity,
+                handle,
+                did,
+                (Utc::now() + chrono::Duration::hours(ttl_hours)).to_rfc3339()
+            ],
+        )?;
+        Ok(sid)
+    }
+
+    /// The live dashboard session behind a cookie, or `None` if unknown or
+    /// expired.
+    pub fn dashboard_session(&self, sid: &str) -> Result<Option<DashboardSession>> {
+        let session = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT identity, handle, did, expires_at FROM dashboard_sessions WHERE sid = ?1",
+                params![sid],
+                |r| {
+                    Ok(DashboardSession {
+                        identity: r.get(0)?,
+                        handle: r.get(1)?,
+                        did: r.get(2)?,
+                        expires_at: parse_time(&r.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?;
+        Ok(session.filter(|s| s.expires_at > Utc::now()))
+    }
+
+    pub fn dashboard_delete_session(&self, sid: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM dashboard_sessions WHERE sid = ?1", params![sid])?;
+        Ok(())
+    }
+
+    // -- dashboard: what a grantor sees ------------------------------------
+    // Read-only views over warrants / tokens / audit_log, filtered to one
+    // grantor identity: the management surface's "who acts in my name".
+
+    /// The most recent warrants naming this grantor, newest first. Bounded:
+    /// the ledger parses every row it returns, so a grantor with thousands
+    /// of warrants does not make their own page load unbounded.
+    pub fn warrants_for_grantor(&self, grantor: &str, limit: i64) -> Result<Vec<GrantorWarrant>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT grantee, warrant_jws, record_uri FROM warrants
+             WHERE grantor = ?1 ORDER BY rowid DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![grantor, limit], |r| {
+                Ok(GrantorWarrant {
+                    grantee: r.get(0)?,
+                    warrant_jws: r.get(1)?,
+                    record_uri: r.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Unexpired bridge tokens issued under this grantor's warrants — the
+    /// agents that could post *right now* (modulo warrant revocation, which
+    /// is re-checked on use).
+    pub fn tokens_for_grantor(&self, grantor: &str) -> Result<Vec<GrantorToken>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT grantee, holder, scopes, expires_at FROM tokens
+             WHERE grantor = ?1 AND expires_at > ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![grantor, Utc::now().to_rfc3339()], |r| {
+                Ok(GrantorToken {
+                    grantee: r.get(0)?,
+                    holder: r.get(1)?,
+                    scopes: r.get(2)?,
+                    expires_at: parse_time(&r.get::<_, String>(3)?),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The most recent audit entries for this grantor, newest first.
+    pub fn audit_for_grantor(&self, grantor: &str, limit: i64) -> Result<Vec<AuditEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT at, grantee, nsid, outcome FROM audit_log
+             WHERE grantor = ?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![grantor, limit], |r| {
+                Ok(AuditEntry {
+                    at: r.get(0)?,
+                    grantee: r.get(1)?,
+                    nsid: r.get(2)?,
+                    outcome: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     // -- IdP: pending OAuth flows -----------------------------------------

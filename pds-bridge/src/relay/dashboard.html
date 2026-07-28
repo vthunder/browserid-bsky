@@ -1,0 +1,214 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Your Bluesky delegation dashboard — browserid</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 44rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  h2 { font-size: 1.1rem; margin: 0 0 .5rem; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin: 1.5rem 0; }
+  .bad { color: #a00; }
+  .ok { color: #060; }
+  .muted { color: #666; }
+  button { font: inherit; padding: .5rem 1rem; }
+  button[disabled] { opacity: .5; }
+  textarea { width: 100%; font: 14px/1.4 ui-monospace, monospace; box-sizing: border-box; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+  th, td { text-align: left; padding: .25rem .5rem .25rem 0; vertical-align: top; }
+  th { color: #666; font-weight: 600; }
+  code { background: #f2f2f2; padding: 0 .2rem; }
+  [hidden] { display: none !important; }
+</style>
+
+<h1>Your Bluesky delegation dashboard</h1>
+
+<div id="signedout" hidden>
+  <p>Sign in with your Bluesky handle to manage what your agents may do in
+    your name: connect posting to your real account, copy the prompt your
+    agent needs, and see — or stop — every delegation you have granted.</p>
+  <p><button id="signin">Sign in with browserid</button></p>
+  <p class="muted">Use your <strong>Bluesky handle identity</strong>
+    (<code>your-handle@__IDP_DOMAIN__</code>). If you have not claimed it
+    yet, the sign-in dialog will walk you through proving your handle.</p>
+</div>
+
+<div id="signedin" hidden>
+  <p>Signed in as <strong id="who"></strong> <span id="whodid" class="muted"></span>
+    <button id="signout" style="margin-left:1rem">Sign out</button></p>
+
+  <div class="card">
+    <h2>Posting to your real account</h2>
+    <p id="writestatus"></p>
+    <p>
+      <a id="connectlink" href="/idp/connect"><button>Connect write access</button></a>
+      <button id="disconnect" hidden>Disconnect</button>
+    </p>
+    <p class="muted">Connected: warranted posts land on your real timeline.
+      Not connected: they land on a bridge account instead. Either way, the
+      kill switch is revoking the warrant — checked before every post.</p>
+  </div>
+
+  <div class="card">
+    <h2>Your agent's prompt</h2>
+    <p>Paste this into your coding agent. It names your grantor identity, so
+      the agent never has to guess who its posts speak for:</p>
+    <textarea id="prompt" rows="4" readonly></textarea>
+    <p><button id="copy">Copy</button> <span id="copied" class="ok" hidden>copied</span></p>
+  </div>
+
+  <div class="card">
+    <h2>Who acts in your name</h2>
+    <div id="agents"><p class="muted">Loading…</p></div>
+    <p><a href="__BROKER_ORIGIN__/account">Manage &amp; revoke warrants at your
+      browserid account</a> — revocation stops posting immediately.</p>
+  </div>
+</div>
+
+<p id="err" class="bad"></p>
+
+<script src="__BROKER_ORIGIN__/include.js"></script>
+<script>
+(function () {
+  // Every dynamic string reaches the DOM as textContent, never as markup:
+  // identities, error text, and everything in /dashboard/agents originate
+  // outside this page.
+  var $ = function (id) { return document.getElementById(id); };
+  var err = $('err');
+
+  function jsonFetch(path, opts) {
+    return fetch(path, Object.assign({ credentials: 'include' }, opts || {}))
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); });
+  }
+
+  function el(tag, text, className) {
+    var e = document.createElement(tag);
+    if (text !== undefined && text !== null) e.textContent = text;
+    if (className) e.className = className;
+    return e;
+  }
+
+  function row(cells) {
+    var tr = document.createElement('tr');
+    cells.forEach(function (c) { tr.appendChild(c); });
+    return tr;
+  }
+
+  function table(headers, rows) {
+    var t = document.createElement('table');
+    t.appendChild(row(headers.map(function (h) { return el('th', h); })));
+    rows.forEach(function (r) { t.appendChild(r); });
+    return t;
+  }
+
+  function renderAgents(body) {
+    var box = $('agents');
+    box.textContent = '';
+    if (!body.warrants.length && !body.tokens.length && !body.recent.length) {
+      box.appendChild(el('p', 'No delegations yet. Paste the prompt above into your agent to grant the first one.', 'muted'));
+      return;
+    }
+    if (body.warrants.length) {
+      box.appendChild(el('h2', 'Warrants'));
+      box.appendChild(table(['agent', 'scopes', 'status'], body.warrants.map(function (w) {
+        return row([
+          el('td', w.grantee),
+          el('td', (w.scopes || []).join(', ')),
+          el('td', w.status, w.status === 'revoked' ? 'bad' : (w.status === 'live' ? 'ok' : 'muted')),
+        ]);
+      })));
+    }
+    if (body.tokens.length) {
+      box.appendChild(el('h2', 'Active bridge tokens'));
+      box.appendChild(table(['agent', 'device', 'expires'], body.tokens.map(function (t) {
+        return row([el('td', t.grantee), el('td', t.holder), el('td', t.expires_at)]);
+      })));
+    }
+    if (body.recent.length) {
+      box.appendChild(el('h2', 'Recent activity'));
+      box.appendChild(table(['when', 'agent', 'operation', 'outcome'], body.recent.map(function (a) {
+        return row([el('td', a.at), el('td', a.grantee), el('td', a.nsid), el('td', a.outcome)]);
+      })));
+    }
+  }
+
+  function refresh() {
+    err.textContent = '';
+    jsonFetch('/dashboard/me').then(function (res) {
+      if (!res.ok) { err.textContent = res.body.error || 'could not load'; return; }
+      var me = res.body;
+      $('signedout').hidden = !!me.authenticated;
+      $('signedin').hidden = !me.authenticated;
+      if (!me.authenticated) return;
+
+      $('who').textContent = me.identity;
+      $('whodid').textContent = '(' + me.did + ')';
+      $('prompt').value = me.prompt;
+
+      var ws = $('writestatus');
+      $('disconnect').hidden = !me.connected;
+      $('connectlink').hidden = !me.allowed;
+      if (!me.allowed) {
+        ws.textContent = 'This identity is not on the write-relay allowlist yet, so posts go to a bridge account.';
+        ws.className = 'muted';
+      } else if (me.connected && me.write_state === 'live') {
+        ws.textContent = 'Connected — posts made under your warrants go to your real account. Access token expires ' + me.access_expires_at + '.';
+        ws.className = 'ok';
+      } else if (me.connected) {
+        ws.textContent = 'Connection is ' + me.write_state + ' — reconnect to keep posting to your real account.';
+        ws.className = 'bad';
+      } else {
+        ws.textContent = 'Not connected. Posts currently go to a bridge account, not your real timeline.';
+        ws.className = '';
+      }
+
+      jsonFetch('/dashboard/agents').then(function (r2) {
+        if (r2.ok) renderAgents(r2.body);
+        else $('agents').textContent = r2.body.error || 'could not load delegations';
+      }).catch(function (e) { $('agents').textContent = String(e); });
+    }).catch(function (e) { err.textContent = String(e); });
+  }
+
+  navigator.id.watch({
+    loggedInUser: null,
+    onlogin: function (presentation) {
+      err.textContent = '';
+      jsonFetch('/dashboard/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ presentation: presentation }),
+      }).then(function (res) {
+        if (!res.ok) {
+          err.textContent = res.body.error_description || res.body.error || 'sign-in failed';
+          return;
+        }
+        refresh();
+      }).catch(function (e) { err.textContent = String(e); });
+    },
+    onlogout: function () {},
+  });
+
+  $('signin').addEventListener('click', function () {
+    navigator.id.request({ siteName: 'Bluesky delegation dashboard' });
+  });
+
+  $('signout').addEventListener('click', function () {
+    jsonFetch('/dashboard/logout', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }).then(function () {
+      if (navigator.id.logout) navigator.id.logout();
+      refresh();
+    });
+  });
+
+  $('copy').addEventListener('click', function () {
+    var p = $('prompt');
+    p.select();
+    (navigator.clipboard ? navigator.clipboard.writeText(p.value) : Promise.reject())
+      .catch(function () { document.execCommand('copy'); })
+      .then(function () { $('copied').hidden = false; setTimeout(function () { $('copied').hidden = true; }, 1500); });
+  });
+
+  refresh();
+})();
+</script>

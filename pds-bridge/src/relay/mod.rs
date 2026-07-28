@@ -36,6 +36,7 @@
 //! returns a DID and nothing else) and nothing here is allowed to soften it.
 
 pub mod crypto;
+pub mod dashboard;
 pub mod oauth;
 pub mod routes;
 

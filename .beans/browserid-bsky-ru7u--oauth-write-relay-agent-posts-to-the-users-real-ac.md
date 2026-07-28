@@ -5,7 +5,7 @@ status: in-progress
 type: feature
 priority: high
 created_at: 2026-07-27T12:54:00Z
-updated_at: 2026-07-28T15:58:19Z
+updated_at: 2026-07-28T16:44:59Z
 parent: browserid-bsky-sxy0
 ---
 
@@ -33,3 +33,51 @@ Write-relay backend built + adversarially reviewed + fixed. Ships inert: WRITE_R
 - Kill switch = warrant revoke (checked before backend selection). Provenance fails loudly (502 posted:true/attested:false).
 
 Remaining: Phase 2 (dashboard + connect UI), Phase 3 (directed provisionEmail login + personalized prompt), then lift allowlist after observing a real refresh cycle + expiry. Enable-gated in prod (empty allowlist) until then.
+
+## Phase 2 build plan (2026-07-28, this session)
+
+Dashboard + connect UI, landed inert behind the same relay gate (relay=None => every route 404s).
+
+- [x] store.rs: dashboard_sessions table + create/get/delete (+expiry sweep on write)
+- [x] store.rs: grantor-scoped reads: warrants_for_grantor (LIMIT), tokens_for_grantor (live only), audit_for_grantor
+- [x] relay/dashboard.rs: page/login/me/agents/logout — login first-party-only + rejects agent-scoped presentations (F1) + same-origin guard (F2)
+- [x] relay/dashboard.html: undirected login, write-connection card, agents list, revoke link, copyable prompt; textContent-only; escaped template tokens; frame-ancestors none
+- [x] relay/routes.rs: require_human_session (dashboard OR idp session); connect.html links back to /dashboard; frame-ancestors on connect page
+- [x] tests: 15 new dashboard tests incl. F1 as-you-agent, F2 login CSRF
+- [x] cargo test green (157 lib + 7 integration); adversarially reviewed (1 medium F1 + lows fixed)
+
+## Phase 2 landed 2026-07-28 (dashboard + connect UI, allowlist-gated-off)
+
+Dashboard shell + connect UI built, adversarially reviewed, fixes applied,
+lands inert (relay=None => every /dashboard* + /idp/connect* route 404s;
+existing paths byte-identical). 157 lib + 7 integration tests.
+
+New: relay/dashboard.rs + dashboard.html (page, login, me, agents, logout);
+dashboard_sessions table (plain-cookie RP session, SEPARATE from
+idp_sessions, per decision); grantor-scoped store reads; require_human_session
+so a dashboard sign-in carries into the connect flow without re-auth.
+
+Sign-in is a plain undirected navigator.id.request for phase 2; the directed
+provisionEmail handle box + identity-match check is phase 3.
+
+Adversarial review (subagent): boundary holds against all 6 attack classes.
+Findings fixed:
+- F1 (MEDIUM): the IdP mints an "as-you" agent cert whose identity IS the
+  handle (certs.rs:266), so an agent's warrant with grantor==grantee==handle
+  cleared login's first-party gate — a delegate with only posting scopes could
+  open the management page. Fixed: login now also rejects any presentation
+  carrying a bridge-grammar scope (a human's plain login carries none; `login`
+  is dropped by the grammar). Tested.
+- F2 (low): added require_same_origin to /dashboard/login (forced-login CSRF
+  parity with logout). Tested.
+- F3 (low): sweep expired dashboard_sessions on each sign-in.
+- F4 (low): LIMIT on warrants_for_grantor (was unbounded per page load).
+- F5/F6/F7/F8 (info): HTML-escape the operator-config template tokens;
+  frame-ancestors 'none' on both HTML pages; .catch on the agents fetch;
+  comment the session-shadowing precedence in require_human_session.
+- F9 (info): moot — relay routes are always registered ahead of the fallback
+  proxy, so /dashboard* never reaches the PDS proxy (test-covered).
+
+Remaining: Phase 3 (directed provisionEmail login + identity-match +
+personalized prompt polish + "or use any email" mint path), then lift the
+allowlist after observing a real refresh cycle + expiry in prod.
