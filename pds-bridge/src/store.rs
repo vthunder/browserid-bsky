@@ -130,15 +130,20 @@ pub struct IdpSession {
     pub expires_at: DateTime<Utc>,
 }
 
-/// The dashboard's first-party RP session (write-relay phase 2). Always a
-/// handle identity — the dashboard signs in `<handle>@<D>` and nothing else.
+/// The dashboard's first-party RP session (write-relay phase 2). Either a
+/// handle identity (`<handle>@<D>`, with the pinned DID) or — since the
+/// mint-a-handle flow — any email identity, which has no handle or DID
+/// here until it mints one.
 #[derive(Debug, Clone)]
 pub struct DashboardSession {
-    /// The full browserid identity string, `<handle>@<D>` — what a
-    /// warrant's grantor field says.
+    /// The full browserid identity string — what a warrant's grantor field
+    /// says (`<handle>@<D>` or an email).
     pub identity: String,
-    pub handle: String,
-    pub did: String,
+    /// `None` for an email sign-in: nothing handle-shaped to manage, so the
+    /// connect endpoints refuse such a session by construction.
+    pub handle: Option<String>,
+    /// The pinned DID behind a handle sign-in; `None` for email sign-ins.
+    pub did: Option<String>,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -1175,13 +1180,16 @@ impl Store {
     // separate from idp_sessions by decision. Holds an identity and nothing
     // token-shaped.
 
+    /// `handle`/`did` are `None` for an email sign-in (stored as empty
+    /// strings — the columns predate the mint flow and are NOT NULL).
     pub fn dashboard_create_session(
         &self,
         identity: &str,
-        handle: &str,
-        did: &str,
+        handle: Option<&str>,
+        did: Option<&str>,
         ttl_hours: i64,
     ) -> Result<String> {
+        let (handle, did) = (handle.unwrap_or(""), did.unwrap_or(""));
         let sid = random_token();
         let conn = self.conn.lock().unwrap();
         // Sweep expired rows on each sign-in — the same "purge on write"
@@ -1219,8 +1227,8 @@ impl Store {
                 |r| {
                     Ok(DashboardSession {
                         identity: r.get(0)?,
-                        handle: r.get(1)?,
-                        did: r.get(2)?,
+                        handle: Some(r.get::<_, String>(1)?).filter(|s| !s.is_empty()),
+                        did: Some(r.get::<_, String>(2)?).filter(|s| !s.is_empty()),
                         expires_at: parse_time(&r.get::<_, String>(3)?),
                     })
                 },

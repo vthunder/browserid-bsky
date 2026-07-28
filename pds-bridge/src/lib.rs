@@ -27,6 +27,7 @@ pub mod relay;
 pub mod routes;
 pub mod scopes;
 pub mod store;
+pub mod ui;
 
 use std::sync::Arc;
 
@@ -148,6 +149,7 @@ impl BridgeState {
                 axum::routing::get(routes::oauth_metadata),
             )
             .route("/", axum::routing::get(routes::root))
+            .route("/agent", axum::routing::get(routes::agent_page))
             .route("/llms.txt", axum::routing::get(routes::llms_txt))
             .route("/browserid/health", axum::routing::get(|| async { "ok" }))
             .route("/verify", axum::routing::get(routes::verify))

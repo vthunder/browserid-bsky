@@ -48,7 +48,7 @@ pub struct Verified {
 /// hosted response omits grantee/warrant-status (audit D2), so those claims
 /// are read from the just-verified bundle and cross-checked against the
 /// verifier's answer.
-async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, Response> {
+pub(crate) async fn verify_presentation(state: &S, presentation: &str) -> Result<Verified, Response> {
     // Our own IdP's identities are verified in-process against a pinned
     // key. The bridge and the IdP are one deployment, so round-tripping
     // through the hosted verifier (and thus DNSSEC discovery, and thus the
@@ -180,7 +180,7 @@ pub struct ProvisionRequest {
     pub handle: String,
 }
 
-fn valid_label(label: &str) -> bool {
+pub(crate) fn valid_label(label: &str) -> bool {
     let bytes = label.as_bytes();
     (2..=63).contains(&label.len())
         && bytes.first().is_some_and(u8::is_ascii_lowercase)
@@ -314,7 +314,7 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
                     "invalid_grant",
                     format!(
                         "{} has no account here — provision one, or connect write access to \
-                         an existing Bluesky handle at {}/idp/connect",
+                         an existing Bluesky handle at {}/dashboard",
                         identity.grantor, state.origin
                     ),
                 )
@@ -451,6 +451,22 @@ pub async fn root(State(state): State<S>, headers: HeaderMap) -> Response {
         .is_some_and(|a| a.contains("text/html"));
     if wants_html {
         axum::response::Html(crate::guide::guide_html(&state.origin, &state.handle_domain))
+            .into_response()
+    } else {
+        markdown(crate::guide::guide_markdown(&state.origin, &state.handle_domain))
+    }
+}
+
+/// GET /agent — the agent guide's own address (UX revamp: the instructions
+/// moved out of the human root page). Browsers get a thin HTML wrapper;
+/// agents and curl get the markdown itself.
+pub async fn agent_page(State(state): State<S>, headers: HeaderMap) -> Response {
+    let wants_html = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|a| a.contains("text/html"));
+    if wants_html {
+        axum::response::Html(crate::guide::agent_html(&state.origin, &state.handle_domain))
             .into_response()
     } else {
         markdown(crate::guide::guide_markdown(&state.origin, &state.handle_domain))
@@ -1916,7 +1932,7 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
 
     let mut checks = serde_json::Map::new();
     let mut ok = true;
-    let mut check = |name: &str, pass: bool, checks: &mut serde_json::Map<String, serde_json::Value>, ok: &mut bool| {
+    let check = |name: &str, pass: bool, checks: &mut serde_json::Map<String, serde_json::Value>, ok: &mut bool| {
         checks.insert(name.into(), serde_json::Value::Bool(pass));
         if !pass { *ok = false; }
     };
@@ -2025,81 +2041,334 @@ fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-fn verify_landing() -> String {
-    "<!doctype html><meta charset=utf-8><title>browserid · verify a Bluesky post</title>\
-     <meta name=viewport content='width=device-width,initial-scale=1'>\
-     <div style='font:16px/1.5 system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem'>\
-     <h1>Verify a Bluesky post</h1>\
-     <p>Paste a post link — a <code>bsky.app</code> URL or an <code>at://</code> URI — \
-     to see who authorized it and who acted, verified against browserid.</p>\
-     <form onsubmit=\"event.preventDefault();location='/verify?uri='+encodeURIComponent(document.getElementById('u').value)\">\
-     <input id=u style='width:100%;padding:.6rem;font-size:1rem;box-sizing:border-box' \
-     placeholder='https://bsky.app/profile/…/post/… or at://…'>\
-     <button style='margin-top:.8rem;padding:.6rem 1.2rem;font-size:1rem'>Verify</button>\
-     </form></div>"
+/// Page styles for the `/verify` surfaces (report, landing, error) — option
+/// 1g of the UX revamp, over the shared system in `ui.rs`.
+const VERIFY_CSS: &str = r#"
+.wrap { max-width: 44rem; margin: 0 auto; padding: 30px 24px 36px; }
+.verdict { display:flex; align-items:center; gap:12px; margin-bottom:6px; }
+.verdict-ic { width:38px; height:38px; border-radius:50%; display:grid; place-items:center; font-size:18px; flex:none; }
+.v-green .verdict-ic { background:var(--green-tint); border:1px solid var(--green-border); color:var(--green); }
+.v-amber .verdict-ic { background:var(--gold-tint); border:1px solid var(--gold-border); color:var(--gold); }
+.v-red .verdict-ic { background:var(--red-tint); border:1px solid var(--red-border); color:var(--red); }
+.verdict-title { font:600 18px var(--mono); letter-spacing:-.01em; }
+.v-green .verdict-title { color:var(--green); }
+.v-amber .verdict-title { color:var(--gold); }
+.v-red .verdict-title { color:var(--red); }
+.verdict-sub { font-size:12px; color:var(--muted); }
+.post-card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px 18px; margin:18px 0; box-shadow:var(--shadow); }
+.post-head { display:flex; gap:10px; align-items:center; margin-bottom:8px; }
+.post-head .avatar { width:34px; height:34px; }
+.post-name { font-size:13.5px; font-weight:700; }
+.post-handle { font:11.5px var(--mono); color:var(--muted); }
+.post-open { margin-left:auto; font:600 11px var(--mono); }
+.post-text { margin:0; font-size:14px; line-height:1.5; white-space:pre-wrap; overflow-wrap:anywhere; }
+.post-note { font-size:11px; color:var(--faint); margin-top:8px; }
+.chain { display:flex; align-items:stretch; margin:0 0 18px; }
+.chain-box { flex:1; border-radius:12px; padding:12px 14px; border:1px solid var(--line); min-width:0; }
+.chain-gold { background:var(--gold-tint); border-color:var(--gold-border); }
+.chain-cyan { background:var(--cyan-tint); border-color:var(--cyan-border); }
+.chain-green { background:var(--green-tint); border-color:var(--green-border); flex:.8; }
+.chain-label { font:600 10px var(--mono); letter-spacing:.12em; text-transform:uppercase; margin-bottom:3px; }
+.chain-gold .chain-label { color:var(--gold); }
+.chain-cyan .chain-label { color:var(--cyan); }
+.chain-green .chain-label { color:var(--green); }
+.chain-id { font:600 12.5px var(--mono); overflow-wrap:anywhere; }
+.chain-sub { font-size:11px; color:var(--muted); }
+.chain-arrow { padding:0 10px; color:var(--line-strong); font-size:16px; align-self:center; flex:none; }
+.checks { border:1px solid var(--line); border-radius:12px; background:var(--panel); }
+.checks-head { display:flex; align-items:center; gap:10px; padding:12px 16px; }
+.checks-count { font:600 12.5px var(--mono); color:var(--green); }
+.checks-count.bad { color:var(--red); }
+.checks-rule { flex:1; height:1px; background:var(--line); }
+.checks-toggle { font:600 11.5px var(--mono); color:var(--gold); background:none; border:0; cursor:pointer; padding:0; }
+.checks-grid { border-top:1px solid var(--line); padding:10px 16px; display:grid; grid-template-columns:1fr 1fr; gap:4px 20px; font:11.5px var(--mono); color:var(--muted); }
+.checks-grid .bad { color:var(--red); }
+.vfoot { font:11px var(--mono); color:var(--faint); margin-top:14px; overflow-wrap:anywhere; }
+.vfoot a { color:var(--faint); }
+.vfoot a:hover { color:var(--gold); }
+.vhero { padding:14px 0 18px; }
+.vhero h1 { font:600 27px/1.15 var(--mono); letter-spacing:-.02em; margin:14px 0 8px; }
+.vhero .lede { margin:0 0 18px; color:var(--muted); font-size:14.5px; max-width:34em; }
+.verify-panel { background:var(--panel); border:1px solid var(--line-strong); border-radius:14px; padding:20px 22px; box-shadow:var(--shadow); }
+.verify-form { display:flex; gap:10px; }
+.verify-form .input { flex:1; min-width:0; }
+.verify-form .btn { border-radius:10px; padding:12px 22px; font-size:13.5px; flex:none; }
+@media (max-width: 640px) {
+  .chain { flex-direction:column; }
+  .chain-arrow { transform:rotate(90deg); padding:4px 0; }
+  .checks-grid { grid-template-columns:1fr; }
+  .verify-form { flex-direction:column; }
+}
+"#;
+
+/// The details toggle — the page's one interaction. Kept as a const so the
+/// surrounding HTML can be `format!`ed without brace-escaping the JS.
+const VERIFY_JS: &str = r#"<script>
+(function () {
+  var t = document.getElementById('ck-toggle');
+  var d = document.getElementById('ck-details');
+  if (!t || !d) return;
+  t.addEventListener('click', function () {
+    var show = d.hidden;
+    d.hidden = !show;
+    t.textContent = show ? 'hide details ▴' : 'show details ▾';
+  });
+})();
+</script>"#;
+
+/// nav + wrap shell shared by the three verify surfaces.
+fn verify_shell(inner: &str) -> String {
+    let nav = crate::ui::nav(
+        &crate::ui::brand_site(),
+        r#"<a class="nav-link" href="/">verify another ↗</a>"#,
+    );
+    crate::ui::document(
+        "browserid · verify a Bluesky post",
+        VERIFY_CSS,
+        &format!("{nav}\n<main class=\"wrap\">{inner}</main>"),
+    )
+}
+
+/// The paste-a-link panel (used by the landing and error pages).
+fn verify_panel() -> String {
+    r#"<section class="verify-panel">
+  <form class="verify-form" action="/verify" method="get">
+    <input class="input" name="uri" placeholder="https://bsky.app/profile/…/post/… or at://…" autofocus>
+    <button class="btn btn-gold" type="submit">Verify</button>
+  </form>
+  <p class="micro" style="margin:8px 0 0">Navigate here yourself — a verify link written inside a post proves nothing.</p>
+</section>"#
         .to_string()
 }
 
+fn verify_landing() -> String {
+    verify_shell(&format!(
+        r#"<div class="vhero">
+  <div class="kicker c-green">Check a post</div>
+  <h1>Verify a Bluesky post</h1>
+  <p class="lede">Paste a post link — a <code>bsky.app</code> URL or an <code>at://</code> URI — to see who authorized it, which agent wrote it, and every check that ran.</p>
+</div>
+{panel}"#,
+        panel = verify_panel()
+    ))
+}
+
 fn verify_html_err(reason: &str) -> String {
-    format!(
-        "<!doctype html><meta charset=utf-8><title>browserid verify</title>\
-         <div style='font:16px system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem'>\
-         <h1>Not verifiable</h1><p>{}</p></div>",
-        esc(reason)
-    )
+    verify_shell(&format!(
+        r#"<div class="verdict v-red" style="margin:14px 0 18px">
+  <span class="verdict-ic">✗</span>
+  <div><div class="verdict-title">Not verifiable</div><div class="verdict-sub">{reason}</div></div>
+</div>
+{panel}"#,
+        reason = esc(reason),
+        panel = verify_panel()
+    ))
+}
+
+/// A warrant scope, in reader words. `None` for scopes that grant nothing a
+/// reader would picture (the bare `login`).
+fn humanize_scope(s: &str) -> Option<String> {
+    match s {
+        "login" => None,
+        "account:create" => Some("open an account".into()),
+        "repo:app.bsky.feed.post?action=create" => Some("create posts".into()),
+        _ => Some(if let Some(rest) = s.strip_prefix("repo:app.bsky.feed.like") {
+            let _ = rest;
+            "like posts".into()
+        } else if let Some(mime) = s.strip_prefix("blob:") {
+            format!("upload {mime} blobs")
+        } else if let Some(nsid) = s.strip_prefix("rpc:") {
+            format!("call {nsid}")
+        } else {
+            s.to_string()
+        }),
+    }
+}
+
+/// Canned reports for the UI-preview harness (`ui_preview_server` in
+/// relay/dashboard.rs) — the only way to eyeball the report without a live
+/// PDS holding provenance records. `kind`: green | amber | red.
+#[cfg(test)]
+pub(crate) fn verify_preview(kind: &str) -> String {
+    let mut checks = serde_json::json!({
+        "warrant_signed_by_config_cert": true,
+        "config_cert_authoritative_for_grantor": true,
+        "config_cert_signed_by_idp": true,
+        "audience_is_this_bridge": true,
+        "warrant_unexpired": true,
+        "provenance_matches_warrant": true,
+        "attestation_signed_by_grantee": true,
+        "access_cert_is_grantee": true,
+        "access_cert_signed_by_idp": true,
+        "content_hash_matches_post": true,
+        "attestation_within_cert_validity": true,
+        "nonce_matches_provenance": true,
+    });
+    let (ok, bound) = match kind {
+        "amber" => (true, false),
+        "red" => {
+            checks["content_hash_matches_post"] = false.into();
+            (false, true)
+        }
+        _ => (true, true),
+    };
+    verify_html(&serde_json::json!({
+        "ok": ok,
+        "postBindingVerified": bound,
+        "post": "at://did:plc:44ydse7qpviwxwmwbjwq7e2/app.bsky.feed.post/3kt5abcdef",
+        "postText": "drafted, sourced, and posted by me — an agent. my human approved exactly this much and can take it back anytime.",
+        "postHandle": "scribe.at.browserid.me",
+        "postUrl": "https://bsky.app/profile/scribe.at.browserid.me/post/3kt5abcdef",
+        "attributedTo": "alice@gmail.com",
+        "executedBy": "alice+scribe@gmail.com",
+        "onBehalf": kind != "amber",
+        "scopes": ["login", "repo:app.bsky.feed.post?action=create"],
+        "checks": checks,
+        "warrantRecord": "at://did:plc:44ydse7qpviwxwmwbjwq7e2/me.browserid.warrant/h-1",
+    }))
 }
 
 fn verify_html(r: &serde_json::Value) -> String {
     let ok = r["ok"].as_bool().unwrap_or(false);
-    let badge = if ok { "✓ delegation verified" } else { "✗ verification failed" };
-    let color = if ok { "#0a7d33" } else { "#b00020" };
     let bound = r["postBindingVerified"].as_bool().unwrap_or(false);
-    let binding_line = if bound {
-        "<div style='color:#0a7d33'>🔒 authorship cryptographically bound to this post (unforgeable)</div>"
+    let checks: Vec<(String, bool)> = r["checks"]
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_bool().unwrap_or(false))).collect())
+        .unwrap_or_default();
+    let passed = checks.iter().filter(|(_, p)| *p).count();
+    let total = checks.len();
+
+    // Three verdicts (option 1g): fully verified / delegation verified
+    // (PDS-asserted binding) / failed, with the first failed check named.
+    let (vclass, icon, title, sub) = if ok && bound {
+        ("v-green", "✓", "Fully verified".to_string(),
+         "authorship cryptographically bound to this exact post — unforgeable".to_string())
+    } else if ok {
+        ("v-amber", "✓", "Delegation verified".to_string(),
+         "authorship of this exact post is PDS-asserted (no grantee signature)".to_string())
     } else {
-        "<div style='color:#a06000'>authorship of this exact post is PDS-asserted (no valid grantee signature)</div>"
+        let first_failed = checks
+            .iter()
+            .find(|(_, p)| !p)
+            .map(|(k, _)| k.replace('_', " "))
+            .unwrap_or_else(|| "verification failed".to_string());
+        ("v-red", "✗", "Verification failed".to_string(), format!("failed: {first_failed}"))
     };
-    let on_behalf = r["onBehalf"].as_bool().unwrap_or(false);
-    let relation = if on_behalf {
-        format!("<b>{}</b> posted <b>on behalf of</b> <b>{}</b>", esc(r["executedBy"].as_str().unwrap_or("")), esc(r["attributedTo"].as_str().unwrap_or("")))
-    } else {
-        format!("<b>{}</b> posted as itself", esc(r["attributedTo"].as_str().unwrap_or("")))
-    };
-    // The verified post itself, shown so the reader confirms it's the post
-    // they came from (anti-spoof).
+
+    // The post itself, so the reader confirms it's the one they came from
+    // (anti-spoof).
     let post_handle = r["postHandle"].as_str().unwrap_or("(unknown handle)");
+    let post_name = post_handle.split('.').next().unwrap_or(post_handle);
     let post_text = r["postText"].as_str().unwrap_or("");
-    let post_link = r["postUrl"].as_str();
-    let post_card = format!(
-        "<div style='border:1px solid #ccc;border-radius:8px;padding:.8rem 1rem;margin:1rem 0;background:#fafafa'>\
-         <div style='color:#555;font-size:.85rem'>verified post{}</div>\
-         <div style='white-space:pre-wrap;margin-top:.3rem'>{}</div>\
-         <div style='margin-top:.4rem;font-size:.85rem'>— <b>{}</b>{}</div></div>",
-        "", esc(post_text), esc(post_handle),
-        post_link.map(|u| format!(" · <a href='{}'>open on bsky.app</a>", esc(u))).unwrap_or_default(),
+    let open_link = r["postUrl"]
+        .as_str()
+        .map(|u| format!(r#"<a class="post-open goldlink" href="{}">open on bsky.app ↗</a>"#, esc(u)))
+        .unwrap_or_default();
+
+    // The chain: who authorized → who wrote → what was allowed.
+    let grantor = r["attributedTo"].as_str().unwrap_or("");
+    let grantee = r["executedBy"].as_str().unwrap_or("");
+    let on_behalf = r["onBehalf"].as_bool().unwrap_or(false);
+    let scopes_h = r["scopes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str())
+                .filter_map(humanize_scope)
+                .collect::<Vec<_>>()
+                .join(" · ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "no bridge scopes".to_string());
+    let actor_boxes = if on_behalf {
+        format!(
+            r#"<div class="chain-box chain-gold"><div class="chain-label">Authorized by</div><div class="chain-id">{grantor}</div><div class="chain-sub">the human · signed the warrant</div></div>
+<div class="chain-arrow">→</div>
+<div class="chain-box chain-cyan"><div class="chain-label">Written by</div><div class="chain-id">{grantee}</div><div class="chain-sub">the agent · signed this post</div></div>"#,
+            grantor = esc(grantor),
+            grantee = esc(grantee),
+        )
+    } else {
+        format!(
+            r#"<div class="chain-box chain-gold"><div class="chain-label">Posted as itself</div><div class="chain-id">{grantor}</div><div class="chain-sub">one identity · authorized and wrote it</div></div>"#,
+            grantor = esc(grantor),
+        )
+    };
+
+    let check_rows: String = checks
+        .iter()
+        .map(|(k, p)| {
+            let mark = if *p { "✓" } else { "✗" };
+            let class = if *p { "" } else { r#" class="bad""# };
+            format!("<span{class}>{mark} {}</span>", esc(&k.replace('_', " ")))
+        })
+        .collect();
+    let count_class = if passed == total { "checks-count" } else { "checks-count bad" };
+
+    // Footer links: the raw at:// URI, the published warrant record (via
+    // this origin's passthrough getRecord), and the JSON form of this page.
+    let post_uri = r["post"].as_str().unwrap_or("");
+    let warrant_uri = r["warrantRecord"].as_str().unwrap_or("");
+    let warrant_link = parse_at_uri(warrant_uri)
+        .map(|(did, coll, rkey)| {
+            format!(
+                r#" · <a href="/xrpc/com.atproto.repo.getRecord?repo={did}&collection={coll}&rkey={rkey}">warrant record ↗</a>"#,
+                did = esc(&did),
+                coll = esc(&coll),
+                rkey = esc(&rkey),
+            )
+        })
+        .unwrap_or_default();
+    let json_link = format!(r#" · <a href="/verify?uri={}&format=json">json</a>"#, esc(post_uri));
+
+    let inner = format!(
+        r#"<div class="verdict {vclass}" style="margin-top:14px">
+  <span class="verdict-ic">{icon}</span>
+  <div><div class="verdict-title">{title}</div><div class="verdict-sub">{sub}</div></div>
+</div>
+<div class="post-card">
+  <div class="post-head">
+    <span class="avatar"></span>
+    <div><span class="post-name">{post_name}</span><div class="post-handle">@{post_handle}</div></div>
+    {open_link}
+  </div>
+  <p class="post-text">{post_text}</p>
+  <div class="post-note">Confirm this is the post you came from — that's what defeats a spoofed link.</div>
+</div>
+<div class="chain">
+{actor_boxes}
+<div class="chain-arrow">→</div>
+<div class="chain-box chain-green"><div class="chain-label">Scope</div><div class="chain-id">{scopes_h}</div><div class="chain-sub">nothing else · revocable</div></div>
+</div>
+<div class="checks">
+  <div class="checks-head">
+    <span class="{count_class}">{passed} / {total} checks passed</span>
+    <span class="checks-rule"></span>
+    <button class="checks-toggle" id="ck-toggle" type="button">show details ▾</button>
+  </div>
+  <div class="checks-grid" id="ck-details" hidden>{check_rows}</div>
+</div>
+<div class="vfoot">{post_uri_esc}{warrant_link}{json_link}</div>
+{VERIFY_JS}"#,
+        vclass = vclass,
+        icon = icon,
+        title = title,
+        sub = esc(&sub),
+        post_name = esc(post_name),
+        post_handle = esc(post_handle),
+        open_link = open_link,
+        post_text = esc(post_text),
+        actor_boxes = actor_boxes,
+        scopes_h = esc(&scopes_h),
+        count_class = count_class,
+        passed = passed,
+        total = total,
+        check_rows = check_rows,
+        post_uri_esc = esc(post_uri),
+        warrant_link = warrant_link,
+        json_link = json_link,
     );
-    let scopes = r["scopes"].as_array().map(|a| a.iter().filter_map(|s| s.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default();
-    let rows = r["checks"].as_object().map(|m| {
-        m.iter().map(|(k, v)| format!("<tr><td>{}</td><td>{}</td></tr>", esc(k), if v.as_bool().unwrap_or(false) {"✓"} else {"✗"})).collect::<String>()
-    }).unwrap_or_default();
-    format!(
-        "<!doctype html><meta charset=utf-8><title>browserid verify</title>\
-         <div style='font:16px/1.5 system-ui;max-width:44rem;margin:3rem auto;padding:0 1rem'>\
-         <div style='color:{color};font-weight:700;font-size:1.3rem'>{badge}</div>\
-         {binding_line}\
-         {post_card}\
-         <p style='font-size:1.1rem'>{relation}, authorized under <b>{root}</b>.</p>\
-         <p>Audience: <code>{aud}</code><br>Scopes: <code>{scopes}</code><br>IdP: <code>{iss}</code></p>\
-         <table style='border-collapse:collapse' cellpadding=6>{rows}</table>\
-         <p style='color:#666;font-size:.9rem;margin-top:1.5rem'>{caveat}</p>\
-         <p style='color:#999;font-size:.8rem'>Post: <code>{post}</code></p></div>",
-        color = color, badge = badge, binding_line = binding_line, post_card = post_card, relation = relation,
-        root = esc(r["root"].as_str().unwrap_or("")),
-        aud = esc(r["audience"].as_str().unwrap_or("")),
-        scopes = esc(&scopes), iss = esc(r["issuer"].as_str().unwrap_or("")),
-        rows = rows, caveat = esc(r["caveat"].as_str().unwrap_or("")),
-        post = esc(r["post"].as_str().unwrap_or("")),
-    )
+    verify_shell(&inner)
 }
 
 // ---------------------------------------------------------------------------

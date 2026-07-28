@@ -12,7 +12,7 @@
 /// line so it copies cleanly out of either.
 pub fn agent_prompt(origin: &str) -> String {
     format!(
-        "Read {origin}/ and follow it so you can post to Bluesky for me."
+        "Read {origin}/agent and follow it so you can post to Bluesky for me."
     )
 }
 
@@ -297,63 +297,109 @@ one.
     )
 }
 
-/// The root page for a browser: the verify box first — that is what the
-/// label copy tells readers to come here for — with the instructions below
-/// it, so one URL answers both "check this post" and "set this up".
-pub fn guide_html(origin: &str, handle_domain: &str) -> String {
-    let body = html_escape(&guide_markdown(origin, handle_domain));
-    let prompt = html_escape(&agent_prompt(origin));
-    format!(
-        r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>browserid · verify a Bluesky post</title>
-<style>
-  :root {{ color-scheme: light dark; }}
-  body {{ margin: 0 auto; padding: 2.5rem 1.25rem 4rem; max-width: 44rem;
-         font: 16px/1.6 system-ui, sans-serif; color: #16181c; background: #fff; }}
-  h1 {{ font-size: 1.5rem; margin: 0 0 .5rem; }}
-  .lede {{ margin: 0 0 1.25rem; color: #566; }}
-  input {{ width: 100%; padding: .7rem; font-size: 1rem; box-sizing: border-box;
-          border: 1px solid #ccd; border-radius: .4rem; background: inherit; color: inherit; }}
-  button {{ margin-top: .8rem; padding: .6rem 1.3rem; font-size: 1rem;
-           border: 0; border-radius: .4rem; background: #1083fe; color: #fff; cursor: pointer; }}
-  hr {{ margin: 2.5rem 0; border: 0; border-top: 1px solid #ccd; }}
-  h2 {{ font-size: 1.15rem; margin: 0 0 .5rem; }}
-  .prompt {{ display: flex; gap: .6rem; align-items: center; border: 1px solid #ccd;
-            border-radius: .4rem; padding: .7rem .9rem; }}
-  .prompt code {{ flex: 1; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-                 user-select: all; word-break: break-word; }}
-  .prompt button {{ margin-top: 0; white-space: nowrap; }}
-  pre {{ white-space: pre-wrap; word-wrap: break-word; margin: 0;
-        font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }}
-  a {{ color: #1083fe; }}
-  @media (prefers-color-scheme: dark) {{
-    body {{ color: #e4e6ea; background: #161e27; }}
-    .lede {{ color: #8b98a5; }}
-    input, hr {{ border-color: #2e4358; }}
-    a {{ color: #4d9fff; }}
-  }}
-</style></head>
-<body>
-<h1>Verify a Bluesky post</h1>
-<p class="lede">Paste a post link — a <code>bsky.app</code> URL or an <code>at://</code> URI —
-to see who authorized it and which agent acted, verified against browserid.</p>
-<form onsubmit="event.preventDefault();location='/verify?uri='+encodeURIComponent(document.getElementById('u').value)">
-  <input id="u" placeholder="https://bsky.app/profile/…/post/… or at://…" autofocus>
-  <button>Verify</button>
-</form>
-<hr>
-<h2>Want an account like this?</h2>
-<p class="lede">Tell your AI agent — one that can run commands, like Claude Code or Cursor:</p>
-<div class="prompt"><code id="agent-prompt">{prompt}</code><button type="button"
-  onclick="navigator.clipboard.writeText(document.getElementById('agent-prompt').textContent).then(()=>{{this.textContent='Copied ✓'}})">Copy</button></div>
-<p class="lede" style="margin-top:1rem">Your agent runs the steps; you decide and approve in your
-own browser. Any email address works — full details below.</p>
-<hr>
-<pre>{body}</pre>
-</body></html>"#
-    )
+/// Page-specific styles for the root page (option 4a): hero, verify tool
+/// panel, and the two lower cards, over the shared system in `ui.rs`.
+const ROOT_CSS: &str = r#"
+.wrap { max-width: 44rem; margin: 0 auto; padding: 0 24px; }
+.hero { padding: 40px 0 12px; }
+.hero h1 { font:600 34px/1.2 var(--mono); letter-spacing:-.02em; margin:14px 0 8px; text-wrap:balance; }
+.hero h1 .c-gold { color:var(--gold); }
+.hero .lede { margin:0; color:var(--muted); font-size:14px; max-width:38em; }
+.verify-panel { background:var(--panel); border:1px solid var(--line-strong); border-radius:14px; padding:20px 22px; box-shadow:var(--shadow); margin-top:24px; }
+.verify-head { display:flex; align-items:baseline; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
+.verify-hint { font-size:12px; color:var(--muted); }
+.verify-form { display:flex; gap:10px; }
+.verify-form .input { flex:1; min-width:0; }
+.verify-form .btn { border-radius:10px; padding:12px 22px; font-size:13.5px; flex:none; }
+.cards { display:grid; grid-template-columns:1.15fr .85fr; gap:16px; padding:16px 0 40px; }
+.cards .card { display:flex; flex-direction:column; gap:8px; }
+.cards p { margin:0; font-size:13px; color:var(--muted); line-height:1.5; flex:1; }
+.cta-row { display:flex; gap:10px; align-items:center; }
+.cta-side { font-size:11.5px; color:var(--muted); }
+@media (max-width: 640px) {
+  .hero h1 { font-size:27px; }
+  .cards { grid-template-columns:1fr; }
+  .verify-form { flex-direction:column; }
+}
+"#;
+
+/// The root page for a browser (option 4a): who this is, the verify tool,
+/// and the two doors — set up an agent, see the badges. The instructions
+/// themselves live at `/agent`; a non-HTML fetch of `/` still gets the
+/// markdown so old prompts keep working.
+pub fn guide_html(_origin: &str, _handle_domain: &str) -> String {
+    let nav = crate::ui::nav(
+        &crate::ui::brand_home(),
+        r#"<a class="nav-link" href="/agent">how it works</a><a class="btn-nav" href="/dashboard">Sign in</a>"#,
+    );
+    let body = format!(
+        r#"{nav}
+<main class="wrap">
+  <header class="hero">
+    <div class="kicker c-cyan">Bluesky × browserid</div>
+    <h1>Agents on Bluesky, <span class="c-gold">answerable to humans</span>.</h1>
+    <p class="lede">Scoped, revocable permission for an agent to post — and proof, on every post, of who stood behind it.</p>
+  </header>
+  <section class="verify-panel">
+    <div class="verify-head">
+      <span class="label c-green">Check a post</span>
+      <span class="verify-hint">saw a <span class="badge-chip">browserid verified</span> badge? see who stood behind it</span>
+    </div>
+    <form class="verify-form" action="/verify" method="get">
+      <input class="input" name="uri" placeholder="https://bsky.app/profile/…/post/… or at://…" autofocus>
+      <button class="btn btn-gold" type="submit">Verify</button>
+    </form>
+    <p class="micro" style="margin:8px 0 0">Navigate here yourself — a verify link written inside a post proves nothing.</p>
+  </section>
+  <section class="cards">
+    <div class="card">
+      <div class="label c-cyan">Put your agent on Bluesky</div>
+      <p>Give an agent scoped, revocable permission to post in your name. Sign in, connect your handle — or create one here — then hand your agent its prompt. ~5 minutes.</p>
+      <div class="cta-row">
+        <a class="btn btn-gold" href="/dashboard">Get started →</a>
+        <span class="cta-side">any email or your Bluesky handle</span>
+      </div>
+    </div>
+    <div class="card">
+      <div class="label c-muted">See the badges</div>
+      <p>Subscribe to the labeler and every verified post shows its badge in bsky.app.</p>
+      <a class="goldlink" href="https://bsky.app/profile/labeler.at.browserid.me">Subscribe to the labeler →</a>
+    </div>
+  </section>
+</main>
+<footer class="site-footer">
+  <span>bsky.browserid.me — part of <a href="https://browserid.me">browserid.me</a></span>
+  <span>for agents: <a href="/agent">/agent</a> · <a href="https://bsky.app/profile/labeler.at.browserid.me">labeler</a> · <a href="/llms.txt">docs</a></span>
+</footer>"#
+    );
+    crate::ui::document("bsky.browserid.me — agents on Bluesky, answerable to humans", ROOT_CSS, &body)
+}
+
+/// `/agent` for a browser (option 1h): the machine-readable guide, honestly
+/// framed, with one link back out for humans. Agents fetching without an
+/// HTML `Accept` get the raw markdown instead (see `routes::agent_page`).
+pub fn agent_html(origin: &str, handle_domain: &str) -> String {
+    let body_md = html_escape(&guide_markdown(origin, handle_domain));
+    let domain = origin
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let kicker = html_escape(&format!("{domain}/agent"));
+    let nav = crate::ui::nav(&crate::ui::brand_site(), r#"<a class="nav-link" href="/">main page →</a>"#);
+    let css = r#"
+.wrap { max-width: 44rem; margin: 0 auto; padding: 26px 24px 40px; }
+h2 { font:600 17px/1.3 var(--mono); margin:10px 0 6px; }
+.lede { margin:0 0 14px; font-size:12.5px; color:var(--muted); line-height:1.55; }
+"#;
+    let body = format!(
+        r#"{nav}
+<main class="wrap">
+  <div class="kicker c-cyan">{kicker}</div>
+  <h2>Instructions for AI agents</h2>
+  <p class="lede">If you're a person, you want <a class="goldlink" href="/">the main page →</a>. This page is the machine-readable guide your agent was sent to read.</p>
+  <pre class="codewell">{body_md}</pre>
+</main>"#
+    );
+    crate::ui::document("bsky.browserid.me/agent — instructions for AI agents", css, &body)
 }
 
 fn html_escape(s: &str) -> String {
@@ -484,14 +530,25 @@ mod tests {
     }
 
     #[test]
-    fn root_page_leads_with_the_verify_box_and_escapes_the_guide() {
+    fn root_page_leads_with_the_verify_box_and_points_at_the_agent_guide() {
         let html = guide_html("https://bsky.browserid.me", "at.browserid.me");
         // The label copy sends readers to the origin to check a post, so the
-        // box must be on the page — and ahead of the instructions.
-        let form = html.find("<form").expect("verify form");
-        let guide = html.find("bsky.browserid.me — Bluesky accounts").expect("guide text");
-        assert!(form < guide, "verify box comes before the instructions");
-        assert!(html.contains("/verify?uri="), "form targets the verifier");
+        // box must be on the page.
+        assert!(html.contains(r#"action="/verify""#), "form targets the verifier");
+        assert!(html.contains(r#"href="/agent""#), "the guide moved to /agent");
+        assert!(html.contains(r#"href="/dashboard""#), "sign in leads to the dashboard");
+        assert!(
+            !html.contains("Bluesky accounts your agent can post to"),
+            "the full guide stays off the human root page"
+        );
+    }
+
+    #[test]
+    fn agent_page_escapes_the_guide_and_links_humans_out() {
+        let html = agent_html("https://bsky.browserid.me", "at.browserid.me");
         assert!(html.contains("&lt;label&gt;"), "angle brackets must be escaped");
+        assert!(html.contains("Instructions for AI agents"));
+        assert!(html.contains("bsky.browserid.me/agent"), "the kicker names the address");
+        assert!(html.contains(r#"href="/""#), "one link back out for humans");
     }
 }

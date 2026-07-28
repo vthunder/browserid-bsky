@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -119,7 +119,6 @@ pub fn routes(
     use super::dashboard;
     router
         .route("/idp/write-client-metadata.json", get(write_client_metadata))
-        .route("/idp/connect", get(connect_page))
         .route("/idp/connect/start", post(connect_start))
         .route("/idp/connect/callback", get(connect_callback))
         .route("/idp/connect/status", get(connect_status))
@@ -128,6 +127,7 @@ pub fn routes(
         .route("/dashboard/login", post(dashboard::login))
         .route("/dashboard/logout", post(dashboard::logout))
         .route("/dashboard/me", get(dashboard::me))
+        .route("/dashboard/mint", post(dashboard::mint))
         .route("/dashboard/agents", get(dashboard::agents))
 }
 
@@ -150,11 +150,16 @@ pub(crate) fn require_human_session(
     // crossing.
     if let Some(sid) = crate::idp::routes::cookie(headers, super::dashboard::DASHBOARD_COOKIE) {
         if let Some(s) = state.store.dashboard_session(&sid)? {
-            return Ok(crate::store::IdpSession {
-                handle: Some(s.handle),
-                did: s.did,
-                expires_at: s.expires_at,
-            });
+            // An email sign-in has no DID here — nothing for the connect
+            // endpoints to act on — so it does not count as a human session
+            // for them; fall through to the IdP cookie instead.
+            if let Some(did) = s.did {
+                return Ok(crate::store::IdpSession {
+                    handle: s.handle,
+                    did,
+                    expires_at: s.expires_at,
+                });
+            }
         }
     }
     crate::idp::routes::require_session(state, headers)
@@ -228,34 +233,12 @@ pub async fn connect_status(State(state): State<S>, headers: HeaderMap) -> Respo
 }
 
 // ---------------------------------------------------------------------------
-// The bare connect page
-// ---------------------------------------------------------------------------
-
-/// `GET /idp/connect` — phase 1's front door: a button and the honest
-/// version of what it does.
-///
-/// The consent copy here is the short form of the design document's
-/// requirement: say what the bridge *can* do at the protocol level, say what
-/// it *will* do, say that the provenance records are permanent and public
-/// and the user's to delete, and say how to stop it. Saying only the second
-/// is a lie of omission; saying only the first makes the feature unusable.
-pub async fn connect_page(State(state): State<S>) -> Response {
-    if require_relay(&state).is_err() {
-        return IdpError::NotConfigured.into_response();
-    }
-    // Deny framing (parity with the dashboard page): clickjacking on the
-    // consent button is already defanged by the SameSite cookie, but this
-    // is free.
-    (
-        [(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'")],
-        Html(include_str!("connect.html")),
-    )
-        .into_response()
-}
-
-// ---------------------------------------------------------------------------
 // Start
 // ---------------------------------------------------------------------------
+// There is no interstitial connect page (UX revamp, option 1e): the
+// dashboard's own button POSTs `/idp/connect/start` and navigates straight
+// to the authorization server, with the consent fine print living in a
+// disclosure on the dashboard card. The endpoints are still curl-drivable.
 
 #[derive(Serialize)]
 pub struct ConnectStartResp {
@@ -400,19 +383,23 @@ pub async fn connect_callback(
         return IdpError::NotConfigured.into_response();
     };
     let clear = (header::SET_COOKIE, set_flow_cookie(&idp.origin, "", 0));
+    // Land back on the dashboard (which is where the flow started — the
+    // interstitial page is gone); it shows the outcome inline on the
+    // "Where your posts land" card.
     match connect_callback_inner(&state, &headers, q).await {
-        Ok(did) => {
-            ([clear], Redirect::to(&format!("/idp/connect?connected={}", urlencode(&did))))
+        Ok(handle) => {
+            ([clear], Redirect::to(&format!("/dashboard?connected={}", urlencode(&handle))))
                 .into_response()
         }
-        Err(e) => ([clear], Redirect::to(&format!("/idp/connect?error={}", urlencode(&e.to_string()))))
+        Err(e) => ([clear], Redirect::to(&format!("/dashboard?error={}", urlencode(&e.to_string()))))
             .into_response(),
     }
 }
 
 /// Finish the write authorization and store the session.
 ///
-/// Returns the connected DID. Every early return leaves **nothing** stored.
+/// Returns the connected handle (what the dashboard shows the user). Every
+/// early return leaves **nothing** stored.
 pub(crate) async fn connect_callback_inner(
     state: &S,
     headers: &HeaderMap,
@@ -538,7 +525,7 @@ pub(crate) async fn connect_callback_inner(
         },
     )?;
     tracing::info!(handle = %flow.handle, did = %pin.did, "write-relay session connected");
-    Ok(pin.did)
+    Ok(flow.handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -667,11 +654,11 @@ pub(crate) mod tests {
         let endpoint = mock_token_endpoint("did:plc:pinned").await;
         stage_flow(&state, "st-ok", &endpoint, "did:plc:pinned").await;
 
-        let did =
+        let handle =
             connect_callback_inner(&state, &headers_with("bsky_write_connect=bind-1"), query("st-ok"))
                 .await
                 .unwrap();
-        assert_eq!(did, "did:plc:pinned");
+        assert_eq!(handle, "dan.bsky.social", "the callback answers with the handle the dashboard shows");
 
         let stored = state.store.write_session(&relay.secrets, "did:plc:pinned").unwrap().unwrap();
         assert_eq!(stored.handle, "dan.bsky.social");
@@ -909,7 +896,6 @@ pub(crate) mod tests {
             server.get("/idp/write-client-metadata.json").await.status_code(),
             StatusCode::NOT_FOUND
         );
-        assert_eq!(server.get("/idp/connect").await.status_code(), StatusCode::NOT_FOUND);
     }
 
     /// With a relay, the write client's document is served at the URL that
@@ -927,7 +913,6 @@ pub(crate) mod tests {
         assert_eq!(write["jwks_uri"], identity["jwks_uri"], "one key, two clients");
         assert!(write["scope"].as_str().unwrap().contains("transition:generic"));
         assert!(!identity["scope"].as_str().unwrap().contains("transition"));
-        server.get("/idp/connect").await.assert_status_ok();
     }
 }
 
