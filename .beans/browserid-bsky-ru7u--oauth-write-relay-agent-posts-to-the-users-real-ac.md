@@ -81,3 +81,40 @@ Findings fixed:
 Remaining: Phase 3 (directed provisionEmail login + identity-match +
 personalized prompt polish + "or use any email" mint path), then lift the
 allowlist after observing a real refresh cycle + expiry in prod.
+
+## Phase 3 built 2026-07-28 (directed login + identity-match + prompt)
+
+Directed provisionEmail sign-in added to the dashboard; still allowlist-gated.
+158 lib + 7 integration tests.
+
+- dashboard.html: a "your Bluesky handle" text box → directed
+  navigator.id.request({ provisionEmail: "<handle>@<D>" }) (skips the
+  chooser). Live identity preview. "or sign in with any email" secondary =
+  undirected request. IDP_DOMAIN templated into JS to build the identity.
+- dashboard.rs: LoginReq gains optional `expected`; login() refuses when the
+  cryptographically-verified identity != expected (case-insensitive), naming
+  both. NOT an authorization input — the session is always opened for the
+  verified grantor, so a forged `expected` can only make a login FAIL, never
+  redirect it. This is the design's mandatory "verify the returned
+  presentation's identity equals what it asked for" (provisionEmail steers,
+  does not bind).
+- Prompt generator already shipped in phase 2 (plain text, grantor named).
+- Verified provisionEmail is plumbed in the broker's include.js/dialog.js
+  (include.js:880, dialog.js:1655/1717).
+
+Then: lift allowlist after observing a real refresh cycle + expiry in prod.
+
+## Phase 3 reviewed clean 2026-07-28
+
+Focused adversarial review of the directed-login delta: main claim HOLDS —
+`expected` is not an authorization input (session always opened for the
+verified grantor; a forged `expected` can only make a login fail, never
+redirect it). No XSS in the new markup; templated IDP_DOMAIN safe inside the
+JS string. No blocking findings. Two INFO notes deferred (not applied, kept
+the reviewed diff for deploy):
+- the page-level `expected` var could go stale if a user abandons a directed
+  dialog then clicks "any email" (fail-open for the UX guard only, never
+  authz);
+- the mismatch error reflects the caller's own `expected` back to itself
+  unbounded (inert: textContent + JSON, self-directed).
+Both are candidate follow-ups if we tighten the dashboard UX.

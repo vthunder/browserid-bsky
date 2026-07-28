@@ -115,6 +115,18 @@ pub struct LoginReq {
     /// The access presentation `navigator.id` produced, audience = this
     /// origin.
     pub presentation: String,
+    /// The identity the page *asked* the dialog for, via a directed
+    /// `provisionEmail` request (`<handle>@<D>`). Absent on the undirected
+    /// "or use any email" path.
+    ///
+    /// `provisionEmail` steers the dialog; it does not bind what comes back
+    /// (design doc, *Sign-in*). This is not an authorization input — the
+    /// session is always opened for the *cryptographically verified*
+    /// identity — but when the two disagree the sign-in is refused rather
+    /// than silently completing as an identity the user did not type. So a
+    /// forged `expected` can only make a request *fail*, never redirect it.
+    #[serde(default)]
+    pub expected: Option<String>,
 }
 
 /// `POST /dashboard/login` — verify the presentation, open the session.
@@ -123,7 +135,8 @@ pub struct LoginReq {
 /// deployment's own IdP issues, so their verification never needs the hosted
 /// verifier. A presentation from any other issuer is refused with directions,
 /// not verified the long way — there is nothing here for a foreign identity
-/// to manage (phase 3 adds the "or use any email" mint path).
+/// to manage (an "any email" holder with no Bluesky handle mints one through
+/// the agent/guide flow, not here).
 pub async fn login(
     State(state): State<S>,
     headers: HeaderMap,
@@ -176,6 +189,24 @@ pub async fn login(
         ));
     }
     let identity = verified.grantor;
+
+    // The directed-login match check (design doc, *Sign-in*: "the dashboard
+    // must still verify the identity in the returned presentation equals the
+    // one it asked for"). The dialog is *supposed* to drive exactly the
+    // `provisionEmail` identity straight through, so a mismatch means either
+    // the user picked a different account at some prompt or the steer was not
+    // honoured — either way, opening a session as an identity they did not
+    // type is a surprise, so refuse and name both. Case-insensitive: both
+    // sides are identity strings, minted lowercase.
+    if let Some(expected) = req.expected.as_deref() {
+        if !expected.eq_ignore_ascii_case(&identity) {
+            return Err(IdpError::BadRequest(format!(
+                "you asked to sign in as {expected}, but that authorized {identity}. \
+                 Sign in again as {expected}, or use the \"any email\" option."
+            )));
+        }
+    }
+
     let handle = identity
         .strip_suffix(&format!("@{}", idp.domain))
         .ok_or_else(|| {
@@ -500,6 +531,44 @@ mod tests {
         assert!(resp.text().contains("agent"), "{}", resp.text());
     }
 
+    /// The directed-login match check. A presentation whose verified
+    /// identity equals the one the page asked for (`expected`) signs in; a
+    /// mismatch is refused and names both, and opens no session — even though
+    /// the returned identity is one the caller legitimately controls, it is
+    /// not the one they typed.
+    #[tokio::test]
+    async fn directed_login_requires_the_returned_identity_to_match() {
+        let state = bridge_with_relay("dan.bsky.social,eve.bsky.social");
+        let d = state.idp.as_ref().unwrap().domain.clone();
+        let dan = format!("dan.bsky.social@{d}");
+        let eve = format!("eve.bsky.social@{d}");
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:dan", Utc::now()).unwrap();
+        state.store.idp_upsert_pin("eve.bsky.social", "did:plc:eve", Utc::now()).unwrap();
+
+        // Asked for dan, dialog returned eve: refused, names both, no session.
+        let resp = server(&state)
+            .post("/dashboard/login")
+            .json(&serde_json::json!({
+                "presentation": presentation(&state, &eve, &eve),
+                "expected": dan,
+            }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST, "{}", resp.text());
+        assert!(resp.text().contains(&dan) && resp.text().contains(&eve), "{}", resp.text());
+        assert!(resp.headers().get(header::SET_COOKIE).is_none());
+
+        // Asked for dan, got dan (case-insensitively): signs in.
+        let resp = server(&state)
+            .post("/dashboard/login")
+            .json(&serde_json::json!({
+                "presentation": presentation(&state, &dan, &dan),
+                "expected": dan.to_uppercase(),
+            }))
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>()["handle"], "dan.bsky.social");
+    }
+
     /// Finding F1 (review). `grantee == grantor` is necessary but not
     /// sufficient: the IdP mints an "as-you" agent cert whose identity is the
     /// handle itself, so an agent can present a warrant with grantor ==
@@ -822,6 +891,13 @@ mod tests {
         assert!(page.contains(r#"src="https://broker.example/include.js""#));
         assert!(page.contains(r#"href="https://broker.example/account""#));
         assert!(page.contains("your-handle@bsky.browserid.test"));
+        // The directed-login machinery is present: the handle box, the JS
+        // domain constant that builds the identity, and the provisionEmail
+        // request.
+        assert!(page.contains("var IDP_DOMAIN = 'bsky.browserid.test';"));
+        assert!(page.contains(r#"id="handle""#));
+        assert!(page.contains("provisionEmail: expected"));
+        assert!(page.contains(r#"id="anyemail""#));
         assert!(!page.contains(BROKER_TOKEN) && !page.contains(IDP_DOMAIN_TOKEN));
         for sink in ["innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"] {
             assert_eq!(page.matches(sink).count(), 0, "{sink} is used in dashboard.html");

@@ -26,10 +26,21 @@
   <p>Sign in with your Bluesky handle to manage what your agents may do in
     your name: connect posting to your real account, copy the prompt your
     agent needs, and see — or stop — every delegation you have granted.</p>
-  <p><button id="signin">Sign in with browserid</button></p>
-  <p class="muted">Use your <strong>Bluesky handle identity</strong>
-    (<code>your-handle@__IDP_DOMAIN__</code>). If you have not claimed it
-    yet, the sign-in dialog will walk you through proving your handle.</p>
+  <form id="handleform">
+    <p>
+      <label for="handle">Your Bluesky handle</label><br>
+      <input id="handle" name="handle" type="text" inputmode="url"
+        autocapitalize="none" autocorrect="off" spellcheck="false"
+        placeholder="dan.bsky.social" size="28">
+      <button id="signin" type="submit">Sign in</button>
+    </p>
+  </form>
+  <p class="muted">We sign you in as
+    <code id="identitypreview">your-handle@__IDP_DOMAIN__</code>. If you have
+    not claimed the handle yet, the dialog walks you through proving it.</p>
+  <p class="muted"><a href="#" id="anyemail">or sign in with any email</a>
+    — for choosing from your accounts, or if you do not have a Bluesky handle
+    yet.</p>
 </div>
 
 <div id="signedin" hidden>
@@ -74,6 +85,17 @@
   // outside this page.
   var $ = function (id) { return document.getElementById(id); };
   var err = $('err');
+  // Operator config, substituted server-side; a Bluesky-handle zone is
+  // [a-z0-9.-], so this is safe inside a JS string.
+  var IDP_DOMAIN = '__IDP_DOMAIN__';
+  // The identity the current sign-in asked the dialog for, so onlogin can
+  // tell the server what to match the returned presentation against. Null on
+  // the undirected "any email" path.
+  var expected = null;
+
+  function normalizeHandle(raw) {
+    return (raw || '').trim().replace(/^@+/, '').toLowerCase();
+  }
 
   function jsonFetch(path, opts) {
     return fetch(path, Object.assign({ credentials: 'include' }, opts || {}))
@@ -175,7 +197,7 @@
       jsonFetch('/dashboard/login', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ presentation: presentation }),
+        body: JSON.stringify({ presentation: presentation, expected: expected }),
       }).then(function (res) {
         if (!res.ok) {
           err.textContent = res.body.error_description || res.body.error || 'sign-in failed';
@@ -187,7 +209,34 @@
     onlogout: function () {},
   });
 
-  $('signin').addEventListener('click', function () {
+  // Live preview of the identity the handle box will sign in as.
+  $('handle').addEventListener('input', function () {
+    var h = normalizeHandle($('handle').value);
+    $('identitypreview').textContent = (h || 'your-handle') + '@' + IDP_DOMAIN;
+  });
+
+  // Primary: a DIRECTED request. provisionEmail drives the dialog straight
+  // to this one identity (skipping the chooser); the server then verifies
+  // the returned presentation actually is that identity before opening a
+  // session.
+  $('handleform').addEventListener('submit', function (ev) {
+    ev.preventDefault();
+    err.textContent = '';
+    var h = normalizeHandle($('handle').value);
+    if (!h) { err.textContent = 'Type your Bluesky handle first.'; return; }
+    expected = h + '@' + IDP_DOMAIN;
+    navigator.id.request({
+      siteName: 'Bluesky delegation dashboard',
+      provisionEmail: expected,
+    });
+  });
+
+  // Secondary: an UNDIRECTED request — pick from the chooser, or use any
+  // email. No expected identity to match against.
+  $('anyemail').addEventListener('click', function (ev) {
+    ev.preventDefault();
+    err.textContent = '';
+    expected = null;
     navigator.id.request({ siteName: 'Bluesky delegation dashboard' });
   });
 
