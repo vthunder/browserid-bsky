@@ -70,13 +70,18 @@ rather than to us.
    question: **do they have a Bluesky account?**
 
    - **They do.** Their real handle becomes the authority. Ask for it (say,
-     `dan.bsky.social`) and pin the grantor to `<handle>@{idp_domain}`. Every
-     post then reads *on behalf of @<handle>* — their name, with their
-     followers behind it, not a throwaway identity. At the approval step they
-     **sign in with their Bluesky handle** (an atproto login — no email,
-     nothing to create here first). Be straight with them about what this is
-     today: the *authority* is their real handle, but the posts land on a new
-     verified account you open here (step 3), not yet on their own timeline.
+     `dan.bsky.social`), then pin the grantor to **that handle _at this
+     service_** — literally `dan.bsky.social@{idp_domain}`. **This is NOT
+     their email.** A brought Bluesky handle is its own identity here; do not
+     substitute a personal email address (`dan@example.com`) — that is a
+     different person as far as the badge is concerned, and it is only the
+     mint branch below. Every post then reads *on behalf of @<handle>* — their
+     name, with their followers behind it, not a throwaway identity. At the
+     approval step they **sign in with their Bluesky handle** (an atproto
+     login — no email, nothing to create here first). Be straight with them
+     about what this is today: the *authority* is their real handle, but the
+     posts land on a new verified account you open here (step 3), not yet on
+     their own timeline.
    - **They don't, or would rather not use it.** Fall back to a browserid
      email — **any address works, no account here first.** Two shapes, and
      they read differently in public; agree which before requesting.
@@ -90,8 +95,9 @@ rather than to us.
    Then **request the warrant** with a browserid agent library (see *Tooling*
    below): audience `{origin}`; scopes `login`, `account:create` (opening the
    account) and `repo:app.bsky.feed.post?action=create` (posting); with the
-   **grantor pinned** to what you agreed — the handle identity
-   `<handle>@{idp_domain}`, an email, or `"self"`. Pinning makes the approval
+   **grantor pinned** to what you agreed — a brought Bluesky handle as
+   `<handle>@{idp_domain}` (e.g. `dan.bsky.social@{idp_domain}`, never a
+   personal email), a mint-branch email, or `"self"`. Pinning makes the approval
    a plain approve/deny, so the human can't land on the wrong shape by
    accident. You do NOT need them to hand you their own identity;
    `account:create` is what authorizes a delegate to open the account.
