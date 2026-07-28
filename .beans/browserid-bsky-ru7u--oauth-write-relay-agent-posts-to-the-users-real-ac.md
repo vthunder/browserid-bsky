@@ -158,3 +158,28 @@ wallet-managed identities):
 
 To publish (needs npm OTP): @browserid-ng/bsky 0.2.0 (agent-cli),
 @browserid-ng/wallet 0.4.2 (browserid-ng/sdk/wallet).
+
+## 2026-07-28 round 2: F10 fixed — broker verified its own cross-issuer certs
+
+Round-2 transcript: shared-store CLI (0.2.0) fixed F5/F6/F7. New blocker F10 —
+`provision refused (400): issuer 'bsky.browserid.me' not authoritative`.
+
+Root cause (browserid-broker/src/verifier.rs verify_access_with_dns, the
+hosted /verify-access the bridge calls for mixed-issuer bundles): it resolved
+ONLY the access cert's issuer (grantee's) and handed AccessPresentation::verify
+a single-key resolver. But core's verify asks for the CONFIG cert's issuer too
+(the grantor's IdP), which for a cross-domain on-behalf-of warrant differs. So
+a @sandmill.org agent posting as a @bsky.browserid.me handle was rejected —
+the IdP didn't recognise its own correctly-signed cert. Blocked BOTH
+/browserid/provision and /browserid/token (so the relay post path too).
+
+Fix: resolve both issuers up front with the same conformance rule per
+identity's own domain; resolver returns the right key per issuer. Rogue-grantor
+config cert still rejected. 2 new regression tests (accept + reject), 10/10
+broker verifier tests pass. Deployed to browserid.me (broker, aa56b93).
+
+Note: danmills CONNECTED write access (relay), so the correct path is `post`
+directly (relay → real account), NOT `setup` (which mints a bridge account).
+The agent chose setup because the guide/CLI implies setup-then-post. Follow-up:
+route relay-connected grantors straight to post. Also outstanding: F11/F4
+error-vocabulary overlap (invalid_token/invalid_grant opaque 400/401s).
