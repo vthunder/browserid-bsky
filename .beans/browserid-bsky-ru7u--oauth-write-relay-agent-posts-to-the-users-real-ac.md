@@ -183,3 +183,22 @@ directly (relay → real account), NOT `setup` (which mints a bridge account).
 The agent chose setup because the guide/CLI implies setup-then-post. Follow-up:
 route relay-connected grantors straight to post. Also outstanding: F11/F4
 error-vocabulary overlap (invalid_token/invalid_grant opaque 400/401s).
+
+## 2026-07-28: guide — conditional setup + error disambiguation
+
+Fixed the instructions so an agent only mints when it actually needs to:
+- Provisioning is now CONDITIONAL. The flow does token-exchange + whoami FIRST
+  (naming /browserid/token, which fixes F4's undefined "bridge token"), then:
+  backend=relay → skip provision, post to the real account; backend=bridge →
+  open an account. `account:create` scope requested only on the mint branch.
+- Tooling reordered: `post` is the default (works for relay/held warrant);
+  `setup` is explicitly only for opening an account here. MCP path documented:
+  wallet authorize+get_assertion → CLI post (shared ~/.browserid identity);
+  the wallet has no post tool by design.
+- New "When a call fails" table (F11): the confusable 401 invalid_token cases
+  (missing bridge token vs warrant revoked) and 409 write_session_expired /
+  400 invalid_grant, each with meaning + opposite action; "branch on
+  error_description, not status."
+- Revocation re-auth line no longer says "run setup"; it's "request a fresh
+  warrant" (no account/connection redo).
+161 lib + 7 integration tests. Deploying (bridge).

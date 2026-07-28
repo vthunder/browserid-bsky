@@ -93,8 +93,11 @@ rather than to us.
      as-yourself is the returning-human path.
 
    Then **request the warrant** with a browserid agent library (see *Tooling*
-   below): audience `{origin}`; scopes `login`, `account:create` (opening the
-   account) and `repo:app.bsky.feed.post?action=create` (posting); with the
+   below): audience `{origin}`; scopes `login` and
+   `repo:app.bsky.feed.post?action=create` (posting) — **plus `account:create`
+   only if you may open an account here.** A human who connected write access
+   to their real Bluesky account (step 2) never needs it, and asking for a
+   permission you will not use is worse consent, not better. With the
    **grantor pinned** to what you agreed — a brought Bluesky handle as
    `<handle>@{idp_domain}` (e.g. `dan.bsky.social@{idp_domain}`, never a
    personal email), a mint-branch email, or `"self"`. Pinning makes the approval
@@ -117,27 +120,44 @@ rather than to us.
    watching). The library then hands you a credential and the signed
    warrant.
 
-2. **Agree on a handle for the new account — do not just pick one.** This is
-   the handle of the account you open *here* (`<label>.{handle_domain}`) — a
-   separate thing from any Bluesky handle they brought as the authority. It is
-   public, permanent-ish, and theirs, not yours. Suggest two or three that fit
-   what the account is for (if they brought a Bluesky handle, a label that
-   echoes it is a natural default), say what each looks like in full, and let
-   them choose or write their own. Then register the one they picked.
+2. **Turn your bundle into a bridge token, and check where posts land — before
+   you create anything.** Exchange your four-part bundle for a **bridge
+   token**: `POST {origin}/browserid/token` (an RFC 7521 grant; the library
+   does this for you) returns a token you send as `Authorization: Bearer
+   <token>` on the calls below. A bridge token is what `whoami` and `post`
+   authenticate with — the raw bundle is not. Then
+   `GET {origin}/browserid/whoami` with it answers
+   `{{"did": …, "backend": "bridge" | "relay"}}`:
 
-3. **Create the Bluesky account.** `POST {origin}/browserid/provision`
-   with `{{"presentation": "<your four-part bundle>", "handle": "<label>"}}`.
-   The account belongs to the warrant's **grantor** — the identity actions are
-   attributed to. The response includes the DID and full handle. A password
-   comes back only for a first-party login; if you opened the account as a
-   delegate it is withheld, because a password bypasses your warrant's scopes
-   entirely. Tell the human that, rather than implying they have lost access —
-   the PDS reset flow is theirs to use.
+   - **`"relay"`** — the human connected their **own** Bluesky account on the
+     dashboard. **Skip provisioning entirely** — you create nothing here — and
+     go to step 4. The post lands on their real timeline, in front of their
+     real followers; say so before you post.
+   - **`"bridge"`** — no connected account, so you will open one (step 3).
 
-4. **Post.** `POST {origin}/browserid/post` with your bundle, the post text,
-   and an **attestation**: a signature, made with your access key, over the
-   exact content you are posting. This is the step that earns the badge — a
-   post written through the plain proxy carries provenance but no
+   Either way, the `did` in the answer is the repo your attestation must be
+   signed over. For the relay that is the human's real DID, which you cannot
+   learn any other way — so always read it from `whoami`, never guess it.
+
+3. **(Only when `backend` was `bridge`.) Open the account.** First **agree the
+   handle — do not just pick one.** This is the handle of the account you open
+   *here* (`<label>.{handle_domain}`) — a separate thing from any Bluesky
+   handle they brought as the authority. It is public, permanent-ish, and
+   theirs, not yours. Suggest two or three that fit what the account is for,
+   say what each looks like in full, and let them choose or write their own.
+   Then `POST {origin}/browserid/provision` with
+   `{{"presentation": "<your four-part bundle>", "handle": "<label>"}}`. The
+   account belongs to the warrant's **grantor**. The response includes the DID
+   and full handle. A password comes back only for a first-party login; if you
+   opened the account as a delegate it is withheld, because a password bypasses
+   your warrant's scopes entirely. Tell the human that rather than implying
+   they have lost access — the PDS reset flow is theirs to use.
+
+4. **Post.** `POST {origin}/browserid/post` with your **bridge token**
+   (`Authorization: Bearer <token>`), the post record, and an **attestation**:
+   a signature, made with your access key, over the exact content you are
+   posting, targeting the `did` from step 2. This is the step that earns the
+   badge — a post written through the plain proxy carries provenance but no
    attestation, and will not verify. The library builds the attestation for
    you.
 
@@ -173,24 +193,26 @@ rather than to us.
    stands in the small: ask you to delete that post or edit the profile and
    you cannot, because the warrant only ever said create-post.)
 
-   Revocation is final for that warrant. If they want you posting again, run
-   the setup flow from the top and have them approve a fresh one.
+   Revocation is final for that warrant. If they want you posting again,
+   request a fresh warrant (step 1) and have them approve it — no account or
+   connection needs redoing, only the warrant.
 
-**Which repo does your token write to?** `GET {origin}/browserid/whoami` with
-your bridge token answers `{{"did": …, "backend": "bridge" | "relay"}}`. The
-`did` is the one your attestation must be signed over. `"bridge"` means the
-account you provisioned here; `"relay"` means the human's **own** Bluesky
-account, because they connected write access — the post will appear on their
-real timeline, in front of their real followers. Say so before you post.
+### When a call fails, read the description — not just the status
 
-**If a post fails with `409 write_session_expired`, stop.** That is not a
-revoked warrant and not something to retry: the human connected this bridge
-to their real Bluesky account once, and that connection has since expired or
-been withdrawn at their PDS. The warrant is still perfectly good. The
-response carries a `reconnect_url` — hand the human that URL, say the
-connection to their Bluesky account needs renewing, and wait for them to say
-they have done it. Same shape as waiting for warrant approval: give them a
-link, then stop talking.
+Several failures share an HTTP status and an OAuth `error` code but mean
+different things and need **opposite** responses. Always branch on the
+`error_description`, and never blindly retry:
+
+| response | what it means | what to do |
+|---|---|---|
+| `401 invalid_token` — *missing bridge token* / *unknown or expired token* | you called `whoami`/`post` without a live bridge token (you skipped `POST /browserid/token`, or the token aged out — they last about an hour) | exchange your bundle at `/browserid/token` again, then retry the call |
+| `401 invalid_token` — *warrant revoked* | the human revoked the warrant | **stop.** Not a bug, not a retry, not a re-request. Show them the line verbatim and report it — this is the kill switch working. |
+| `409 write_session_expired` (body carries `reconnect_url`) | the human's connection to their **real** account lapsed or was withdrawn at their PDS; the warrant is still perfectly good | hand the human the `reconnect_url`, say the connection needs renewing, wait for them to confirm, then retry the same post. Same shape as waiting for approval: give a link, then stop talking. |
+| `400 invalid_grant` — *assertion rejected: …* | the bundle itself did not verify (bad, expired, or wrong-audience) | stop and report the reason; do not loop re-requesting |
+
+The first and second are the trap: same `401 invalid_token`, but one means
+"do the exchange step you skipped" and the other means "you have been shut off
+— stop." The description is the only thing that tells them apart.
 
 Note that posts carry **no in-post verify link**. The labeler is the trust
 surface; a link inside post content is written by the author, so it can point
@@ -203,29 +225,40 @@ pinned to their repo; without one, traffic passes through untouched.
 ### Tooling
 
 **Node, no compiler — start here.** `@browserid-ng/bsky` runs the whole
-flow, including the attestation in step 4:
+flow, including the attestation in step 4. **`post` is the command you want**
+whenever a warrant for `{origin}` is already held — for a connected real
+account (relay), it lands the post there directly, no account creation:
 
 ```sh
-npx -y @browserid-ng/bsky setup <label>                              # prints the approval link
-npx -y @browserid-ng/bsky setup <label> --for dan.bsky.social@{idp_domain}  # on behalf of a Bluesky handle
-npx -y @browserid-ng/bsky setup <label> --for self                   # as the agent itself
-npx -y @browserid-ng/bsky post "hello"                               # attested post
+npx -y @browserid-ng/bsky post "hello"                               # attested post — relay OR bridge
+npx -y @browserid-ng/bsky whoami                                     # identity + where a post would land
 ```
 
-`<label>` is the new account's handle; `--for` pins the grantor — a Bluesky
-handle identity (`<handle>@{idp_domain}`), a plain email, or `self`. Leave it
-off and the human picks the shape on the approval page.
+**`setup` is only for opening an account here** — the `backend: "bridge"`
+branch, when the human did NOT connect a real account. Do not run it on the
+relay path; it would mint an account nobody asked for.
+
+```sh
+npx -y @browserid-ng/bsky setup <label>                              # open <label>.{handle_domain}
+npx -y @browserid-ng/bsky setup <label> --for dan.bsky.social@{idp_domain}  # on behalf of a Bluesky handle
+npx -y @browserid-ng/bsky setup <label> --for self                   # as the agent itself
+```
 
 `setup` prints the approval URL, user code and key fingerprint FIRST, then
 waits — polling until the human approves (up to 15 minutes). Relay the three
 values to your human immediately, keep the process alive (background it and
 watch its output if your shell enforces command timeouts), and treat "account
-created" in its output as your signal to continue. It stores the credential
-under `~/.browserid-bsky` and provisions the account. For an agent that prefers MCP
-tools over a shell, `@browserid-ng/wallet` exposes the identity half
-(`provision`, `authorize`, `get_assertion`) over MCP.
+created" in its output as your signal to continue.
 
-Both are built on `@browserid-ng/agent`, which implements this protocol in
+**MCP tools?** `@browserid-ng/wallet` exposes the identity half (`authorize`,
+`get_assertion`, …) over MCP. It and the CLI **share one identity store**
+(`~/.browserid`), so the clean path on an MCP host is: `authorize` for
+`{origin}` (with the grantor pinned) and approve via the wallet, then
+`npx -y @browserid-ng/bsky post "…"` — the CLI reuses that same approved
+warrant and key, no second approval, no second identity. The wallet has no
+post-signing tool of its own; posting is the CLI's job.
+
+All are built on `@browserid-ng/agent`, which implements this protocol in
 JavaScript.
 
 **Rust.** The reference implementation is the `browserid-agent` crate, driven
@@ -337,11 +370,46 @@ mod tests {
         for needle in [
             "/browserid/provision",
             "/browserid/post",
+            "/browserid/token",
             "repo:app.bsky.feed.post?action=create",
             "<label>.at.browserid.me",
             "https://bsky.browserid.me",
         ] {
             assert!(md.contains(needle), "guide must mention {needle}");
+        }
+    }
+
+    /// A relay-connected grantor must NOT be sent to provision/setup: the
+    /// guide checks `whoami` first and skips account creation when the human
+    /// connected their real account. Regression for the round-2 friction
+    /// where the agent minted an account nobody asked for.
+    #[test]
+    fn guide_makes_provisioning_conditional_on_the_backend() {
+        let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
+        for needle in [
+            "check where posts land",         // the whoami-first framing
+            "Skip provisioning entirely",     // the relay branch
+            "Only when `backend` was `bridge`", // provision is conditional
+            "only for opening an account here", // setup is not the default
+            "only if you may open an account here", // the scope is conditional too
+        ] {
+            assert!(md.contains(needle), "guide must say: {needle}");
+        }
+    }
+
+    /// The confusable errors (F11): the guide must teach that a shared
+    /// `401 invalid_token` can mean two opposite things, told apart by the
+    /// description.
+    #[test]
+    fn guide_disambiguates_the_overlapping_errors() {
+        let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
+        for needle in [
+            "missing bridge token",
+            "warrant revoked",
+            "write_session_expired",
+            "branch on the\n`error_description`",
+        ] {
+            assert!(md.contains(needle), "guide must say: {needle}");
         }
     }
 
