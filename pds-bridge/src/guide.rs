@@ -12,8 +12,7 @@
 /// line so it copies cleanly out of either.
 pub fn agent_prompt(origin: &str) -> String {
     format!(
-        "Read {origin}/ and follow it (don't just summarize) so you can post to \
-Bluesky for me, verifiably."
+        "Read {origin}/ and follow it so you can post to Bluesky for me."
     )
 }
 
@@ -341,8 +340,8 @@ mod tests {
             assert!(md.contains(needle), "guide must say: {needle}");
         }
         assert!(
-            agent_prompt("https://bsky.browserid.me").contains("don't just summarize"),
-            "the prompt itself must demand action"
+            agent_prompt("https://bsky.browserid.me").contains("follow it"),
+            "the prompt itself must demand action (\"follow it\", not just \"read it\")"
         );
     }
 
