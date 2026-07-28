@@ -107,11 +107,16 @@ pub enum RelayError {
 
 /// Who may connect a write session (design doc, *Decision 6*).
 ///
-/// v1 is opt-in testers only, until at least one refresh cycle and one
-/// session expiry have been observed in production. **Empty means nobody** —
-/// never "everybody". An allowlist that silently opens up when its
-/// configuration goes missing is not an allowlist, and this is the one
-/// control that bounds how many real accounts a bridge compromise reaches.
+/// v1 was opt-in testers only. **Empty still means nobody** — never
+/// "everybody"; an allowlist that silently opens up when its configuration
+/// goes missing is not an allowlist. Opening the relay to everyone is a
+/// *deliberate, explicit* act: a single `*` entry
+/// (`WRITE_RELAY_ALLOWLIST=*`). That is the one value that means "any
+/// connected account", and it has to be typed on purpose — the default of a
+/// missing or empty variable is still closed. With `*` set, the bridge will
+/// custody live write credentials for anyone who connects, which is the
+/// blast radius *Decision 6* is about; the wildcard exists so that choice is
+/// made in one obvious place rather than by pre-listing the world.
 #[derive(Debug, Clone, Default)]
 pub struct Allowlist(Vec<String>);
 
@@ -142,9 +147,18 @@ impl Allowlist {
         self.0.is_empty()
     }
 
-    /// May this identity connect? Either its handle or its DID must be
-    /// listed. An empty list permits nothing.
+    /// Is this an open (`*`) allowlist — anyone may connect?
+    pub fn is_open(&self) -> bool {
+        self.0.iter().any(|e| e == "*")
+    }
+
+    /// May this identity connect? A `*` entry permits anyone; otherwise the
+    /// identity's handle or its DID must be listed. An empty list permits
+    /// nothing.
     pub fn permits(&self, handle: &str, did: &str) -> bool {
+        if self.is_open() {
+            return true;
+        }
         let (h, d) = (handle.to_ascii_lowercase(), did.to_ascii_lowercase());
         self.0.iter().any(|e| *e == h || *e == d)
     }
@@ -204,11 +218,19 @@ impl RelayState {
             return Ok(None);
         }
         let secrets = SecretBox::from_env()?;
-        tracing::info!(
-            allowed = allowlist.entries().len(),
-            "write relay ENABLED — the bridge will hold live posting credentials for \
-             connected accounts"
-        );
+        if allowlist.is_open() {
+            tracing::warn!(
+                "write relay ENABLED and OPEN (WRITE_RELAY_ALLOWLIST=*) — ANY Bluesky \
+                 account may connect, and the bridge will custody live posting credentials \
+                 for every one that does"
+            );
+        } else {
+            tracing::info!(
+                allowed = allowlist.entries().len(),
+                "write relay ENABLED — the bridge will hold live posting credentials for \
+                 connected accounts"
+            );
+        }
         Ok(Some(Self {
             client: WriteClient { origin: origin.trim_end_matches('/').to_string() },
             secrets,
@@ -606,6 +628,23 @@ mod tests {
         // takes rather than mutating the environment under other tests.
         assert!(Allowlist::parse("").is_empty());
         assert!(!Allowlist::parse("dan.bsky.social").is_empty());
+    }
+
+    /// A `*` entry opens the relay to everyone — but only when typed on
+    /// purpose. Empty is still closed; `*` is the one value that means "any".
+    #[test]
+    fn a_wildcard_entry_opens_the_relay_to_anyone() {
+        let open = Allowlist::parse("*");
+        assert!(open.is_open() && !open.is_empty());
+        assert!(open.permits("anyone.bsky.social", "did:plc:whoever"));
+        assert!(open.permits("someone.else", "did:plc:x"));
+        // A `*` mixed in with names still opens it (the explicit choice wins).
+        assert!(Allowlist::parse("dan.bsky.social, *").permits("bob.bsky.social", "did:plc:y"));
+        // No wildcard, no open.
+        let closed = Allowlist::parse("dan.bsky.social");
+        assert!(!closed.is_open());
+        assert!(!closed.permits("bob.bsky.social", "did:plc:y"));
+        assert!(!Allowlist::parse("").is_open());
     }
 
     #[test]

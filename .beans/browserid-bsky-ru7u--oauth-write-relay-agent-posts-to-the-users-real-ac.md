@@ -118,3 +118,13 @@ the reviewed diff for deploy):
 - the mismatch error reflects the caller's own `expected` back to itself
   unbounded (inert: textContent + JSON, self-directed).
 Both are candidate follow-ups if we tighten the dashboard UX.
+
+## 2026-07-28: open the relay for live testing (WRITE_RELAY_ALLOWLIST=*)
+
+Decision (user): no external audience knows about this yet, so allowlisting
+one tester vs opening to all is the same exposure today. Added an explicit
+`*` wildcard to Allowlist so "open to everyone" is a single deliberate value
+(empty still = nobody; missing var still = closed). Boot logs a WARN when
+open. Enabled in prod: WRITE_RELAY_ALLOWLIST=* + WRITE_SESSION_KEY set on the
+bsky-bridge dokku app. Still un-observed in prod: the first real
+connect/post/refresh/expiry cycle — that is the live test this unblocks.
