@@ -73,7 +73,7 @@ fn session_cookie(headers: &HeaderMap) -> Option<String> {
     cookie(headers, SESSION_COOKIE)
 }
 
-fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(header::COOKIE)?
         .to_str()

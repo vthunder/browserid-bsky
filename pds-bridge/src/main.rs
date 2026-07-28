@@ -84,6 +84,23 @@ async fn main() {
         );
     }
 
+    // The write relay (bean ru7u). Requires the IdP — the pinned handle↔DID
+    // binding is what a relayed post is attributed to — and stays off unless
+    // WRITE_RELAY_ALLOWLIST names someone.
+    // A misconfigured relay is a boot failure, not a degraded mode: the one
+    // thing worse than no relay is a relay whose AEAD key was quietly
+    // invented and stored beside the database it protects.
+    let relay = match &idp {
+        Some(_) => match pds_bridge::relay::RelayState::from_env(&origin) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("write relay misconfigured: {e}");
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     let state = BridgeState {
         origin: origin.clone(),
         handle_domain,
@@ -99,6 +116,7 @@ async fn main() {
         label_tx: pds_bridge::label_channel(),
         idp,
         idp_verifier,
+        relay,
     };
     let state = Arc::new(state);
     // Posts made before the labeler existed still need to reach the

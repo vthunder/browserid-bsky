@@ -1,0 +1,117 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Connect write access — browserid</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
+  .box { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin: 1.5rem 0; }
+  .bad { color: #a00; }
+  .ok { color: #060; }
+  button { font: inherit; padding: .6rem 1.2rem; }
+  button[disabled] { opacity: .5; }
+  ul { padding-left: 1.2rem; }
+  code { background: #f2f2f2; padding: 0 .2rem; }
+</style>
+
+<h1>Connect write access to your Bluesky account</h1>
+
+<p id="who">Checking your sign-in…</p>
+
+<div class="box">
+  <p><strong>Read this before you click.</strong> This is a second, separate
+    authorization — signing in proved you own the handle; this grants posting
+    access to the account behind it.</p>
+  <ul>
+    <li><strong>What the bridge will be able to do</strong>, at the protocol
+      level: Bluesky's OAuth has no "only create posts" grant yet, so the
+      permission you approve (<code>transition:generic</code>) means write
+      access to your repo generally.</li>
+    <li><strong>What it will actually do:</strong> create
+      <code>app.bsky.feed.post</code> records, plus two
+      <code>me.browserid.*</code> provenance records per post — and only when
+      a live, unrevoked warrant and a valid agent signature say so. No
+      deletes, edits, likes, follows, or profile changes.</li>
+    <li><strong>Those provenance records are permanent, public, and visible
+      on the firehose.</strong> They live in your repo. They are yours — you
+      can delete them; the bridge will not.</li>
+    <li><strong>How to stop it:</strong> revoke the warrant. That is checked
+      before any post is written, so revoking stops posting immediately. You
+      can also disconnect this app at your own PDS, which is your only
+      recourse if the bridge itself is ever compromised.</li>
+  </ul>
+</div>
+
+<p><button id="go" disabled>Connect write access</button></p>
+<p id="msg"></p>
+
+<script>
+(function () {
+  var who = document.getElementById('who');
+  var msg = document.getElementById('msg');
+  var go = document.getElementById('go');
+
+  // Every string below reaches the DOM as textContent. Nothing here is ever
+  // assigned as markup: the query string and the server's error text are
+  // both attacker-reachable.
+  var params = new URLSearchParams(location.search);
+  if (params.get('connected')) {
+    msg.className = 'ok';
+    msg.textContent = 'Connected. Posts made under a warrant for this identity will now go to '
+      + params.get('connected') + '.';
+  } else if (params.get('error')) {
+    msg.className = 'bad';
+    msg.textContent = params.get('error');
+  }
+
+  fetch('/idp/connect/status', { credentials: 'include' })
+    .then(function (r) { return r.json(); })
+    .then(function (s) {
+      if (!s.authenticated) {
+        who.textContent = 'You are not signed in. Sign in with your Bluesky handle first.';
+        return;
+      }
+      who.textContent = 'Signed in as ' + s.handle + ' (' + s.did + ').';
+      if (!s.allowed) {
+        who.textContent += ' This identity is not on the write-relay allowlist.';
+        return;
+      }
+      if (s.connected) {
+        who.textContent += ' A write session is already connected (' + s.state
+          + ', access token expires ' + s.access_expires_at + '). Connecting again replaces it.';
+      }
+      go.disabled = false;
+    })
+    .catch(function () { who.textContent = 'Could not read your sign-in status.'; });
+
+  go.addEventListener('click', function () {
+    go.disabled = true;
+    msg.className = '';
+    msg.textContent = 'Starting…';
+    // Same-origin, so the browser sends Sec-Fetch-Site: same-origin, which
+    // is what the server checks. The explicit JSON content-type is belt and
+    // braces for a browser too old to send fetch metadata.
+    fetch('/idp/connect/start', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'content-type': 'application/json' },
+    })
+      .then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        if (!res.ok) {
+          msg.className = 'bad';
+          msg.textContent = res.body.error || 'could not start';
+          go.disabled = false;
+          return;
+        }
+        // Top-level navigation, never an iframe.
+        location.href = res.body.authorize_url;
+      })
+      .catch(function (e) {
+        msg.className = 'bad';
+        msg.textContent = String(e);
+        go.disabled = false;
+      });
+  });
+})();
+</script>

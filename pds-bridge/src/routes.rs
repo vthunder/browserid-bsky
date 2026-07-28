@@ -289,17 +289,35 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
         Err(e) => return e,
     };
 
-    // The grantor names the account; only a provisioned grantor can delegate.
-    let account = match state.store.account_by_email(&identity.grantor) {
-        Ok(Some(a)) => a,
-        Ok(None) => {
-            return err(
-                StatusCode::FORBIDDEN,
-                "invalid_grant",
-                format!("{} has no account here — provision first", identity.grantor),
-            )
-        }
-        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+    // The grantor names the repo this token acts on. Two possibilities, and
+    // the token carries the answer so the agent signs its attestation over
+    // the right DID (`AttestationClaims.did` is in the SIGNED bytes, so the
+    // agent has to know the real DID at signing time):
+    //
+    //   * the grantor connected write access — the repo is their OWN
+    //     account, at the DID pinned for their handle;
+    //   * otherwise the repo is the bridge-provisioned account, unchanged.
+    //
+    // The relay wins when both exist: connecting write access is a
+    // deliberate, later act than provisioning, and it is what the human
+    // asked for.
+    let did = match relay_did_for_grantor(&state, &identity.grantor) {
+        Some(did) => did,
+        None => match state.store.account_by_email(&identity.grantor) {
+            Ok(Some(a)) => a.did,
+            Ok(None) => {
+                return err(
+                    StatusCode::FORBIDDEN,
+                    "invalid_grant",
+                    format!(
+                        "{} has no account here — provision one, or connect write access to \
+                         an existing Bluesky handle at {}/idp/connect",
+                        identity.grantor, state.origin
+                    ),
+                )
+            }
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
+        },
     };
 
     // Only scopes that parse under the granular grammar grant anything.
@@ -320,7 +338,7 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
     let warrant_ref = crate::store::warrant_hash(&identity.warrant_jws);
     if let Err(e) = state.store.upsert_warrant(&crate::store::StoredWarrant {
         hash: warrant_ref.clone(),
-        did: account.did.clone(),
+        did: did.clone(),
         grantor: identity.grantor.clone(),
         grantee: identity.grantee.clone(),
         warrant_jws: identity.warrant_jws.clone(),
@@ -331,7 +349,7 @@ pub async fn token(State(state): State<S>, Form(req): Form<TokenRequest>) -> Res
     }
 
     let token = BridgeToken {
-        did: account.did,
+        did,
         grantor: identity.grantor,
         grantee: identity.grantee,
         holder: identity.holder,
@@ -905,6 +923,159 @@ async fn create_via_session(
     }
 }
 
+// ---------------------------------------------------------------------------
+// GET /browserid/whoami — which repo does this token write to?
+// ---------------------------------------------------------------------------
+
+/// The agent has to know the target DID **before** it signs: `did` is inside
+/// `AttestationClaims`, i.e. inside the signed bytes (`attestation.rs`).
+///
+/// On the mint branch it learns the DID from `/browserid/provision`. On the
+/// relay branch no account is provisioned — the repo is one the user already
+/// had — so there has to be somewhere to ask. This is that somewhere. It
+/// requires a live bridge token and reveals only what that token already
+/// authorizes, plus which backend it will use.
+pub async fn whoami(State(state): State<S>, headers: HeaderMap) -> Response {
+    let token = match authorize_token(&state, &headers).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let relayed = relay_did_for_grantor(&state, &token.grantor).as_deref() == Some(&token.did);
+    Json(serde_json::json!({
+        // The repo an attested post will land in — sign your attestation
+        // over THIS did.
+        "did": token.did,
+        "grantor": token.grantor,
+        "grantee": token.grantee,
+        "scopes": token.scopes,
+        // "relay" = the grantor's own Bluesky account; "bridge" = an account
+        // provisioned here.
+        "backend": if relayed { "relay" } else { "bridge" },
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Which repo does an attested post land in?
+// ---------------------------------------------------------------------------
+
+/// The two write backends, chosen **per grantor**.
+///
+/// They are picked apart here and nowhere else: every check in
+/// [`attributed_post`] runs identically for both, and only the write at the
+/// end differs. The bridge must keep both alive side by side (design doc,
+/// *Non-goals*) — users without a Bluesky handle, or with one they will not
+/// grant write access to, keep the mint-a-handle path unchanged.
+enum PostBackend<'a> {
+    /// A bridge-provisioned `<label>.at.browserid.me` account on our own
+    /// PDS. Zero custody, disposable repo — today's path, untouched.
+    Bridge,
+    /// The user's **real** account, through a stored OAuth session. The
+    /// session is the only thing in the process that can name a repo, and it
+    /// names exactly one.
+    Relay(crate::relay::RelaySession<'a>),
+}
+
+/// The DID a warrant's grantor acts on when they have connected write
+/// access: the DID pinned for their handle, never anything from a request.
+///
+/// `None` for every identity that is not one of ours, is not pinned, is
+/// suspended, is **no longer allowlisted**, or has not connected — all of
+/// which fall through to the bridge-account backend.
+///
+/// The allowlist is re-read here, on every post, rather than only at connect
+/// time. That makes `WRITE_RELAY_ALLOWLIST` a **live kill switch**: taking a
+/// name out of it stops that account relaying at the next post, without
+/// anyone having to remember to delete a row. Checking it only at connect
+/// would have made the list a one-time gate on *acquiring* a session, which
+/// is not what "allowlisted in v1" (*Decision 6*) is for — the point of the
+/// list is to bound how many real accounts are exposed at any moment, and a
+/// bound you cannot tighten is not a bound.
+fn relay_did_for_grantor(state: &BridgeState, grantor: &str) -> Option<String> {
+    let idp = state.idp.as_ref()?;
+    let relay = state.relay.as_ref()?;
+    let (local, domain) = grantor.rsplit_once('@')?;
+    if !domain.eq_ignore_ascii_case(&idp.domain) {
+        return None;
+    }
+    // `<handle>+tag@D` agent sub-identities resolve to the same handle; a
+    // warrant's grantor is the root identity, but strip a tag defensively so
+    // the lookup can never miss and silently fall back to the bridge.
+    let handle = local.split('+').next()?.to_ascii_lowercase();
+    let pin = state.store.idp_pin(&handle).ok().flatten()?;
+    if pin.suspended {
+        return None;
+    }
+    if !relay.allowlist.permits(&handle, &pin.did) {
+        tracing::info!(
+            %handle,
+            "grantor has a stored write session but is no longer allowlisted — not relaying"
+        );
+        return None;
+    }
+    relay.has_session(&state.store, &pin.did).then_some(pin.did)
+}
+
+/// `write_session_expired` — a dedicated error, not a generic 502.
+///
+/// The warrant is perfectly valid; only the OAuth session is gone.
+/// Conflating the two sends agents down the wrong path (retrying, or telling
+/// the human their delegation failed), so the response says which one broke
+/// and carries the URL that fixes it.
+fn write_session_expired(state: &S, detail: String) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "write_session_expired",
+            "error_description": detail,
+            "reconnect_url": format!("{}/idp/connect", state.origin),
+            "hint": "The warrant is still valid — only the connection to the Bluesky account \
+                     died. Stop and give the human the reconnect URL; do not retry.",
+        })),
+    )
+        .into_response()
+}
+
+/// Pick the backend for this token.
+///
+/// The relay is chosen when — and only when — the grantor's pinned DID has a
+/// stored write session *and* that DID is the one the token was issued for.
+/// A grantor who has connected but whose session has died gets the dedicated
+/// `write_session_expired` error rather than a silent fallback to the bridge
+/// account: posting somewhere other than where the human expects is worse
+/// than failing.
+async fn choose_backend<'a>(
+    state: &'a S,
+    token: &crate::store::BridgeToken,
+) -> Result<PostBackend<'a>, Response> {
+    let Some(relay_did) = relay_did_for_grantor(state, &token.grantor) else {
+        return Ok(PostBackend::Bridge);
+    };
+    // The token was issued against a DID; the pin says which DID this
+    // grantor is now. A token that outlived a reassignment must not write
+    // into either repo.
+    if relay_did != token.did {
+        return Err(err(
+            StatusCode::FORBIDDEN,
+            "invalid_token",
+            "the grantor's account changed since this token was issued — exchange a new one",
+        ));
+    }
+    let (relay, idp) = match (state.relay.as_ref(), state.idp.as_ref()) {
+        (Some(r), Some(i)) => (r, i),
+        _ => return Ok(PostBackend::Bridge),
+    };
+    match relay.open(&state.store, idp, &relay_did).await {
+        Ok(session) => Ok(PostBackend::Relay(session)),
+        // Raced with a disconnect between the existence probe and the load.
+        Err(crate::relay::RelayError::NoSession(_)) => Ok(PostBackend::Bridge),
+        Err(e @ crate::relay::RelayError::SessionExpired(_)) => {
+            Err(write_session_expired(state, e.to_string()))
+        }
+        Err(e) => Err(err(StatusCode::BAD_GATEWAY, "server_error", e.to_string())),
+    }
+}
+
 pub async fn attributed_post(
     State(state): State<S>,
     headers: HeaderMap,
@@ -962,31 +1133,215 @@ pub async fn attributed_post(
         return err(StatusCode::FORBIDDEN, "insufficient_scope", "warrant does not permit creating posts");
     }
 
-    // 5. Replay guard: claim the nonce before writing anything.
+    // 5. Which repo does this land in? Resolved BEFORE the nonce is
+    //    reserved, so a grantor whose write session has died gets an
+    //    actionable error without burning their single-use nonce.
+    let backend = match choose_backend(&state, &token).await {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+
+    // 6. Replay guard: claim the nonce before writing anything.
     match state.store.reserve_nonce(&claims.nonce, &token.did) {
         Ok(true) => {}
         Ok(false) => return err(StatusCode::CONFLICT, "invalid_grant", "attestation nonce already used (replay)"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e.to_string()),
     }
 
-    // 6. Create the post, then wire up nonce + signed provenance.
-    let (created, account) = match create_via_session(&state, &token.did, "app.bsky.feed.post", &req.record).await {
-        Ok(x) => x,
-        Err(e) => return e,
-    };
-    let post_uri = created["uri"].as_str().unwrap_or_default().to_string();
-    let rkey = post_uri.rsplit('/').next().unwrap_or_default();
-    let _ = state.store.set_nonce_rkey(&claims.nonce, rkey);
-    let _ = state.store.audit(&token, "com.atproto.repo.createRecord", "ok-attested");
-
     let attestation_json = serde_json::json!({
         "claims": claims,
         "sig": att.sig,
         "accessCert": req.access_cert,
     });
-    write_provenance(&state, &token, &account, &post_uri, created["cid"].as_str(), &claims.nonce, Some(attestation_json)).await;
 
-    (StatusCode::OK, Json(created)).into_response()
+    // 7. Create the post, then wire up nonce + signed provenance.
+    match backend {
+        PostBackend::Bridge => {
+            let (created, account) =
+                match create_via_session(&state, &token.did, "app.bsky.feed.post", &req.record).await
+                {
+                    Ok(x) => x,
+                    Err(e) => return e,
+                };
+            let post_uri = created["uri"].as_str().unwrap_or_default().to_string();
+            let rkey = post_uri.rsplit('/').next().unwrap_or_default();
+            let _ = state.store.set_nonce_rkey(&claims.nonce, rkey);
+            let _ = state.store.audit(&token, "com.atproto.repo.createRecord", "ok-attested");
+
+            // On a throwaway bridge account an unbadged post is an
+            // acceptable degradation, so this logs and returns 200.
+            write_provenance(
+                &state,
+                &token,
+                &account,
+                &post_uri,
+                created["cid"].as_str(),
+                &claims.nonce,
+                Some(attestation_json),
+            )
+            .await;
+            (StatusCode::OK, Json(created)).into_response()
+        }
+        PostBackend::Relay(session) => {
+            relay_post(&state, &token, &session, &req.record, &claims.nonce, attestation_json).await
+        }
+    }
+}
+
+/// The relay backend: the same three records, written into the user's own
+/// repo through their own OAuth session.
+///
+/// One deliberate divergence from the bridge path, and it is a requirement
+/// rather than a preference (design doc, *Decision 3*): **provenance fails
+/// loudly**. On a disposable account a failed provenance write leaves an
+/// unbadged post nobody sees. On a real timeline it leaves a post the
+/// human's followers can already read, with no provenance and no badge, and
+/// nobody told them. So the response says the post landed and is unattested,
+/// and it is not a 200.
+async fn relay_post(
+    state: &S,
+    token: &crate::store::BridgeToken,
+    session: &crate::relay::RelaySession<'_>,
+    record: &serde_json::Value,
+    nonce: &str,
+    attestation: serde_json::Value,
+) -> Response {
+    let did = session.did().to_string();
+    let created = match session
+        .create_own_record(&state.store, "app.bsky.feed.post", None, record)
+        .await
+    {
+        Ok(c) => c,
+        Err(e @ crate::relay::RelayError::SessionExpired(_)) => {
+            let _ = state.store.audit(token, "com.atproto.repo.createRecord", "relay-session-dead");
+            return write_session_expired(state, e.to_string());
+        }
+        Err(e) => {
+            let _ = state.store.audit(token, "com.atproto.repo.createRecord", "relay-failed");
+            return err(StatusCode::BAD_GATEWAY, "server_error", e.to_string());
+        }
+    };
+
+    let rkey = created.uri.rsplit('/').next().unwrap_or_default().to_string();
+    let _ = state.store.set_nonce_rkey(nonce, &rkey);
+    // Audited with the REAL did, so the user's own relay history is a true
+    // record of what was written to their account.
+    let _ = state.store.audit(token, "com.atproto.repo.createRecord", "ok-attested-relay");
+    tracing::info!(%did, uri = %created.uri, "relayed an attested post to the user's own repo");
+
+    if let Err(reason) = relay_provenance(
+        state,
+        token,
+        session,
+        &created.uri,
+        created.cid.as_deref(),
+        nonce,
+        attestation,
+    )
+    .await
+    {
+        tracing::error!(%did, uri = %created.uri, "relayed post is UNATTESTED: {reason}");
+        let _ = state.store.audit(token, "me.browserid.provenance", "relay-provenance-failed");
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "provenance_write_failed",
+                "error_description": format!(
+                    "the post was created but its provenance record could not be written: {reason}"
+                ),
+                "uri": created.uri,
+                "cid": created.cid,
+                "posted": true,
+                "attested": false,
+                "hint": "The post IS live on the account's timeline and its followers can see \
+                         it, but it carries no provenance record and will not be badged. Tell \
+                         the human — they may want to delete it.",
+            })),
+        )
+            .into_response();
+    }
+
+    // Verifiable now: label it and push it to the firehose. `emit_label`
+    // reads every record from the DID's own PDS, so a foreign repo needs
+    // nothing special here.
+    emit_label(state, &did, &rkey).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "uri": created.uri,
+            "cid": created.cid,
+            "repo": did,
+            "relayed": true,
+        })),
+    )
+        .into_response()
+}
+
+/// Write `me.browserid.warrant` (once per warrant) and
+/// `me.browserid.provenance` (per post) into the user's own repo.
+///
+/// `Err` is a caller-visible failure, not a log line — see [`relay_post`].
+async fn relay_provenance(
+    state: &S,
+    token: &crate::store::BridgeToken,
+    session: &crate::relay::RelaySession<'_>,
+    post_uri: &str,
+    post_cid: Option<&str>,
+    nonce: &str,
+    attestation: serde_json::Value,
+) -> Result<(), String> {
+    let w = state
+        .store
+        .warrant_by_hash(&token.warrant_ref)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("warrant {} is not on file", token.warrant_ref))?;
+
+    // The warrant record is published once per warrant. `record_uri` is
+    // recorded against the warrant hash, which is scoped to one grantor, so
+    // a relayed warrant record cannot be mistaken for a bridge-account one.
+    let warrant_record_uri = match w.record_uri.clone() {
+        Some(u) => u,
+        None => {
+            let record = serde_json::json!({
+                "$type": "me.browserid.warrant",
+                "warrant": w.warrant_jws,
+                "configCert": w.config_cert_jws,
+                "attributedTo": w.grantor,
+                "executedBy": w.grantee,
+            });
+            let created = session
+                .create_own_record(
+                    &state.store,
+                    "me.browserid.warrant",
+                    Some(&token.warrant_ref),
+                    &record,
+                )
+                .await
+                .map_err(|e| format!("warrant record: {e}"))?;
+            let _ = state.store.set_warrant_record_uri(&token.warrant_ref, &created.uri);
+            created.uri
+        }
+    };
+
+    let rkey = post_uri.rsplit('/').next().unwrap_or_default();
+    let mut prov = serde_json::json!({
+        "$type": "me.browserid.provenance",
+        "post": post_uri,
+        "warrant": warrant_record_uri,
+        "attributedTo": token.grantor,
+        "executedBy": token.grantee,
+        "nonce": nonce,
+        "attestation": attestation,
+    });
+    if let Some(cid) = post_cid {
+        prov["postCid"] = serde_json::Value::String(cid.to_string());
+    }
+    session
+        .create_own_record(&state.store, "me.browserid.provenance", Some(rkey), &prov)
+        .await
+        .map_err(|e| format!("provenance record: {e}"))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1119,6 +1474,217 @@ fn root_identity(email: &str) -> String {
     match email.split_once('@') {
         Some((local, domain)) => format!("{}@{}", local.split('+').next().unwrap_or(local), domain),
         None => email.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod backend_tests {
+    use super::*;
+    use crate::relay::tests_support::insert_live_session;
+    use crate::store::{Account, WriteSessionState};
+
+    fn token(grantor: &str, did: &str) -> BridgeToken {
+        BridgeToken {
+            did: did.into(),
+            grantor: grantor.into(),
+            grantee: format!("{grantor}+agent"),
+            holder: "svc.agent".into(),
+            scopes: vec!["repo:app.bsky.feed.post?action=create".into()],
+            warrant_status: None,
+            warrant_ref: "wh".into(),
+            expires_at: Utc::now() + Duration::minutes(30),
+        }
+    }
+
+    /// The branch itself: a grantor with a connected write session posts to
+    /// their REAL repo; everyone else keeps the bridge-account path they
+    /// have today. Both backends stay alive side by side (design doc,
+    /// *Non-goals*) — this is not a migration.
+    #[tokio::test]
+    async fn a_connected_grantor_gets_the_relay_and_everyone_else_the_bridge() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+
+        // No pin, no session: bridge.
+        assert!(relay_did_for_grantor(&state, grantor).is_none());
+        assert!(matches!(
+            choose_backend(&state, &token(grantor, "did:plc:bridge")).await.ok(),
+            Some(PostBackend::Bridge)
+        ));
+
+        // Pinned, but write access never connected: still the bridge. The
+        // mint-a-handle path must keep working untouched.
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        assert!(relay_did_for_grantor(&state, grantor).is_none());
+
+        // Connected: the relay, pointed at the pinned DID.
+        insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
+        assert_eq!(relay_did_for_grantor(&state, grantor).as_deref(), Some("did:plc:real"));
+        let Ok(backend) = choose_backend(&state, &token(grantor, "did:plc:real")).await else {
+            panic!("a connected grantor must not be refused")
+        };
+        match backend {
+            PostBackend::Relay(s) => assert_eq!(s.did(), "did:plc:real"),
+            PostBackend::Bridge => panic!("a connected grantor must not fall back to the bridge"),
+        }
+
+        // A different grantor on the same deployment is unaffected.
+        assert!(relay_did_for_grantor(&state, "someone@bsky.browserid.test").is_none());
+        // ...as is an identity from another IdP entirely.
+        assert!(relay_did_for_grantor(&state, "dan.bsky.social@elsewhere.example").is_none());
+    }
+
+    /// The allowlist is a **live** kill switch, not a one-time gate on
+    /// acquiring a session. Taking a name out of `WRITE_RELAY_ALLOWLIST`
+    /// must stop that account relaying at the very next post, even though
+    /// the session row is still sitting there perfectly valid — otherwise
+    /// "allowlisted in v1" bounds only who can *connect*, never how many
+    /// real accounts are exposed right now.
+    #[tokio::test]
+    async fn de_allowlisting_cuts_off_an_existing_session_immediately() {
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+
+        // Allowlisted: relays.
+        let listed = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        listed.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        insert_live_session(&listed, "dan.bsky.social", "did:plc:real", "https://shard.example");
+        assert_eq!(relay_did_for_grantor(&listed, grantor).as_deref(), Some("did:plc:real"));
+
+        // Same store contents, same live session — but the operator has
+        // since removed them from the list.
+        for allowlist in ["", "someone.else.social"] {
+            let dropped = crate::relay::routes::tests::bridge_with_relay(allowlist);
+            dropped.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+            insert_live_session(
+                &dropped,
+                "dan.bsky.social",
+                "did:plc:real",
+                "https://shard.example",
+            );
+            assert!(
+                dropped.store.write_session_exists("did:plc:real").unwrap(),
+                "the row is deliberately still there — the allowlist, not deletion, is the switch"
+            );
+            assert!(
+                relay_did_for_grantor(&dropped, grantor).is_none(),
+                "allowlist {allowlist:?} still relayed"
+            );
+            // And the post path therefore takes the bridge backend rather
+            // than writing to the user's real repo.
+            assert!(matches!(
+                choose_backend(&dropped, &token(grantor, "did:plc:bridge")).await.ok(),
+                Some(PostBackend::Bridge)
+            ));
+        }
+    }
+
+    /// A suspended binding must not relay, even while its row is being swept
+    /// — the fallback is "refuse", never "post to the bridge account".
+    #[tokio::test]
+    async fn a_suspended_binding_does_not_relay() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
+
+        state.store.idp_set_pin_suspended("dan.bsky.social", true).unwrap();
+        assert!(relay_did_for_grantor(&state, grantor).is_none());
+    }
+
+    /// A dead session is never a silent fallback to the bridge account:
+    /// posting somewhere other than where the human expects is worse than
+    /// failing, so the caller gets `write_session_expired` and a reconnect
+    /// URL rather than a post on a stranger-ish timeline.
+    #[tokio::test]
+    async fn a_dead_session_yields_write_session_expired_not_a_bridge_post() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
+        state.store.write_session_set_state("did:plc:real", WriteSessionState::Revoked).unwrap();
+
+        let Err(resp) = choose_backend(&state, &token(grantor, "did:plc:real")).await else {
+            panic!("a revoked session must not silently choose a backend")
+        };
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"], "write_session_expired");
+        assert_eq!(body["reconnect_url"], "https://bsky.browserid.test/idp/connect");
+        // Not an authorization failure: the warrant is fine.
+        assert_ne!(body["error"], "invalid_token");
+    }
+
+    /// A token issued before the handle was reassigned must not write into
+    /// either repo.
+    #[tokio::test]
+    async fn a_token_that_outlived_a_reassignment_is_refused() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:new", Utc::now()).unwrap();
+        insert_live_session(&state, "dan.bsky.social", "did:plc:new", "https://shard.example");
+
+        let Err(resp) = choose_backend(&state, &token(grantor, "did:plc:old")).await else {
+            panic!("a stale token must not choose a backend")
+        };
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// `/browserid/whoami` is how the agent learns the DID to sign over on
+    /// the relay branch, where nothing was provisioned. It must require a
+    /// token and must name the backend, so the agent can tell a real
+    /// timeline from a bridge account before it posts.
+    #[tokio::test]
+    async fn whoami_names_the_target_repo_and_the_backend() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
+        let bearer = state.store.issue_token(&token(grantor, "did:plc:real")).unwrap();
+
+        let server = axum_test::TestServer::new(crate::BridgeState::router_from(state)).unwrap();
+        // No token, no answer — this is not a public lookup.
+        assert_eq!(
+            server.get("/browserid/whoami").await.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let body: serde_json::Value = server
+            .get("/browserid/whoami")
+            .add_header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .await
+            .json();
+        assert_eq!(body["did"], "did:plc:real");
+        assert_eq!(body["backend"], "relay");
+        assert_eq!(body["grantor"], grantor);
+    }
+
+    /// Token exchange must hand the agent the REAL DID once write access is
+    /// connected — `AttestationClaims.did` is in the signed bytes, so the
+    /// agent has to know it before it signs.
+    #[test]
+    fn token_exchange_binds_a_connected_grantor_to_their_real_did() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        let grantor = "dan.bsky.social@bsky.browserid.test";
+        state
+            .store
+            .insert_account(&Account {
+                email: grantor.into(),
+                did: "did:plc:bridge".into(),
+                handle: "dan.at.browserid.test".into(),
+                access_jwt: "a".into(),
+                refresh_jwt: "r".into(),
+            })
+            .unwrap();
+        // With only a bridge account, the bridge DID is what a token binds to.
+        assert!(relay_did_for_grantor(&state, grantor).is_none());
+
+        // Once write access is connected the relay wins, even though the
+        // bridge account still exists: connecting is the later, deliberate
+        // act, and it is what the human asked for.
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
+        assert_eq!(relay_did_for_grantor(&state, grantor).as_deref(), Some("did:plc:real"));
     }
 }
 

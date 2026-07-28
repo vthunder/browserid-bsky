@@ -17,6 +17,8 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
+use crate::relay::crypto::SecretBox;
+
 pub const TOKEN_PREFIX: &str = "bidb_";
 
 #[derive(Debug, thiserror::Error)]
@@ -155,6 +157,91 @@ pub struct PendingOauthFlow {
     pub expires_at: DateTime<Utc>,
 }
 
+/// A pending write-relay connect flow. Same disposable shape as
+/// [`PendingOauthFlow`], with one addition that carries the security crux:
+/// `did` is the DID already pinned for `handle`, captured *before* the
+/// browser leaves, and the callback refuses unless the token's `sub` equals
+/// it. Without that a user could authorize the connect hop as a different
+/// Bluesky account and the bridge would relay posts attributed to one handle
+/// into someone else's repo.
+#[derive(Debug, Clone)]
+pub struct PendingWriteFlow {
+    pub state: String,
+    pub handle: String,
+    pub did: String,
+    pub pds: String,
+    pub issuer: String,
+    pub token_endpoint: String,
+    pub code_verifier: String,
+    pub dpop_secret: String,
+    pub browser_binding: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Where a stored write session stands. `Expired` and `Revoked` both mean
+/// "cannot post"; they are kept apart because only one of them is the user's
+/// doing, and the human-facing message differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteSessionState {
+    Live,
+    Expired,
+    Revoked,
+}
+
+impl WriteSessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    /// Anything unrecognized reads as `Revoked` — the state that refuses.
+    fn parse(s: &str) -> Self {
+        match s {
+            "live" => Self::Live,
+            "expired" => Self::Expired,
+            _ => Self::Revoked,
+        }
+    }
+}
+
+/// A decrypted write-relay session: live OAuth credentials for an account
+/// the bridge does not own.
+///
+/// This struct is the custody the IdP design deliberately refused to take
+/// (its `exchange_code` returns only a DID). It exists only behind the
+/// relay, only for allowlisted opted-in accounts, and only the AEAD key can
+/// produce one from the database.
+#[derive(Debug, Clone)]
+pub struct WriteSession {
+    /// The account's DID — the pinned one, and the only value ever used as
+    /// the `repo` of a relayed write.
+    pub did: String,
+    pub handle: String,
+    /// The browserid identity string, `<handle>@<D>` — what a warrant's
+    /// grantor field says.
+    pub identity: String,
+    /// The resource server holding the repo.
+    pub pds: String,
+    /// The authorization server that issued these tokens.
+    pub issuer: String,
+    pub token_endpoint: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    /// The session's long-lived DPoP key, base64url P-256 scalar. Long-lived
+    /// by necessity: the access token is bound to it.
+    pub dpop_secret: String,
+    /// The resource server's most recent `DPoP-Nonce`, persisted so a
+    /// restart does not cost every session a rejected first request.
+    pub dpop_nonce: Option<String>,
+    pub scope: String,
+    pub access_expires_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub state: WriteSessionState,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -275,7 +362,45 @@ impl Store {
                  retire        INTEGER NOT NULL DEFAULT 0,
                  browser_binding TEXT NOT NULL DEFAULT '',
                  expires_at    TEXT NOT NULL
-             );",
+             );
+             -- A pending WRITE-relay OAuth flow. Same shape as the identity
+             -- flow above and just as disposable, plus the identity whose
+             -- pinned DID the returned `sub` must equal.
+             CREATE TABLE IF NOT EXISTS write_oauth_flows (
+                 state          TEXT PRIMARY KEY,
+                 handle         TEXT NOT NULL,
+                 did            TEXT NOT NULL,
+                 pds            TEXT NOT NULL,
+                 issuer         TEXT NOT NULL,
+                 token_endpoint TEXT NOT NULL,
+                 code_verifier  TEXT NOT NULL,
+                 dpop_secret    TEXT NOT NULL,
+                 browser_binding TEXT NOT NULL,
+                 expires_at     TEXT NOT NULL
+             );
+             -- The write relay's stored atproto OAuth sessions (bean ru7u).
+             -- Unlike every other table here this one holds live credentials
+             -- for accounts the bridge does not own, so the three secret
+             -- columns are AEAD blobs, not text — see `relay::crypto`. There
+             -- is no accessor that reads or writes them without a key.
+             CREATE TABLE IF NOT EXISTS write_sessions (
+                 did               TEXT PRIMARY KEY,
+                 handle            TEXT NOT NULL,
+                 identity          TEXT NOT NULL,
+                 pds               TEXT NOT NULL,
+                 issuer            TEXT NOT NULL,
+                 token_endpoint    TEXT NOT NULL,
+                 access_enc        BLOB NOT NULL,
+                 refresh_enc       BLOB NOT NULL,
+                 dpop_secret_enc   BLOB NOT NULL,
+                 dpop_nonce        TEXT,
+                 scope             TEXT NOT NULL,
+                 access_expires_at TEXT NOT NULL,
+                 created_at        TEXT NOT NULL,
+                 last_refresh      TEXT NOT NULL,
+                 state             TEXT NOT NULL DEFAULT 'live'
+             );
+             CREATE INDEX IF NOT EXISTS write_sessions_handle ON write_sessions (handle);",
         )?;
         // Idempotent column adds for DBs created before a column existed
         // (CREATE TABLE IF NOT EXISTS won't alter an existing table). A
@@ -1050,6 +1175,285 @@ impl Store {
         )?;
         Ok(flow.filter(|f| f.expires_at > Utc::now()))
     }
+
+    // -- write relay: pending connect flows --------------------------------
+
+    pub fn write_put_oauth_flow(&self, f: &PendingWriteFlow) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO write_oauth_flows
+                 (state, handle, did, pds, issuer, token_endpoint, code_verifier, dpop_secret,
+                  browser_binding, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                f.state,
+                f.handle,
+                f.did,
+                f.pds,
+                f.issuer,
+                f.token_endpoint,
+                f.code_verifier,
+                f.dpop_secret,
+                f.browser_binding,
+                f.expires_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Consume a pending connect flow — read and delete in one shot, so a
+    /// replayed `state` finds nothing.
+    pub fn write_take_oauth_flow(&self, state: &str) -> Result<Option<PendingWriteFlow>> {
+        let conn = self.conn.lock().unwrap();
+        let flow = conn
+            .query_row(
+                "SELECT state, handle, did, pds, issuer, token_endpoint, code_verifier,
+                        dpop_secret, browser_binding, expires_at
+                 FROM write_oauth_flows WHERE state = ?1",
+                params![state],
+                |r| {
+                    Ok(PendingWriteFlow {
+                        state: r.get(0)?,
+                        handle: r.get(1)?,
+                        did: r.get(2)?,
+                        pds: r.get(3)?,
+                        issuer: r.get(4)?,
+                        token_endpoint: r.get(5)?,
+                        code_verifier: r.get(6)?,
+                        dpop_secret: r.get(7)?,
+                        browser_binding: r.get(8)?,
+                        expires_at: parse_time(&r.get::<_, String>(9)?),
+                    })
+                },
+            )
+            .optional()?;
+        conn.execute("DELETE FROM write_oauth_flows WHERE state = ?1", params![state])?;
+        conn.execute(
+            "DELETE FROM write_oauth_flows WHERE expires_at < ?1",
+            params![Utc::now().to_rfc3339()],
+        )?;
+        Ok(flow.filter(|f| f.expires_at > Utc::now()))
+    }
+
+    // -- write relay: sessions ---------------------------------------------
+    //
+    // Every accessor that touches `access_enc` / `refresh_enc` /
+    // `dpop_secret_enc` takes the AEAD key. That is not decoration: it is
+    // what makes "the table does not exist before the key does" (design doc,
+    // Decision 4) a property of the type system rather than a promise. A
+    // deployment with no key configured has no `SecretBox`, and therefore no
+    // way to call any of these.
+
+    pub fn write_session_put(&self, key: &SecretBox, s: &WriteSession) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO write_sessions
+                 (did, handle, identity, pds, issuer, token_endpoint, access_enc, refresh_enc,
+                  dpop_secret_enc, dpop_nonce, scope, access_expires_at, created_at,
+                  last_refresh, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11, ?12, ?12, 'live')
+             ON CONFLICT(did) DO UPDATE SET
+                 handle = excluded.handle,
+                 identity = excluded.identity,
+                 pds = excluded.pds,
+                 issuer = excluded.issuer,
+                 token_endpoint = excluded.token_endpoint,
+                 access_enc = excluded.access_enc,
+                 refresh_enc = excluded.refresh_enc,
+                 dpop_secret_enc = excluded.dpop_secret_enc,
+                 dpop_nonce = NULL,
+                 scope = excluded.scope,
+                 access_expires_at = excluded.access_expires_at,
+                 last_refresh = excluded.last_refresh,
+                 state = 'live'",
+            params![
+                s.did,
+                s.handle,
+                s.identity,
+                s.pds,
+                s.issuer,
+                s.token_endpoint,
+                key.seal_str(&s.did, "access_token", &s.access_token),
+                key.seal_str(&s.did, "refresh_token", &s.refresh_token),
+                key.seal_str(&s.did, "dpop_secret", &s.dpop_secret),
+                s.scope,
+                s.access_expires_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The stored session for `did`, decrypted. A row whose secrets will not
+    /// open (a rotated AEAD key, a tampered file) is reported as an error
+    /// rather than as "no session" — a silent fallback to the bridge-account
+    /// backend would post somewhere the human did not expect.
+    pub fn write_session(&self, key: &SecretBox, did: &str) -> Result<Option<WriteSession>> {
+        let row = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT did, handle, identity, pds, issuer, token_endpoint, access_enc,
+                        refresh_enc, dpop_secret_enc, dpop_nonce, scope, access_expires_at,
+                        created_at, state
+                 FROM write_sessions WHERE did = ?1",
+                params![did],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                        r.get::<_, Vec<u8>>(6)?,
+                        r.get::<_, Vec<u8>>(7)?,
+                        r.get::<_, Vec<u8>>(8)?,
+                        r.get::<_, Option<String>>(9)?,
+                        r.get::<_, String>(10)?,
+                        r.get::<_, String>(11)?,
+                        r.get::<_, String>(12)?,
+                        r.get::<_, String>(13)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            did,
+            handle,
+            identity,
+            pds,
+            issuer,
+            token_endpoint,
+            acc,
+            refr,
+            dpop,
+            dpop_nonce,
+            scope,
+            expires,
+            created,
+            state,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let open = |column: &str, blob: &[u8]| {
+            key.open_str(&did, column, blob).map_err(|e| StoreError(e.to_string()))
+        };
+        Ok(Some(WriteSession {
+            access_token: open("access_token", &acc)?,
+            refresh_token: open("refresh_token", &refr)?,
+            dpop_secret: open("dpop_secret", &dpop)?,
+            did,
+            handle,
+            identity,
+            pds,
+            issuer,
+            token_endpoint,
+            dpop_nonce,
+            scope,
+            access_expires_at: parse_time(&expires),
+            created_at: parse_time(&created),
+            state: WriteSessionState::parse(&state),
+        }))
+    }
+
+    /// Store a rotated token pair. Called under the per-DID refresh lock, so
+    /// the read-modify-write around it is serialized; this statement is the
+    /// point at which the new refresh token becomes the one of record.
+    pub fn write_session_rotate(
+        &self,
+        key: &SecretBox,
+        did: &str,
+        access_token: &str,
+        refresh_token: &str,
+        access_expires_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE write_sessions
+                SET access_enc = ?2, refresh_enc = ?3, access_expires_at = ?4,
+                    last_refresh = ?5, state = 'live'
+              WHERE did = ?1",
+            params![
+                did,
+                key.seal_str(did, "access_token", access_token),
+                key.seal_str(did, "refresh_token", refresh_token),
+                access_expires_at.to_rfc3339(),
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        if n == 0 {
+            return Err(StoreError(format!("no write session for {did} to rotate")));
+        }
+        Ok(())
+    }
+
+    /// Remember the resource server's latest `DPoP-Nonce`, so a restart does
+    /// not cost every session an extra round trip.
+    pub fn write_session_set_nonce(&self, did: &str, nonce: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE write_sessions SET dpop_nonce = ?2 WHERE did = ?1",
+            params![did, nonce],
+        )?;
+        Ok(())
+    }
+
+    pub fn write_session_set_state(&self, did: &str, state: WriteSessionState) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE write_sessions SET state = ?2 WHERE did = ?1",
+            params![did, state.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Drop the write session for a handle whose identity binding just died.
+    ///
+    /// Called wherever [`Self::idp_revoke_status_for_handle`] is: a suspended
+    /// or retired binding must not leave a live write token behind, or the
+    /// bridge would still be able to post as an identity it no longer
+    /// certifies. Deleting rather than disabling (design doc open question 5)
+    /// — the recoverable case is a reconnect, which is cheap, and the
+    /// unrecoverable case is a stranger's credentials sitting in our database.
+    pub fn write_session_delete_for_handle(&self, handle: &str) -> Result<usize> {
+        let n = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM write_sessions WHERE handle = ?1", params![handle])?;
+        if n > 0 {
+            tracing::info!(%handle, "handle binding ended — deleted its write-relay session");
+        }
+        Ok(n)
+    }
+
+    pub fn write_session_delete(&self, did: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM write_sessions WHERE did = ?1", params![did])?;
+        Ok(())
+    }
+
+    /// Does a write session exist for this DID at all? Answers without the
+    /// AEAD key, so the post path can pick a backend before decrypting.
+    pub fn write_session_exists(&self, did: &str) -> Result<bool> {
+        let n: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM write_sessions WHERE did = ?1",
+            params![did],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The raw secret columns exactly as they sit on disk — so a test can
+    /// assert that what a stolen database file yields is ciphertext.
+    #[cfg(test)]
+    pub fn write_session_raw_secrets(&self, did: &str) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT access_enc, refresh_enc, dpop_secret_enc FROM write_sessions WHERE did = ?1",
+            params![did],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?)
+    }
 }
 
 /// Parse an RFC 3339 timestamp written by this module. A malformed value
@@ -1187,6 +1591,141 @@ mod tests {
         let s = Store::open(&path).unwrap();
         assert_eq!(s.labels_for("at://a/p/1").unwrap().len(), 3);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -- write relay -------------------------------------------------------
+
+    fn secrets() -> SecretBox {
+        SecretBox::from_key_bytes(&[3u8; 32]).unwrap()
+    }
+
+    fn write_session(did: &str) -> WriteSession {
+        WriteSession {
+            did: did.into(),
+            handle: "dan.bsky.social".into(),
+            identity: "dan.bsky.social@bsky.browserid.test".into(),
+            pds: "https://shard.example".into(),
+            issuer: "https://bsky.social".into(),
+            token_endpoint: "https://bsky.social/oauth/token".into(),
+            access_token: "ACCESS-TOKEN-PLAINTEXT".into(),
+            refresh_token: "REFRESH-TOKEN-PLAINTEXT".into(),
+            dpop_secret: "DPOP-SECRET-PLAINTEXT".into(),
+            dpop_nonce: None,
+            scope: "atproto transition:generic".into(),
+            access_expires_at: Utc::now() + Duration::hours(1),
+            created_at: Utc::now(),
+            state: WriteSessionState::Live,
+        }
+    }
+
+    #[test]
+    fn a_write_session_round_trips_through_the_aead() {
+        let s = Store::open_in_memory().unwrap();
+        let k = secrets();
+        s.write_session_put(&k, &write_session("did:plc:abc")).unwrap();
+
+        let got = s.write_session(&k, "did:plc:abc").unwrap().unwrap();
+        assert_eq!(got.access_token, "ACCESS-TOKEN-PLAINTEXT");
+        assert_eq!(got.refresh_token, "REFRESH-TOKEN-PLAINTEXT");
+        assert_eq!(got.dpop_secret, "DPOP-SECRET-PLAINTEXT");
+        assert_eq!(got.pds, "https://shard.example");
+        assert_eq!(got.state, WriteSessionState::Live);
+        assert!(s.write_session_exists("did:plc:abc").unwrap());
+        assert!(s.write_session(&k, "did:plc:nobody").unwrap().is_none());
+
+        // Rotation replaces the pair and can be read back under the same key.
+        let later = Utc::now() + Duration::hours(2);
+        s.write_session_rotate(&k, "did:plc:abc", "ACC-2", "REF-2", later).unwrap();
+        let got = s.write_session(&k, "did:plc:abc").unwrap().unwrap();
+        assert_eq!((got.access_token.as_str(), got.refresh_token.as_str()), ("ACC-2", "REF-2"));
+        // Rotating a session that is not there is an error, not a silent
+        // insert — that would resurrect a session the user disconnected.
+        assert!(s.write_session_rotate(&k, "did:plc:ghost", "a", "r", later).is_err());
+    }
+
+    /// What a stolen database file yields. The three secret columns must be
+    /// ciphertext on disk — this is the whole justification for the AEAD, so
+    /// it is asserted against the bytes rusqlite actually stored, not
+    /// against the struct.
+    #[test]
+    fn the_secret_columns_are_never_plaintext_on_disk() {
+        let s = Store::open_in_memory().unwrap();
+        let k = secrets();
+        s.write_session_put(&k, &write_session("did:plc:abc")).unwrap();
+
+        let (acc, refr, dpop) = s.write_session_raw_secrets("did:plc:abc").unwrap();
+        for (name, blob, plain) in [
+            ("access_enc", &acc, "ACCESS-TOKEN-PLAINTEXT"),
+            ("refresh_enc", &refr, "REFRESH-TOKEN-PLAINTEXT"),
+            ("dpop_secret_enc", &dpop, "DPOP-SECRET-PLAINTEXT"),
+        ] {
+            assert!(
+                !blob.windows(plain.len()).any(|w| w == plain.as_bytes()),
+                "{name} holds the plaintext"
+            );
+            assert!(blob.len() > 24, "{name} carries a nonce and a tag");
+        }
+        assert_ne!(acc, refr, "distinct nonces per column");
+
+        // And the wrong key gets nothing back — not even a partial read.
+        let wrong = SecretBox::from_key_bytes(&[4u8; 32]).unwrap();
+        assert!(s.write_session(&wrong, "did:plc:abc").is_err());
+    }
+
+    /// The hazard the design calls out: a handle whose binding is suspended
+    /// or retired must not leave live posting credentials behind, or the
+    /// bridge could still post as an identity it no longer certifies.
+    #[test]
+    fn a_write_session_is_swept_when_its_handle_binding_ends() {
+        let s = Store::open_in_memory().unwrap();
+        let k = secrets();
+        s.write_session_put(&k, &write_session("did:plc:abc")).unwrap();
+
+        assert_eq!(s.write_session_delete_for_handle("someone.else").unwrap(), 0);
+        assert!(s.write_session_exists("did:plc:abc").unwrap());
+
+        assert_eq!(s.write_session_delete_for_handle("dan.bsky.social").unwrap(), 1);
+        assert!(!s.write_session_exists("did:plc:abc").unwrap());
+        assert!(s.write_session(&k, "did:plc:abc").unwrap().is_none());
+    }
+
+    /// A dead session must not read as "no session" — the post path treats
+    /// those differently, and a silent fallback would post to the wrong repo.
+    #[test]
+    fn a_dead_session_still_reads_back_with_its_state() {
+        let s = Store::open_in_memory().unwrap();
+        let k = secrets();
+        s.write_session_put(&k, &write_session("did:plc:abc")).unwrap();
+        s.write_session_set_state("did:plc:abc", WriteSessionState::Revoked).unwrap();
+        assert_eq!(s.write_session(&k, "did:plc:abc").unwrap().unwrap().state, WriteSessionState::Revoked);
+        assert!(s.write_session_exists("did:plc:abc").unwrap());
+
+        // Reconnecting clears it back to live.
+        s.write_session_put(&k, &write_session("did:plc:abc")).unwrap();
+        assert_eq!(s.write_session(&k, "did:plc:abc").unwrap().unwrap().state, WriteSessionState::Live);
+    }
+
+    #[test]
+    fn a_connect_flow_is_single_use_and_expires() {
+        let s = Store::open_in_memory().unwrap();
+        let flow = |state: &str, mins: i64| PendingWriteFlow {
+            state: state.into(),
+            handle: "dan.bsky.social".into(),
+            did: "did:plc:abc".into(),
+            pds: "https://shard.example".into(),
+            issuer: "https://bsky.social".into(),
+            token_endpoint: "https://bsky.social/oauth/token".into(),
+            code_verifier: "v".into(),
+            dpop_secret: "s".into(),
+            browser_binding: "b".into(),
+            expires_at: Utc::now() + Duration::minutes(mins),
+        };
+        s.write_put_oauth_flow(&flow("st-1", 15)).unwrap();
+        assert_eq!(s.write_take_oauth_flow("st-1").unwrap().unwrap().did, "did:plc:abc");
+        assert!(s.write_take_oauth_flow("st-1").unwrap().is_none(), "replayed state finds nothing");
+
+        s.write_put_oauth_flow(&flow("old", -1)).unwrap();
+        assert!(s.write_take_oauth_flow("old").unwrap().is_none());
     }
 
     #[test]

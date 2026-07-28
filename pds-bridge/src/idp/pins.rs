@@ -19,6 +19,11 @@
 //!   has *continuously* resolved to it for 30 days is the pin replaced. The
 //!   clock starts at the first refused attempt, so squatting a briefly-lapsed
 //!   handle buys nothing.
+//! Wherever a binding dies — suspended, reassigned, or retired — its
+//! write-relay session (bean ru7u) dies with it. A suspended identity that
+//! left a live OAuth token behind would leave the bridge able to post as an
+//! account it no longer certifies.
+//!
 //! * **Voluntary retirement** — the old owner authenticates with the pinned
 //!   DID itself (atproto OAuth accepts a DID as the account identifier) and
 //!   releases the binding immediately. A graceful rename therefore never
@@ -100,8 +105,12 @@ pub fn claim(store: &Store, handle: &str, did: &str) -> Result<ClaimOutcome, Idp
     match decide(pin.as_ref(), did, first_seen, now) {
         Ok(outcome) => {
             if outcome == ClaimOutcome::Seasoned {
-                // The old owner's certs must not outlive the reassignment.
+                // The old owner's certs must not outlive the reassignment —
+                // and neither may their write-relay session, or the bridge
+                // would still hold posting credentials for an account that
+                // no longer owns this identity.
                 store.idp_revoke_status_for_handle(handle)?;
+                store.write_session_delete_for_handle(handle)?;
             }
             store.idp_upsert_pin(handle, did, now)?;
             store.idp_clear_reassignment_attempts(handle)?;
@@ -109,9 +118,11 @@ pub fn claim(store: &Store, handle: &str, did: &str) -> Result<ClaimOutcome, Idp
         }
         Err(e) => {
             // Fail closed AND fail loudly: the contested binding stops
-            // issuing, and its live certs are revoked via the status list.
+            // issuing, its live certs are revoked via the status list, and
+            // any write-relay session it had is deleted.
             store.idp_set_pin_suspended(handle, true)?;
             store.idp_revoke_status_for_handle(handle)?;
+            store.write_session_delete_for_handle(handle)?;
             Err(e)
         }
     }
@@ -136,6 +147,7 @@ pub fn verify_still_bound(store: &Store, handle: &str, resolved_did: &str) -> Re
     if pin.did != resolved_did {
         store.idp_set_pin_suspended(handle, true)?;
         store.idp_revoke_status_for_handle(handle)?;
+        store.write_session_delete_for_handle(handle)?;
         tracing::warn!(
             %handle, pinned = %pin.did, resolved = %resolved_did,
             "handle moved to a different DID — binding suspended, certs revoked"
@@ -158,6 +170,7 @@ pub fn retire_for_did(store: &Store, did: &str) -> Result<Vec<String>, IdpError>
     let handles = store.idp_pins_for_did(did)?;
     for handle in &handles {
         store.idp_revoke_status_for_handle(handle)?;
+        store.write_session_delete_for_handle(handle)?;
         store.idp_delete_pin(handle)?;
         store.idp_clear_reassignment_attempts(handle)?;
     }

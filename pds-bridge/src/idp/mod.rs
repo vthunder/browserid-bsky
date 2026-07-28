@@ -418,6 +418,7 @@ pub(crate) mod tests {
             label_tx: crate::label_channel(),
             idp_verifier: Some(crate::idp_verifier(&idp, &idp.origin, status_cache)),
             idp: Some(idp),
+            relay: None,
         })
     }
 

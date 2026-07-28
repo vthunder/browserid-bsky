@@ -141,7 +141,15 @@ impl ClientKey {
         })
     }
 
-    fn sign_jwt(&self, header: serde_json::Value, claims: serde_json::Value) -> String {
+    /// Sign a JWT with the client key.
+    ///
+    /// Visible to the crate so the **write** relay's confidential client
+    /// (`crate::relay`) can mint its own `private_key_jwt` assertions under
+    /// the same key and the same published `jwks_uri` (design doc,
+    /// *Decision 1*: two `client_id`s, one key). Nothing else about this
+    /// module is shared with the relay — in particular
+    /// [`exchange_code`]'s zero custody stays a property of *this* file.
+    pub(crate) fn sign_jwt(&self, header: serde_json::Value, claims: serde_json::Value) -> String {
         sign_es256(&self.signing_key, header, claims)
     }
 }

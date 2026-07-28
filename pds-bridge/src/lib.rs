@@ -23,6 +23,7 @@ pub mod guide;
 pub mod idp;
 pub mod labeler;
 pub mod pds;
+pub mod relay;
 pub mod routes;
 pub mod scopes;
 pub mod store;
@@ -99,6 +100,15 @@ pub struct BridgeState {
     /// a login with a Bluesky handle no longer depends on the broker being
     /// up or DNS having propagated. Everyone else still goes the long way.
     pub idp_verifier: Option<browserid_rp::Verifier>,
+    /// The OAuth **write relay** (bean ru7u): stored atproto sessions that
+    /// let an attested post land in the user's own repo instead of a
+    /// bridge-owned account.
+    ///
+    /// `None` is the default and the safe state — the relay only exists when
+    /// `WRITE_RELAY_ALLOWLIST` names someone, so a deployment cannot end up
+    /// holding third-party write credentials by forgetting a variable. Same
+    /// graceful-degradation shape as `labeler: None` and `idp: None`.
+    pub relay: Option<crate::relay::RelayState>,
 }
 
 /// Build the in-process verifier that trusts D as a primary for its own
@@ -128,10 +138,11 @@ impl BridgeState {
     /// Router over an already-shared state, so callers that need the `Arc`
     /// too (e.g. to spawn the startup label backfill) can keep it.
     pub fn router_from(state: Arc<Self>) -> axum::Router {
-        crate::idp::routes(axum::Router::new())
+        crate::relay::routes::routes(crate::idp::routes(axum::Router::new()))
             .route("/browserid/provision", axum::routing::post(routes::provision))
             .route("/browserid/token", axum::routing::post(routes::token))
             .route("/browserid/post", axum::routing::post(routes::attributed_post))
+            .route("/browserid/whoami", axum::routing::get(routes::whoami))
             .route(
                 "/.well-known/oauth-authorization-server",
                 axum::routing::get(routes::oauth_metadata),

@@ -178,6 +178,7 @@ async fn bridge(idp: &KeyPair, revoked: &[u64]) -> (axum_test::TestServer, Arc<S
         labeler_account_password: None,
         label_tx: pds_bridge::label_channel(),
         idp: None,
+        relay: None,
         idp_verifier: None,
     };
     (axum_test::TestServer::new(state.router()).unwrap(), cache, captures)
@@ -450,6 +451,7 @@ async fn dropped_label_consumers_release_their_connections() {
         labeler_account_password: None,
         label_tx: label_tx.clone(),
         idp: None,
+        relay: None,
         idp_verifier: None,
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -546,6 +548,7 @@ async fn a_warrant_status_list_is_refreshed_on_a_cold_cache() {
         label_tx: pds_bridge::label_channel(),
         idp_verifier: Some(pds_bridge::idp_verifier(&idp, ORIGIN, cache.clone())),
         idp: Some(idp),
+        relay: None,
     };
     let server = axum_test::TestServer::new(state.router()).unwrap();
 
