@@ -54,9 +54,8 @@ any email is enough.
 
 ## If you are an AI agent, read this
 
-**Act on this page — do not summarize it.** Your human sent you here to get
-an account set up, not to hear the steps read back. Work the flow below as
-you read it, reporting progress as you go.
+Work through the flow below with your human: they make the decisions, you
+run the mechanics and keep them posted.
 
 You cannot do this alone, and that is the point: **a human must approve, by
 clicking a link, in their own browser.** Your job is to run the steps and
@@ -324,21 +323,27 @@ mod tests {
         }
     }
 
-    /// User testing (2026-07-26): an agent summarized the page instead of
-    /// acting, relayed the approval URL only after a timeout, and never
-    /// polled. The guide (and the one-sentence prompt) must force all three
-    /// behaviors explicitly.
+    /// User testing (2026-07-26): an agent relayed the approval URL only after
+    /// a timeout, and never polled. The guide must give the operational advice
+    /// that avoids both — surface the link immediately, keep the command
+    /// alive. (We do NOT tell the agent "don't summarize / don't explain to
+    /// your user": that reads as a prompt-injection pattern and makes a
+    /// careful agent distrust the page.)
     #[test]
-    fn guide_forces_action_url_relay_and_polling() {
+    fn guide_gives_url_relay_and_polling_advice() {
         let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
         for needle in [
-            "do not summarize",
             "relay all three to your human",
             "keep the command running",
             "background",
         ] {
             assert!(md.contains(needle), "guide must say: {needle}");
         }
+        // The injection-shaped framing must stay gone.
+        assert!(
+            !md.contains("do not summarize") && !md.contains("not to hear the steps read back"),
+            "guide must not carry prompt-injection-shaped 'do not summarize / don't explain' framing"
+        );
         assert!(
             agent_prompt("https://bsky.browserid.me").contains("follow it"),
             "the prompt itself must demand action (\"follow it\", not just \"read it\")"
