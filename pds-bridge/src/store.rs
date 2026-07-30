@@ -193,6 +193,11 @@ pub struct PendingOauthFlow {
     pub dpop_secret: String,
     /// This flow is a voluntary retirement, not a claim.
     pub retire: bool,
+    /// Which first-party page the callback returns to: `device-authorize`
+    /// (the cert-issuing sign-in) or `claim` (the broker's handle-identity
+    /// attestation hop). Stored server-side from an allowlist — never read
+    /// off the redirect.
+    pub return_page: String,
     /// Ties the flow to the browser that started it: the value of the
     /// `bsky_idp_flow` cookie set at `/idp/oauth/start`. The callback must
     /// present it, so a `state` captured from someone else's flow cannot be
@@ -467,6 +472,7 @@ impl Store {
             "ALTER TABLE label_defs ADD COLUMN grantor TEXT",
             "ALTER TABLE label_defs ADD COLUMN grantee TEXT",
             "ALTER TABLE idp_oauth_flows ADD COLUMN browser_binding TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE idp_oauth_flows ADD COLUMN return_page TEXT NOT NULL DEFAULT 'device-authorize'",
         ] {
             if let Err(e) = conn.execute(stmt, []) {
                 if !e.to_string().contains("duplicate column name") {
@@ -1318,8 +1324,8 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "INSERT INTO idp_oauth_flows
                  (state, handle, did, issuer, token_endpoint, code_verifier, dpop_secret,
-                  retire, browser_binding, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  retire, browser_binding, expires_at, return_page)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 f.state,
                 f.handle,
@@ -1331,6 +1337,7 @@ impl Store {
                 i64::from(f.retire),
                 f.browser_binding,
                 f.expires_at.to_rfc3339(),
+                f.return_page,
             ],
         )?;
         Ok(())
@@ -1343,7 +1350,7 @@ impl Store {
         let flow = conn
             .query_row(
                 "SELECT state, handle, did, issuer, token_endpoint, code_verifier, dpop_secret,
-                        retire, browser_binding, expires_at
+                        retire, browser_binding, expires_at, return_page
                  FROM idp_oauth_flows WHERE state = ?1",
                 params![state],
                 |r| {
@@ -1358,6 +1365,7 @@ impl Store {
                         retire: r.get::<_, i64>(7)? != 0,
                         browser_binding: r.get(8)?,
                         expires_at: parse_time(&r.get::<_, String>(9)?),
+                        return_page: r.get(10)?,
                     })
                 },
             )

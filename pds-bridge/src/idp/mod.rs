@@ -327,6 +327,8 @@ pub fn routes(router: axum::Router<Arc<crate::BridgeState>>) -> axum::Router<Arc
         .route("/idp/oauth/callback", get(routes::oauth_callback))
         .route("/idp/whoami", get(routes::whoami))
         .route("/idp/resolve", get(routes::resolve_check))
+        .route("/idp/attest", post(routes::attest))
+        .route("/idp/claim", get(routes::claim_page))
         .route("/idp/logout", post(routes::logout))
         .route("/idp/retire", post(routes::retire_binding))
         .route("/idp/device_cert", post(certs::device_cert))
@@ -392,6 +394,7 @@ pub(crate) mod tests {
             "/.well-known/browserid-status",
             "/idp/device-authorize",
             "/idp/resolve?domain=dan.bsky.social",
+            "/idp/claim",
         ] {
             assert_eq!(server.get(path).await.status_code(), StatusCode::NOT_FOUND, "{path}");
         }

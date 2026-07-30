@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Verify your Bluesky handle</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 16px/1.6 system-ui, -apple-system, sans-serif; max-width: 26rem;
+      margin: 4rem auto; padding: 0 1.25rem; text-align: center; }
+    h1 { font-size: 1.3rem; }
+    .muted { opacity: .65; }
+    .err { color: #c53030; }
+    .spinner { width: 28px; height: 28px; margin: 1.5rem auto; border: 3px solid rgba(127,127,127,.3);
+      border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Verify your Bluesky handle</h1>
+  <div class="spinner" id="spin"></div>
+  <p id="msg" class="muted">Checking…</p>
+
+<script>
+// Handle-identity claim hop (browserid-ng-tsqk).
+//
+// The browserid dialog opens us with #email=<label>@<handle>&return_origin=…
+// (popup mode) or …&return_url=… (redirect mode). We prove the handle via
+// atproto OAuth at the user's own PDS, ask the bridge to sign an attestation
+// ("this DID holds this handle, verified now"), and hand THAT back to the
+// dialog — which redeems it at the broker. No keys are generated here and no
+// certs are issued: unlike the device-authorize page, the only thing that
+// crosses back is a short-lived, broker-addressed attestation.
+(function () {
+  'use strict';
+  var KEY = 'browserid_handle_claim';
+  // Server-injected allowlist (see routes::claim_page). The attestation is a
+  // bearer claim on the identity within its expiry window, so only the
+  // broker's dialog origin may receive it.
+  var TRUSTED_ORIGINS = __TRUSTED_ORIGINS__;
+  var msg = document.getElementById('msg');
+  var spin = document.getElementById('spin');
+
+  function fail(text) {
+    spin.style.display = 'none';
+    msg.className = 'err';
+    msg.textContent = text;
+  }
+  function working(text) {
+    spin.style.display = '';
+    msg.className = 'muted';
+    msg.textContent = text;
+  }
+
+  // Park fragment params; sessionStorage survives the OAuth round trip and
+  // the fragment never reaches a server.
+  var frag = location.hash.length > 1 ? location.hash.slice(1) : '';
+  if (frag) {
+    var p = new URLSearchParams(frag);
+    if (p.get('email') && p.get('return_origin')) {
+      try {
+        sessionStorage.setItem(KEY, JSON.stringify({
+          email: p.get('email'),
+          return_origin: p.get('return_origin'),
+          return_url: p.get('return_url') || null
+        }));
+      } catch (e) {}
+    }
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
+  // Status handed back by the OAuth callback redirect.
+  var query = new URLSearchParams(location.search);
+  var callbackError = query.get('error');
+  var cameBack = query.get('signed_in') !== null || callbackError !== null;
+  if (location.search) history.replaceState(null, '', location.pathname);
+
+  var params = null;
+  try { params = JSON.parse(sessionStorage.getItem(KEY) || 'null'); } catch (e) {}
+  if (!params) return fail('This page is opened by the browserid sign-in dialog; open it from there.');
+
+  var returnOrigin;
+  try {
+    returnOrigin = new URL(params.return_origin).origin;
+    if (!/^https?:$/.test(new URL(returnOrigin).protocol)) throw new Error('bad scheme');
+  } catch (e) { return fail('Invalid return origin.'); }
+  // Fail closed BEFORE any OAuth or attestation: an origin not on the
+  // server's allowlist gets nothing.
+  if (TRUSTED_ORIGINS.indexOf(returnOrigin) === -1) {
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    return fail('This page cannot return a sign-in to ' + returnOrigin + '.');
+  }
+
+  var email = String(params.email);
+  var at = email.lastIndexOf('@');
+  var handle = at > 0 ? email.slice(at + 1).toLowerCase() : '';
+  if (!handle) return fail('Invalid identity: ' + email);
+
+  // The dialog's resume entry point on the validated return origin — used by
+  // redirect mode, and by the popup return leg when the PDS's COOP severed
+  // our opener.
+  var RESUME_PATH = '/dialog/dialog.html?resume=handle_claim';
+
+  function resultFragment(payload) {
+    if (payload.type === 'browserid:handle_attestation') {
+      return '#handle_attestation=' + encodeURIComponent(payload.attestation) +
+        '&email=' + encodeURIComponent(payload.email);
+    }
+    return '#handle_error=' + encodeURIComponent(payload.reason || 'refused') +
+      '&email=' + encodeURIComponent(payload.email);
+  }
+
+  function send(payload) {
+    if (params.return_url) {
+      var ok = false;
+      try { ok = new URL(params.return_url).origin === returnOrigin; } catch (e) {}
+      if (!ok) return fail('Invalid return URL.');
+      try { sessionStorage.removeItem(KEY); } catch (e) {}
+      location.replace(params.return_url + resultFragment(payload));
+      return;
+    }
+    if (!window.opener) {
+      // Popup whose opener the OAuth hop severed: same handback redirect
+      // mode uses — result in the FRAGMENT to the dialog's resume URL on
+      // the already-allowlisted origin.
+      try { sessionStorage.removeItem(KEY); } catch (e) {}
+      location.replace(returnOrigin + RESUME_PATH + resultFragment(payload));
+      return;
+    }
+    window.opener.postMessage(payload, returnOrigin);
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    window.close();
+  }
+
+  function sendError(reason) {
+    send({ type: 'browserid:handle_error', email: email, reason: reason });
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body || {})
+    }).then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); });
+  }
+
+  function attestAndReturn() {
+    working('Verifying ' + handle + '…');
+    post('/idp/attest').then(function (res) {
+      if (!res.ok || !res.body.attestation) {
+        return sendError((res.body && res.body.error) || 'could not verify the handle');
+      }
+      send({
+        type: 'browserid:handle_attestation',
+        email: email,
+        attestation: res.body.attestation
+      });
+    }).catch(function (e) {
+      sendError('could not verify the handle: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  function startOauth() {
+    working('Finding ' + handle + '…');
+    post('/idp/oauth/start', { identifier: handle, return_page: 'claim' }).then(function (res) {
+      if (!res.ok || !res.body.authorize_url) {
+        return sendError((res.body && res.body.error) || 'could not start Bluesky sign-in');
+      }
+      working('Taking you to your Bluesky account…');
+      // Announce the handoff BEFORE navigating: the PDS's COOP severs our
+      // opener, which makes the dialog's popup.closed poll read true. Hearing
+      // this, it keeps waiting for the resume handback instead.
+      if (window.opener) {
+        try {
+          window.opener.postMessage(
+            { type: 'browserid:handle_claim_pending', email: email },
+            returnOrigin
+          );
+        } catch (e) { /* redirect mode: nothing to tell */ }
+      }
+      location.href = res.body.authorize_url;
+    }).catch(function (e) {
+      sendError('could not start Bluesky sign-in: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  if (callbackError) return sendError(callbackError);
+
+  working('Checking…');
+  fetch('/idp/whoami', { credentials: 'same-origin', headers: { accept: 'application/json' } })
+    .then(function (r) { return r.json(); })
+    .then(function (who) {
+      if (who && who.authenticated && String(who.handle || '').toLowerCase() === handle) {
+        return attestAndReturn();
+      }
+      if (cameBack) {
+        // We already went through OAuth and still have no matching session —
+        // don't loop; report it.
+        return sendError('Bluesky sign-in did not complete for ' + handle);
+      }
+      startOauth();
+    })
+    .catch(function () {
+      if (cameBack) return sendError('could not check the sign-in session');
+      startOauth();
+    });
+})();
+</script>
+</body>
+</html>

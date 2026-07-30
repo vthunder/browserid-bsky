@@ -248,7 +248,7 @@ dependencies = [
 [[package]]
 name = "browserid-agent"
 version = "0.1.0"
-source = "git+https://github.com/vthunder/browserid-ng?branch=main#f6fff77b1dcd377e6d31933c0b05c47a0b1ec0b0"
+source = "git+https://github.com/vthunder/browserid-ng?branch=main#560037a89798532ee9c924207c87be71af5d9608"
 dependencies = [
  "base64",
  "browserid-core",
@@ -264,7 +264,7 @@ dependencies = [
 [[package]]
 name = "browserid-core"
 version = "0.1.0"
-source = "git+https://github.com/vthunder/browserid-ng?branch=main#f6fff77b1dcd377e6d31933c0b05c47a0b1ec0b0"
+source = "git+https://github.com/vthunder/browserid-ng?branch=main#560037a89798532ee9c924207c87be71af5d9608"
 dependencies = [
  "base64",
  "chrono",
@@ -281,7 +281,7 @@ dependencies = [
 [[package]]
 name = "browserid-rp"
 version = "0.1.0"
-source = "git+https://github.com/vthunder/browserid-ng?branch=main#f6fff77b1dcd377e6d31933c0b05c47a0b1ec0b0"
+source = "git+https://github.com/vthunder/browserid-ng?branch=main#560037a89798532ee9c924207c87be71af5d9608"
 dependencies = [
  "base64",
  "browserid-core",

@@ -51,12 +51,25 @@ pub async fn device_authorize_page(State(state): State<S>) -> Response {
 }
 
 /// The placeholder the trusted-origin allowlist replaces. Present exactly
-/// once in the page; the const is what keeps the two in sync.
+/// once in each first-party page; the const is what keeps them in sync.
 const TRUSTED_ORIGINS_TOKEN: &str = "__TRUSTED_ORIGINS__";
 
 fn render_device_authorize(trusted: &[String]) -> String {
     let json = serde_json::to_string(trusted).unwrap_or_else(|_| "[]".into());
     include_str!("device-authorize.html").replace(TRUSTED_ORIGINS_TOKEN, &json)
+}
+
+/// `GET /idp/claim` — the handle-identity claim hop the browserid dialog
+/// opens (browserid-ng-tsqk). Same serve-time allowlist injection as the
+/// device-authorize page, for the same reason: the attestation may only be
+/// handed back to the broker's dialog origin, and the list must never be
+/// fetchable-after-parameters.
+pub async fn claim_page(State(state): State<S>) -> Response {
+    let Ok(st) = super::require_idp(&state) else {
+        return IdpError::NotConfigured.into_response();
+    };
+    let json = serde_json::to_string(&st.trusted_origins).unwrap_or_else(|_| "[]".into());
+    Html(include_str!("claim.html").replace(TRUSTED_ORIGINS_TOKEN, &json)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +200,66 @@ pub async fn resolve_check(
     Ok(Json(resp).into_response())
 }
 
+#[derive(Serialize)]
+pub struct AttestResp {
+    /// The signed handle attestation, verbatim JWS.
+    pub attestation: String,
+    pub handle: String,
+    pub did: String,
+}
+
+/// `POST /idp/attest` — sign "DID X holds handle H, verified now" for the
+/// session's handle, addressed to the broker (browserid-ng-tsqk, bean 031k).
+///
+/// This is the bridge's half of a handle-identity claim: the broker is the
+/// issuer, and this attestation — signed with D's DNSSEC-published IdP key —
+/// is what it accepts in place of an SMTP verification loop. The session
+/// alone is not enough to sign: the public binding is re-resolved (bounded
+/// by the resolve cache) and checked against the pin, the same assurance
+/// cadence the access-cert mint runs, so a session that outlives a handle
+/// move cannot mint attestations for a handle its holder no longer has.
+pub async fn attest(State(state): State<S>, headers: HeaderMap) -> Result<Response, IdpError> {
+    let st = super::require_idp(&state)?;
+    let session = require_session(&state, &headers)?;
+    let handle = session.handle.clone().ok_or_else(|| {
+        IdpError::BadRequest("this session holds no handle to attest".into())
+    })?;
+
+    // Fresh public state, outage-tolerant within the cadence bound.
+    let resolved = resolve::resolve_for_assurance(st, &state.http, &handle, true).await?;
+    if resolved.did != session.did {
+        return Err(IdpError::Forbidden);
+    }
+    // The pin table still bounds moves and takedowns; a mismatch suspends.
+    pins::verify_still_bound(&state.store, &handle, &resolved.did)?;
+
+    let attestation = browserid_core::HandleAttestation::create(
+        &st.domain,
+        &broker_audience(&state.broker_url),
+        &handle,
+        &resolved.did,
+        &st.keypair,
+    )
+    .map_err(|e| IdpError::Internal(format!("attestation: {e}")))?;
+
+    Ok(Json(AttestResp {
+        attestation: attestation.encoded().to_string(),
+        handle,
+        did: resolved.did,
+    })
+    .into_response())
+}
+
+/// The attestation audience: the broker's domain (host[:port]), which is
+/// what the broker's own `state.domain` holds and checks against.
+fn broker_audience(broker_url: &str) -> String {
+    let rest = broker_url
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
+}
+
 /// `POST /idp/logout` — end the session and clear the cookie.
 pub async fn logout(State(state): State<S>, headers: HeaderMap) -> Response {
     let Ok(st) = super::require_idp(&state) else {
@@ -211,7 +284,18 @@ pub struct OauthStartReq {
     /// Retire this account's handle bindings instead of claiming one.
     #[serde(default)]
     pub retire: bool,
+    /// Which first-party page the callback should land on. Optional;
+    /// validated against [`RETURN_PAGES`].
+    #[serde(default)]
+    pub return_page: Option<String>,
 }
+
+/// The only pages an OAuth callback may return to. `device-authorize` is
+/// the cert-issuing sign-in; `claim` is the broker's handle-identity
+/// attestation hop. The value is stored on the flow at start time and
+/// interpolated into a redirect path, so the allowlist is what keeps it
+/// from becoming an open-redirect (or header-injection) vector.
+const RETURN_PAGES: [&str; 2] = ["device-authorize", "claim"];
 
 #[derive(Serialize)]
 pub struct OauthStartResp {
@@ -234,6 +318,14 @@ pub async fn oauth_start(
 ) -> Result<Response, IdpError> {
     let st = super::require_idp(&state)?;
     let identifier = req.identifier.trim();
+
+    let return_page = match req.return_page.as_deref() {
+        None => RETURN_PAGES[0].to_string(),
+        Some(p) if RETURN_PAGES.contains(&p) => p.to_string(),
+        Some(p) => {
+            return Err(IdpError::BadRequest(format!("unknown return_page '{p}'")));
+        }
+    };
 
     // Resolve first — both entry points end at a binding that has passed
     // the bidirectional check, so the OAuth hop always has a DID to be
@@ -267,6 +359,7 @@ pub async fn oauth_start(
         code_verifier: prepared.code_verifier,
         dpop_secret: prepared.dpop_secret,
         retire: req.retire,
+        return_page,
         browser_binding: binding.clone(),
         expires_at: Utc::now() + Duration::minutes(OAUTH_FLOW_TTL_MINUTES),
     })?;
@@ -309,14 +402,18 @@ pub async fn oauth_callback(
     // The flow cookie is spent either way — success or failure, this flow
     // is over.
     let clear_flow = (header::SET_COOKIE, set_flow_cookie(st, "", 0));
-    match callback_inner(&state, st, &headers, q).await {
+    // Which page errors land on: the flow's, once it has been read — a
+    // failed claim hop must not strand the user on the device-authorize
+    // page, whose sessionStorage knows nothing about it.
+    let mut page = RETURN_PAGES[0].to_string();
+    match callback_inner(&state, st, &headers, q, &mut page).await {
         Ok((sid, redirect)) => (
             [clear_flow, (header::SET_COOKIE, set_cookie(st, &sid, SESSION_TTL_HOURS * 3600))],
             redirect,
         )
             .into_response(),
         Err(e) => {
-            ([clear_flow], back_to_page(&format!("error={}", urlencode(&e.to_string()))))
+            ([clear_flow], back_to_page(&page, &format!("error={}", urlencode(&e.to_string()))))
                 .into_response()
         }
     }
@@ -327,6 +424,7 @@ async fn callback_inner(
     st: &IdpState,
     headers: &HeaderMap,
     q: OauthCallbackQuery,
+    page: &mut String,
 ) -> Result<(String, Redirect), IdpError> {
     if let Some(err) = q.error {
         let detail = q.error_description.unwrap_or_default();
@@ -346,6 +444,9 @@ async fn callback_inner(
         .store
         .idp_take_oauth_flow(&state_tok)?
         .ok_or_else(|| IdpError::BadRequest("this sign-in expired — start again".into()))?;
+    if RETURN_PAGES.contains(&flow.return_page.as_str()) {
+        *page = flow.return_page.clone();
+    }
 
     // Is this the browser that started the flow? Checked before the code is
     // exchanged and long before any session is issued, so a `state` redeemed
@@ -395,7 +496,7 @@ async fn callback_inner(
     if flow.retire {
         let retired = pins::retire_for_did(&state.store, &flow.did)?;
         let sid = state.store.idp_create_session(None, &flow.did, SESSION_TTL_HOURS)?;
-        return Ok((sid, back_to_page(&format!("retired={}", urlencode(&retired.join(", "))))));
+        return Ok((sid, back_to_page(page, &format!("retired={}", urlencode(&retired.join(", "))))));
     }
 
     let handle = flow
@@ -405,7 +506,7 @@ async fn callback_inner(
     // handle fails here, and the message tells the user how to resolve it.
     pins::claim(&state.store, &handle, &flow.did)?;
     let sid = state.store.idp_create_session(Some(&handle), &flow.did, SESSION_TTL_HOURS)?;
-    Ok((sid, back_to_page("signed_in=1")))
+    Ok((sid, back_to_page(page, "signed_in=1")))
 }
 
 /// `POST /idp/retire` — start a voluntary retirement.
@@ -422,8 +523,10 @@ pub async fn retire_binding(
 }
 
 /// Bounce back to the device-authorize page with a status in the query.
-fn back_to_page(query: &str) -> Redirect {
-    Redirect::to(&format!("/idp/device-authorize?{query}"))
+/// `page` is always a [`RETURN_PAGES`] member — enforced at flow start and
+/// re-checked when read back — so this cannot be steered off-origin.
+fn back_to_page(page: &str, query: &str) -> Redirect {
+    Redirect::to(&format!("/idp/{page}?{query}"))
 }
 
 /// Minimal percent-encoding for a query-string value. The bridge has no
@@ -503,6 +606,7 @@ mod tests {
             code_verifier: "v".into(),
             dpop_secret: "s".into(),
             retire: false,
+            return_page: "device-authorize".into(),
             browser_binding: "b-1".into(),
             expires_at: Utc::now() + Duration::minutes(15),
         };
@@ -525,11 +629,103 @@ mod tests {
                 code_verifier: "v".into(),
                 dpop_secret: "s".into(),
                 retire: false,
+                return_page: "device-authorize".into(),
                 browser_binding: "b-old".into(),
                 expires_at: Utc::now() - Duration::minutes(1),
             })
             .unwrap();
         assert!(store.idp_take_oauth_flow("old").unwrap().is_none());
+    }
+
+    /// The attest endpoint signs "DID X holds handle H" for the broker —
+    /// but only for a live session whose handle still resolves to the
+    /// pinned DID. Resolution is served from a seeded cache so the test
+    /// runs without network.
+    #[tokio::test]
+    async fn attest_signs_for_a_verified_session_binding() {
+        let bridge = crate::idp::tests::test_bridge();
+        let idp = bridge.idp.clone().unwrap();
+        let sid = bridge.store.idp_create_session(Some("dan.bsky.social"), "did:plc:dan", 12).unwrap();
+        bridge.store.idp_upsert_pin("dan.bsky.social", "did:plc:dan", Utc::now()).unwrap();
+        idp.resolve_cache.put(resolve::Resolved {
+            handle: "dan.bsky.social".into(),
+            did: "did:plc:dan".into(),
+            pds: "https://pds.example".into(),
+            resolved_at: Utc::now(),
+        });
+        let server =
+            axum_test::TestServer::new(crate::BridgeState::router_from(bridge.clone())).unwrap();
+
+        // No session → 401.
+        let resp = server.post("/idp/attest").await;
+        assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+
+        let resp = server
+            .post("/idp/attest")
+            .add_header(header::COOKIE, format!("{SESSION_COOKIE}={sid}").parse::<axum::http::HeaderValue>().unwrap())
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["handle"], "dan.bsky.social");
+        assert_eq!(body["did"], "did:plc:dan");
+
+        // The attestation verifies under D's key, addressed to the broker's
+        // domain, and claims exactly the session's handle+DID.
+        let att = browserid_core::HandleAttestation::parse(body["attestation"].as_str().unwrap())
+            .unwrap();
+        att.verify(&idp.keypair.public_key(), "broker.invalid").unwrap();
+        assert_eq!(att.claims().handle, "dan.bsky.social");
+        assert_eq!(att.claims().did, "did:plc:dan");
+        assert_eq!(att.claims().iss, idp.domain);
+    }
+
+    /// A session that outlives a handle move must not mint attestations:
+    /// the cached resolution now answers a different DID than the pin.
+    #[tokio::test]
+    async fn attest_refuses_when_the_handle_moved() {
+        let bridge = crate::idp::tests::test_bridge();
+        let idp = bridge.idp.clone().unwrap();
+        let sid = bridge.store.idp_create_session(Some("dan.bsky.social"), "did:plc:old", 12).unwrap();
+        bridge.store.idp_upsert_pin("dan.bsky.social", "did:plc:old", Utc::now()).unwrap();
+        // The public binding now answers a NEW DID.
+        idp.resolve_cache.put(resolve::Resolved {
+            handle: "dan.bsky.social".into(),
+            did: "did:plc:new".into(),
+            pds: "https://pds.example".into(),
+            resolved_at: Utc::now(),
+        });
+        let server =
+            axum_test::TestServer::new(crate::BridgeState::router_from(bridge.clone())).unwrap();
+
+        let resp = server
+            .post("/idp/attest")
+            .add_header(header::COOKIE, format!("{SESSION_COOKIE}={sid}").parse::<axum::http::HeaderValue>().unwrap())
+            .await;
+        // Forbidden before the pin machinery even runs: resolved != session.
+        assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    /// The claim page ships its allowlist server-side, like the
+    /// device-authorize page — no placeholder may survive into a browser.
+    #[tokio::test]
+    async fn the_claim_page_carries_the_server_side_allowlist() {
+        let server = axum_test::TestServer::new(crate::BridgeState::router_from(
+            crate::idp::tests::test_bridge(),
+        ))
+        .unwrap();
+        let resp = server.get("/idp/claim").await;
+        resp.assert_status_ok();
+        let page = resp.text();
+        assert!(page.contains(r#"TRUSTED_ORIGINS = ["https://broker.invalid"]"#));
+        assert!(!page.contains(TRUSTED_ORIGINS_TOKEN));
+        assert!(page.contains("TRUSTED_ORIGINS.indexOf(returnOrigin) === -1"));
+    }
+
+    #[test]
+    fn broker_audience_is_the_hostport() {
+        assert_eq!(broker_audience("https://browserid.me"), "browserid.me");
+        assert_eq!(broker_audience("http://localhost:3000/"), "localhost:3000");
+        assert_eq!(broker_audience("https://broker.example/path?q=1"), "broker.example");
     }
 
     /// The broker's hierarchy check: absence, malformed input, and
@@ -645,6 +841,7 @@ mod tests {
             code_verifier: "v".into(),
             dpop_secret: "s".into(),
             retire: false,
+            return_page: "device-authorize".into(),
             browser_binding: "bind-1".into(),
             expires_at: Utc::now() + Duration::minutes(15),
         };
@@ -659,13 +856,13 @@ mod tests {
         // No cookie at all — the attacker's browser never visited
         // /idp/oauth/start.
         state.store.idp_put_oauth_flow(&flow("st-a")).unwrap();
-        let e = callback_inner(&state, &st, &HeaderMap::new(), query("st-a")).await.unwrap_err();
+        let e = callback_inner(&state, &st, &HeaderMap::new(), query("st-a"), &mut String::new()).await.unwrap_err();
         assert!(e.to_string().contains("did not start in this browser"), "{e}");
 
         // A cookie that does not match the flow's binding.
         state.store.idp_put_oauth_flow(&flow("st-b")).unwrap();
         let wrong = headers_with(&format!("{FLOW_COOKIE}=bind-2"));
-        let e = callback_inner(&state, &st, &wrong, query("st-b")).await.unwrap_err();
+        let e = callback_inner(&state, &st, &wrong, query("st-b"), &mut String::new()).await.unwrap_err();
         assert!(e.to_string().contains("did not start in this browser"), "{e}");
 
         // The matching cookie gets past the binding check — it then fails at
@@ -673,7 +870,7 @@ mod tests {
         // is proof the binding was not what stopped it.
         state.store.idp_put_oauth_flow(&flow("st-c")).unwrap();
         let right = headers_with(&format!("{FLOW_COOKIE}=bind-1"));
-        let e = callback_inner(&state, &st, &right, query("st-c")).await.unwrap_err();
+        let e = callback_inner(&state, &st, &right, query("st-c"), &mut String::new()).await.unwrap_err();
         assert!(!e.to_string().contains("did not start in this browser"), "{e}");
     }
 
@@ -694,6 +891,7 @@ mod tests {
                 code_verifier: "v".into(),
                 dpop_secret: "s".into(),
                 retire: false,
+                return_page: "device-authorize".into(),
                 browser_binding: String::new(),
                 expires_at: Utc::now() + Duration::minutes(15),
             })
@@ -706,7 +904,7 @@ mod tests {
             error: None,
             error_description: None,
         };
-        let e = callback_inner(&state, &st, &headers, q).await.unwrap_err();
+        let e = callback_inner(&state, &st, &headers, q, &mut String::new()).await.unwrap_err();
         assert!(e.to_string().contains("did not start in this browser"), "{e}");
     }
 
