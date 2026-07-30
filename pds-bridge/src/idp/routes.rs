@@ -133,6 +133,60 @@ pub async fn whoami(State(state): State<S>, headers: HeaderMap) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+pub struct ResolveCheckQuery {
+    /// A domain name that may or may not be an atproto handle.
+    pub domain: String,
+}
+
+#[derive(Serialize)]
+pub struct ResolveCheckResp {
+    /// Whether the domain is a currently-valid handle binding (both
+    /// resolution methods consulted, bidirectional `alsoKnownAs` check
+    /// passed).
+    pub valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub did: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// `GET /idp/resolve` — the broker's presence check for the authority
+/// hierarchy: is this domain a resolved atproto handle binding, right now?
+///
+/// The answer is deliberately binary. An outage looks the same as absence
+/// (`valid: false`), because the hierarchy routes on *current* state — a
+/// handle we cannot resolve right now is not a binding the broker may rely
+/// on, and the caller falls through to the MX step. The resolve cache (and
+/// its bounded stale-on-outage fallback) smooths short outages for handles
+/// we have seen recently.
+///
+/// This endpoint serves the broker as a trusted internal component of the
+/// browserid.me fallback; everything it reports is public atproto state.
+pub async fn resolve_check(
+    State(state): State<S>,
+    Query(q): Query<ResolveCheckQuery>,
+) -> Result<Response, IdpError> {
+    let st = super::require_idp(&state)?;
+    let resp = match resolve::resolve_for_assurance(st, &state.http, &q.domain, true).await {
+        Ok(r) => ResolveCheckResp {
+            valid: true,
+            handle: Some(r.handle),
+            did: Some(r.did),
+            reason: None,
+        },
+        Err(e) => ResolveCheckResp {
+            valid: false,
+            handle: None,
+            did: None,
+            reason: Some(e.to_string()),
+        },
+    };
+    Ok(Json(resp).into_response())
+}
+
 /// `POST /idp/logout` — end the session and clear the cookie.
 pub async fn logout(State(state): State<S>, headers: HeaderMap) -> Response {
     let Ok(st) = super::require_idp(&state) else {
@@ -476,6 +530,32 @@ mod tests {
             })
             .unwrap();
         assert!(store.idp_take_oauth_flow("old").unwrap().is_none());
+    }
+
+    /// The broker's hierarchy check: absence, malformed input, and
+    /// an unresolvable handle all read as `valid: false` — the binary
+    /// answer the claim-routing rule needs — while a missing IdP is 404 so
+    /// a broker misconfigured against an IdP-less bridge fails loudly
+    /// rather than reading every domain as "not a handle".
+    #[tokio::test]
+    async fn resolve_check_answers_binary() {
+        let server = axum_test::TestServer::new(crate::BridgeState::router_from(
+            crate::idp::tests::test_bridge(),
+        ))
+        .unwrap();
+
+        // Not a domain at all.
+        let resp = server.get("/idp/resolve").add_query_param("domain", "dan").await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["valid"], false);
+
+        // Domain-shaped but unresolvable (the test state's DoH endpoint is
+        // .invalid and no well-known answers): still a clean false.
+        let resp =
+            server.get("/idp/resolve").add_query_param("domain", "nosuch.handle.invalid").await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>()["valid"], false);
     }
 
     /// Finding #1. The page must learn its allowlist from the server, and

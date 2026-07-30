@@ -326,6 +326,7 @@ pub fn routes(router: axum::Router<Arc<crate::BridgeState>>) -> axum::Router<Arc
         .route("/idp/oauth/start", post(routes::oauth_start))
         .route("/idp/oauth/callback", get(routes::oauth_callback))
         .route("/idp/whoami", get(routes::whoami))
+        .route("/idp/resolve", get(routes::resolve_check))
         .route("/idp/logout", post(routes::logout))
         .route("/idp/retire", post(routes::retire_binding))
         .route("/idp/device_cert", post(certs::device_cert))
@@ -386,7 +387,12 @@ pub(crate) mod tests {
         let state = Arc::new(crate::BridgeState { idp: None, idp_verifier: None, ..unwrap_state(state) });
         let server = axum_test::TestServer::new(crate::BridgeState::router_from(state)).unwrap();
 
-        for path in ["/.well-known/browserid", "/.well-known/browserid-status", "/idp/device-authorize"] {
+        for path in [
+            "/.well-known/browserid",
+            "/.well-known/browserid-status",
+            "/idp/device-authorize",
+            "/idp/resolve?domain=dan.bsky.social",
+        ] {
             assert_eq!(server.get(path).await.status_code(), StatusCode::NOT_FOUND, "{path}");
         }
         // The mint's preflight is gated too, so an IdP-less origin does not
