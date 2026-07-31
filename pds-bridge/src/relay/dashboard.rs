@@ -1172,7 +1172,8 @@ mod tests {
         let page = render_dashboard("https://broker.example/", "bsky.browserid.test", "at.browserid.test");
         assert!(page.contains(r#"src="https://broker.example/include.js""#));
         assert!(page.contains(r#"href="https://broker.example/account""#));
-        assert!(page.contains("your-handle@bsky.browserid.test"));
+        // The native identity shape: the preview teaches me@<handle>.
+        assert!(page.contains("me@your-handle"));
         // The directed-login machinery is present: the handle box, the JS
         // domain constant that builds the identity, and the provisionEmail
         // request.
