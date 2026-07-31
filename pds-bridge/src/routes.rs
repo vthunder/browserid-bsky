@@ -1015,13 +1015,19 @@ fn relay_did_for_grantor(state: &BridgeState, grantor: &str) -> Option<String> {
     let idp = state.idp.as_ref()?;
     let relay = state.relay.as_ref()?;
     let (local, domain) = grantor.rsplit_once('@')?;
-    if !domain.eq_ignore_ascii_case(&idp.domain) {
-        return None;
-    }
-    // `<handle>+tag@D` agent sub-identities resolve to the same handle; a
-    // warrant's grantor is the root identity, but strip a tag defensively so
-    // the lookup can never miss and silently fall back to the bridge.
-    let handle = local.split('+').next()?.to_ascii_lowercase();
+    // Two identity shapes name a Bluesky account (browserid-ng-tsqk):
+    //   legacy `<handle>@<D>` — bridge-minted; the handle is the LOCAL part
+    //     (strip a `+tag` agent sub-address defensively so the lookup can
+    //     never miss and silently fall back to the bridge);
+    //   native `<label>@<handle>` — e.g. me@dan.bsky.social; the handle is
+    //     the DOMAIN and every label belongs to the handle owner.
+    // A non-handle domain (someone@gmail.com) simply has no pin and falls
+    // through to the bridge-account backend as before.
+    let handle = if domain.eq_ignore_ascii_case(&idp.domain) {
+        local.split('+').next()?.to_ascii_lowercase()
+    } else {
+        domain.to_ascii_lowercase()
+    };
     let pin = state.store.idp_pin(&handle).ok().flatten()?;
     if pin.suspended {
         return None;
@@ -1705,6 +1711,29 @@ mod backend_tests {
         state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
         insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
         assert_eq!(relay_did_for_grantor(&state, grantor).as_deref(), Some("did:plc:real"));
+    }
+
+    /// The native handle-identity shape (browserid-ng-tsqk): the handle is
+    /// the grantor's DOMAIN, and every label at it belongs to the handle
+    /// owner — me@, an agent label, anything. A non-handle domain has no pin
+    /// and falls through to the bridge-account backend.
+    #[test]
+    fn token_exchange_binds_a_native_handle_grantor_by_domain() {
+        let state = crate::relay::routes::tests::bridge_with_relay("dan.bsky.social");
+        state.store.idp_upsert_pin("dan.bsky.social", "did:plc:real", Utc::now()).unwrap();
+        insert_live_session(&state, "dan.bsky.social", "did:plc:real", "https://shard.example");
+
+        assert_eq!(
+            relay_did_for_grantor(&state, "me@dan.bsky.social").as_deref(),
+            Some("did:plc:real")
+        );
+        // Any label — the handle-proven domain covers them all.
+        assert_eq!(
+            relay_did_for_grantor(&state, "me+claude@dan.bsky.social").as_deref(),
+            Some("did:plc:real")
+        );
+        // Not a handle we hold a session for: fall through to the bridge.
+        assert!(relay_did_for_grantor(&state, "someone@gmail.com").is_none());
     }
 }
 
