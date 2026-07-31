@@ -89,9 +89,9 @@ __BASE_CSS__
           <button id="signin" type="submit" class="btn btn-gold">Sign in</button>
         </div>
       </form>
-      <p class="micro" style="margin:10px 0 0">We sign you in as
-        <code id="identitypreview">your-handle@__IDP_DOMAIN__</code>. If you have
-        not claimed the handle yet, the dialog walks you through proving it.</p>
+      <p class="micro" style="margin:10px 0 0">Your browserid is an address at your
+        handle — you sign in as <code id="identitypreview">me@your-handle</code>.
+        If you have not claimed it yet, the dialog walks you through proving it.</p>
       <div class="signin-alt"><a href="#" id="anyemail" class="goldlink">or sign in with any email</a>
         <span class="micro">— no Bluesky handle needed; create one here after.</span></div>
     </div>
@@ -438,7 +438,7 @@ __BASE_CSS__
   // Live preview of the identity the handle box will sign in as.
   $('handle').addEventListener('input', function () {
     var h = normalizeHandle($('handle').value);
-    $('identitypreview').textContent = (h || 'your-handle') + '@' + IDP_DOMAIN;
+    $('identitypreview').textContent = 'me@' + (h || 'your-handle');
   });
 
   // Primary: a DIRECTED request. provisionEmail drives the dialog straight
@@ -450,7 +450,7 @@ __BASE_CSS__
     err.textContent = '';
     var h = normalizeHandle($('handle').value);
     if (!h) { err.textContent = 'Type your Bluesky handle first.'; return; }
-    expected = h + '@' + IDP_DOMAIN;
+    expected = 'me@' + h;
     navigator.id.request({
       siteName: 'Bluesky delegation dashboard',
       provisionEmail: expected,

@@ -221,24 +221,37 @@ pub async fn login(
 
     // A handle identity carries the DID pinned for it; an email identity
     // carries neither — its session manages the mint card and its warrants.
-    let (handle, did) = match identity.strip_suffix(&format!("@{}", idp.domain)) {
-        Some(h) => {
-            let handle = h.to_ascii_lowercase();
-            // The pin is the authority on which account this identity is.
-            // No pin, no session: a handle session's whole point is the DID
-            // behind it.
-            let pin = state
-                .store
-                .idp_pin(&handle)?
-                .ok_or_else(|| IdpError::BadRequest(format!("{handle} has no pinned account")))?;
-            if pin.suspended {
+    let (handle, did) = if let Some(h) = identity.strip_suffix(&format!("@{}", idp.domain)) {
+        // Legacy bridge-minted shape: the handle is the local part. The pin
+        // is the authority on which account this identity is. No pin, no
+        // session: this shape's whole point is the DID behind it.
+        let handle = h.to_ascii_lowercase();
+        let pin = state
+            .store
+            .idp_pin(&handle)?
+            .ok_or_else(|| IdpError::BadRequest(format!("{handle} has no pinned account")))?;
+        if pin.suspended {
+            return Err(IdpError::BindingSuspended(format!(
+                "the binding for {handle} is suspended; sign in again once it is re-verified"
+            )));
+        }
+        (Some(handle), Some(pin.did))
+    } else if let Some((_, domain)) = identity.rsplit_once('@') {
+        // Native handle-identity shape (browserid-ng-tsqk): the handle IS
+        // the domain, pinned by the broker's claim hop. A domain with no
+        // pin here is an ordinary email identity — mint card + warrants.
+        let handle = domain.to_ascii_lowercase();
+        match state.store.idp_pin(&handle)? {
+            Some(pin) if pin.suspended => {
                 return Err(IdpError::BindingSuspended(format!(
                     "the binding for {handle} is suspended; sign in again once it is re-verified"
                 )));
             }
-            (Some(handle), Some(pin.did))
+            Some(pin) => (Some(handle), Some(pin.did)),
+            None => (None, None),
         }
-        None => (None, None),
+    } else {
+        (None, None)
     };
 
     let sid = state.store.dashboard_create_session(
