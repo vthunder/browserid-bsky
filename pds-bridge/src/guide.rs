@@ -19,8 +19,10 @@ pub fn agent_prompt(origin: &str) -> String {
 /// The instructions. `origin` is this deployment's public base URL.
 pub fn guide_markdown(origin: &str, handle_domain: &str) -> String {
     let agent_prompt = agent_prompt(origin);
-    // The IdP identity domain — a Bluesky handle claimed here reads as
-    // `<handle>@<idp_domain>` (e.g. dan.bsky.social@bsky.browserid.me).
+    // The IdP's own domain. Since browserid-ng-tsqk a brought Bluesky
+    // handle is a NATIVE identity, `me@<handle>` — the handle sits in the
+    // domain position. `idp_domain` survives only for the legacy-shape note
+    // (`<handle>@<idp_domain>` identities claimed before the flip).
     let idp_domain = origin
         .trim_start_matches("https://")
         .trim_start_matches("http://");
@@ -69,19 +71,23 @@ rather than to us.
    and lasting, so settle it before you request anything. The deciding
    question: **do they have a Bluesky account?**
 
-   - **They do.** Their real handle becomes the authority. Ask for it (say,
-     `dan.bsky.social`), then pin the grantor to **that handle _at this
-     service_** — literally `dan.bsky.social@{idp_domain}`. **This is NOT
-     their email.** A brought Bluesky handle is its own identity here; do not
-     substitute a personal email address (`dan@example.com`) — that is a
-     different person as far as the badge is concerned, and it is only the
-     mint branch below. Every post then reads *on behalf of @<handle>* — their
-     name, with their followers behind it, not a throwaway identity. At the
-     approval step they **sign in with their Bluesky handle** (an atproto
-     login — no email, nothing to create here first). Be straight with them
-     about what this is today: the *authority* is their real handle, but the
-     posts land on a new verified account you open here (step 3), not yet on
-     their own timeline.
+   - **They do.** Their handle IS their browserid: the grantor is
+     `me@<their handle>` — literally `me@dan.bsky.social`. A Bluesky handle
+     is a domain name, so it sits where an email's domain sits, and `me` is
+     the label for a person's own identity. **Do not substitute a personal
+     email address** (`dan@example.com`) — that is a different person as far
+     as the badge is concerned, and it is only the mint branch below — **and
+     never pin the bare handle**: `dan.bsky.social` alone is how ownership
+     gets *proven*, not the identity. Every post then reads *on behalf of
+     @<handle>* — their name, with their followers behind it, not a
+     throwaway identity. At the approval step they **prove the handle with a
+     Bluesky sign-in** (an atproto login — no email, nothing to create here
+     first). Best of all: if they **connect write access** at
+     `{origin}/dashboard`, your posts land on their real timeline (step 2
+     tells you which); otherwise on a new verified account you open here
+     (step 3). (Identities claimed earlier in the legacy
+     `<handle>@{idp_domain}` shape still work; new grants use
+     `me@<handle>`.)
    - **They don't, or would rather not use it.** Fall back to a browserid
      email — **any address works, no account here first.** Two shapes, and
      they read differently in public; agree which before requesting.
@@ -99,8 +105,8 @@ rather than to us.
    to their real Bluesky account (step 2) never needs it, and asking for a
    permission you will not use is worse consent, not better. With the
    **grantor pinned** to what you agreed — a brought Bluesky handle as
-   `<handle>@{idp_domain}` (e.g. `dan.bsky.social@{idp_domain}`, never a
-   personal email), a mint-branch email, or `"self"`. Pinning makes the approval
+   `me@<handle>` (e.g. `me@dan.bsky.social` — never a personal email, never
+   the bare handle), a mint-branch email, or `"self"`. Pinning makes the approval
    a plain approve/deny, so the human can't land on the wrong shape by
    accident. You do NOT need them to hand you their own identity;
    `account:create` is what authorizes a delegate to open the account.
@@ -240,7 +246,7 @@ relay path; it would mint an account nobody asked for.
 
 ```sh
 npx -y @browserid-ng/bsky setup <label>                              # open <label>.{handle_domain}
-npx -y @browserid-ng/bsky setup <label> --for dan.bsky.social@{idp_domain}  # on behalf of a Bluesky handle
+npx -y @browserid-ng/bsky setup <label> --for me@dan.bsky.social     # on behalf of a Bluesky handle
 npx -y @browserid-ng/bsky setup <label> --for self                   # as the agent itself
 ```
 
@@ -496,8 +502,9 @@ mod tests {
         let md = guide_markdown("https://bsky.browserid.me", "at.browserid.me");
         for needle in [
             "do they have a Bluesky account",       // the fork
-            "@bsky.browserid.me",                    // handle identity as grantor
-            "sign in with their Bluesky handle",     // how the handle path is approved
+            "me@dan.bsky.social",                    // NATIVE handle identity as grantor
+            "never pin the bare handle",             // identity is the address, not the handle
+            "prove the handle with a",               // how the handle path is approved (wraps)
             "As yourself",                           // email shape
             "On behalf",                             // email shape
             "409",                                   // returning-human note
