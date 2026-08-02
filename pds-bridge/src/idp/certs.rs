@@ -59,7 +59,10 @@ pub fn support_document(st: &IdpState) -> serde_json::Value {
         .with_device_authorization("/idp/device-authorize")
         // The same page serves agent mode (`#agent_email=…`), so named
         // `<handle>+<tag>` agents are supported here, not just as-you ones.
-        .with_agent_device_authorization("/idp/device-authorize");
+        .with_agent_device_authorization("/idp/device-authorize")
+        // Cross-issuer revocation (browserid-ng-ft55): a registrar's account
+        // UI may send the USER here to revoke certs we issued.
+        .with_device_revocation("/idp/revoke-device");
     serde_json::to_value(&doc).unwrap_or_else(|_| serde_json::json!({}))
 }
 

@@ -260,6 +260,58 @@ fn broker_audience(broker_url: &str) -> String {
     rest.split(['/', '?', '#']).next().unwrap_or(rest).to_string()
 }
 
+/// `GET /idp/revoke-device` — the cross-issuer revocation page a
+/// registrar's account UI opens (browserid-ng-ft55). Same serve-time
+/// allowlist injection as the other first-party pages.
+pub async fn revoke_device_page(State(state): State<S>) -> Response {
+    let Ok(st) = super::require_idp(&state) else {
+        return IdpError::NotConfigured.into_response();
+    };
+    let json = serde_json::to_string(&st.trusted_origins).unwrap_or_else(|_| "[]".into());
+    Html(include_str!("revoke-device.html").replace(TRUSTED_ORIGINS_TOKEN, &json)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RevokeDeviceReq {
+    /// The identity whose certs die: `<handle>@<D>` (agent sub-identities
+    /// of the same handle are included — status granularity is per handle).
+    pub identity: String,
+}
+
+/// `POST /idp/revoke_device` — flip the status bits for the session's
+/// handle. The AUTHORITY here is the first-party session: the user just
+/// proved the handle with a Bluesky sign-in, and may only revoke their own.
+/// The registrar that sent them here has no say — by design.
+pub async fn revoke_device(
+    State(state): State<S>,
+    headers: HeaderMap,
+    Json(req): Json<RevokeDeviceReq>,
+) -> Result<Response, IdpError> {
+    let st = super::require_idp(&state)?;
+    let session = require_session(&state, &headers)?;
+    let session_handle = session
+        .handle
+        .ok_or_else(|| IdpError::BadRequest("this session holds no handle".into()))?;
+
+    let identity = req.identity.to_lowercase();
+    let (local, domain) = identity
+        .rsplit_once('@')
+        .ok_or_else(|| IdpError::BadRequest(format!("invalid identity: {identity}")))?;
+    if !domain.eq_ignore_ascii_case(&st.domain) {
+        return Err(IdpError::BadRequest(format!(
+            "{identity} was not issued here — its certs are not ours to revoke"
+        )));
+    }
+    let handle = local.split('+').next().unwrap_or(local);
+    if !handle.eq_ignore_ascii_case(&session_handle) {
+        return Err(IdpError::Forbidden);
+    }
+
+    let revoked = state.store.idp_revoke_status_for_handle(&session_handle)?;
+    tracing::info!(handle = %session_handle, revoked, "user-initiated device revocation (cross-issuer page)");
+    Ok(Json(serde_json::json!({ "revoked": revoked, "handle": session_handle })).into_response())
+}
+
 /// `POST /idp/logout` — end the session and clear the cookie.
 pub async fn logout(State(state): State<S>, headers: HeaderMap) -> Response {
     let Ok(st) = super::require_idp(&state) else {
@@ -295,7 +347,7 @@ pub struct OauthStartReq {
 /// attestation hop. The value is stored on the flow at start time and
 /// interpolated into a redirect path, so the allowlist is what keeps it
 /// from becoming an open-redirect (or header-injection) vector.
-const RETURN_PAGES: [&str; 2] = ["device-authorize", "claim"];
+const RETURN_PAGES: [&str; 3] = ["device-authorize", "claim", "revoke-device"];
 
 #[derive(Serialize)]
 pub struct OauthStartResp {
@@ -703,6 +755,57 @@ mod tests {
             .await;
         // Forbidden before the pin machinery even runs: resolved != session.
         assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    /// Cross-issuer revocation (browserid-ng-ft55): the endpoint's
+    /// authority is the first-party session, scoped to the session's own
+    /// handle — a registrar can send the user here but can never revoke by
+    /// itself, and one user can never revoke another's certs.
+    #[tokio::test]
+    async fn revoke_device_is_session_scoped_and_flips_the_status_list() {
+        let bridge = crate::idp::tests::test_bridge();
+        let identity = "dan.bsky.social@bsky.browserid.test";
+        // Allocate status slots the way issuance does: one for the identity,
+        // one for an agent sub-identity, one for a bystander.
+        let own = bridge.store.idp_status_idx(identity).unwrap();
+        let agent = bridge.store.idp_status_idx("dan.bsky.social+poster@bsky.browserid.test").unwrap();
+        let other = bridge.store.idp_status_idx("alice.bsky.social@bsky.browserid.test").unwrap();
+        let sid = bridge.store.idp_create_session(Some("dan.bsky.social"), "did:plc:dan", 12).unwrap();
+        let server =
+            axum_test::TestServer::new(crate::BridgeState::router_from(bridge.clone())).unwrap();
+        let cookie = format!("{SESSION_COOKIE}={sid}").parse::<axum::http::HeaderValue>().unwrap();
+
+        // No session → 401.
+        let resp = server.post("/idp/revoke_device").json(&serde_json::json!({ "identity": identity })).await;
+        assert_eq!(resp.status_code(), StatusCode::UNAUTHORIZED);
+
+        // Someone else's identity → 403, nothing flipped.
+        let resp = server
+            .post("/idp/revoke_device")
+            .add_header(header::COOKIE, cookie.clone())
+            .json(&serde_json::json!({ "identity": "alice.bsky.social@bsky.browserid.test" }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::FORBIDDEN);
+
+        // An identity we did not issue → 400.
+        let resp = server
+            .post("/idp/revoke_device")
+            .add_header(header::COOKIE, cookie.clone())
+            .json(&serde_json::json!({ "identity": "me@dan.bsky.social" }))
+            .await;
+        assert_eq!(resp.status_code(), StatusCode::BAD_REQUEST);
+
+        // The session's own identity: revokes it AND its agent sub-identities,
+        // never the bystander.
+        let resp = server
+            .post("/idp/revoke_device")
+            .add_header(header::COOKIE, cookie)
+            .json(&serde_json::json!({ "identity": identity }))
+            .await;
+        resp.assert_status_ok();
+        let (revoked, _max) = bridge.store.idp_revoked_status_indices().unwrap();
+        assert!(revoked.contains(&own) && revoked.contains(&agent));
+        assert!(!revoked.contains(&other));
     }
 
     /// The claim page ships its allowlist server-side, like the

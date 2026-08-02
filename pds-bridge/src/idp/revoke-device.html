@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Revoke access — bsky.browserid.me</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font: 16px/1.6 system-ui, -apple-system, sans-serif; max-width: 26rem;
+      margin: 4rem auto; padding: 0 1.25rem; text-align: center; }
+    h1 { font-size: 1.3rem; }
+    .muted { opacity: .65; }
+    .err { color: #c53030; }
+    .warn { background: rgba(197,48,48,.08); border: 1px solid rgba(197,48,48,.35);
+      border-radius: 10px; padding: 14px 16px; text-align: left; font-size: .95rem; }
+    button { margin-top: .9rem; padding: .6rem 1.2rem; font: inherit; border-radius: 6px;
+      border: 1px solid rgba(127,127,127,.5); background: transparent; color: inherit; cursor: pointer; }
+    #confirm { border-color: #c53030; color: #c53030; font-weight: 600; }
+    .spinner { width: 28px; height: 28px; margin: 1.5rem auto; border: 3px solid rgba(127,127,127,.3);
+      border-top-color: currentColor; border-radius: 50%; animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Revoke access</h1>
+  <div class="spinner" id="spin"></div>
+  <p id="msg" class="muted">Checking…</p>
+  <div id="ask" hidden>
+    <div class="warn" id="warntext"></div>
+    <button id="confirm" type="button">Revoke everything for this identity</button>
+    <button id="cancel" type="button">Cancel</button>
+  </div>
+
+<script>
+// Device-revocation page (cross-issuer revocation, browserid-ng-ft55).
+//
+// A registrar's account UI opens us with #identity=…&return_origin=… so the
+// USER can revoke certs THIS IdP issued. The registrar has no authority
+// here — the user re-authenticates first-party (their Bluesky sign-in), and
+// an explicit confirmation gates the flip, because our status granularity
+// is per-identity: one bit kills every cert for the handle and its agents.
+(function () {
+  'use strict';
+  var KEY = 'browserid_revoke_device';
+  var TRUSTED_ORIGINS = __TRUSTED_ORIGINS__;
+  var msg = document.getElementById('msg');
+  var spin = document.getElementById('spin');
+  var ask = document.getElementById('ask');
+
+  function fail(text) {
+    spin.style.display = 'none'; ask.hidden = true;
+    msg.className = 'err'; msg.textContent = text;
+  }
+  function working(text) {
+    spin.style.display = ''; ask.hidden = true;
+    msg.className = 'muted'; msg.textContent = text;
+  }
+
+  var frag = location.hash.length > 1 ? location.hash.slice(1) : '';
+  if (frag) {
+    var p = new URLSearchParams(frag);
+    if (p.get('identity') && p.get('return_origin')) {
+      try {
+        sessionStorage.setItem(KEY, JSON.stringify({
+          identity: p.get('identity'),
+          return_origin: p.get('return_origin'),
+          return_url: p.get('return_url') || null
+        }));
+      } catch (e) {}
+    }
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+
+  var query = new URLSearchParams(location.search);
+  var callbackError = query.get('error');
+  var cameBack = query.get('signed_in') !== null || callbackError !== null;
+  if (location.search) history.replaceState(null, '', location.pathname);
+
+  var params = null;
+  try { params = JSON.parse(sessionStorage.getItem(KEY) || 'null'); } catch (e) {}
+  if (!params) return fail('This page is opened from your browserid account page; start there.');
+
+  var returnOrigin;
+  try {
+    returnOrigin = new URL(params.return_origin).origin;
+    if (!/^https?:$/.test(new URL(returnOrigin).protocol)) throw new Error('bad scheme');
+  } catch (e) { return fail('Invalid return origin.'); }
+  if (TRUSTED_ORIGINS.indexOf(returnOrigin) === -1) {
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    return fail('This page cannot report back to ' + returnOrigin + '.');
+  }
+
+  var identity = String(params.identity).toLowerCase();
+  var at = identity.lastIndexOf('@');
+  var local = at > 0 ? identity.slice(0, at) : '';
+  var handle = local.split('+')[0];
+  if (!handle) return fail('Invalid identity: ' + identity);
+
+  function send(payload) {
+    if (params.return_url) {
+      var ok = false;
+      try { ok = new URL(params.return_url).origin === returnOrigin; } catch (e) {}
+      if (!ok) return fail('Invalid return URL.');
+      try { sessionStorage.removeItem(KEY); } catch (e) {}
+      location.replace(params.return_url + '#revoked=' + encodeURIComponent(payload.identity));
+      return;
+    }
+    if (window.opener) {
+      window.opener.postMessage(payload, returnOrigin);
+    }
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    msg.className = 'muted';
+    spin.style.display = 'none';
+    msg.textContent = 'Revoked. You can close this window.';
+    window.close();
+  }
+
+  function post(path, body) {
+    return fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(body || {})
+    }).then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); });
+  }
+
+  function offerConfirm() {
+    spin.style.display = 'none';
+    msg.className = 'muted';
+    msg.textContent = '';
+    document.getElementById('warntext').textContent =
+      'Sign ' + handle + ' out of every device and agent at this service? ' +
+      'Every certificate issued here for ' + identity + ' (and ' + handle +
+      '+… agents) stops verifying within minutes. Your Bluesky account itself is untouched; ' +
+      'you can sign in again any time.';
+    ask.hidden = false;
+  }
+
+  document.getElementById('confirm').addEventListener('click', function () {
+    working('Revoking…');
+    post('/idp/revoke_device', { identity: identity }).then(function (res) {
+      if (!res.ok) return fail((res.body && res.body.error) || 'revocation failed');
+      send({ type: 'browserid:device_revoked', identity: identity, revoked: res.body.revoked });
+    }).catch(function (e) {
+      fail('revocation failed: ' + (e && e.message ? e.message : e));
+    });
+  });
+  document.getElementById('cancel').addEventListener('click', function () {
+    try { sessionStorage.removeItem(KEY); } catch (e) {}
+    window.close();
+    fail('Cancelled — nothing was revoked.');
+  });
+
+  function startOauth() {
+    working('Sign in with Bluesky to continue…');
+    post('/idp/oauth/start', { identifier: handle, return_page: 'revoke-device' }).then(function (res) {
+      if (!res.ok || !res.body.authorize_url) {
+        return fail((res.body && res.body.error) || 'could not start Bluesky sign-in');
+      }
+      location.href = res.body.authorize_url;
+    }).catch(function (e) {
+      fail('could not start Bluesky sign-in: ' + (e && e.message ? e.message : e));
+    });
+  }
+
+  if (callbackError) return fail('Bluesky sign-in failed: ' + callbackError);
+
+  working('Checking…');
+  fetch('/idp/whoami', { credentials: 'same-origin', headers: { accept: 'application/json' } })
+    .then(function (r) { return r.json(); })
+    .then(function (who) {
+      if (who && who.authenticated && String(who.handle || '').toLowerCase() === handle) {
+        return offerConfirm();
+      }
+      if (cameBack) return fail('Bluesky sign-in did not complete for ' + handle);
+      startOauth();
+    })
+    .catch(function () {
+      if (cameBack) return fail('could not check the sign-in session');
+      startOauth();
+    });
+})();
+</script>
+</body>
+</html>
