@@ -59,5 +59,11 @@ jobs:
           chmod 600 ~/.ssh/dokku_key
           # The dokku user's forced command turns the args into a dokku
           # command; git:from-image pulls the image and releases it.
-          ssh -i ~/.ssh/dokku_key -o StrictHostKeyChecking=accept-new \
-            "dokku@$DOKKU_HOST" git:from-image bsky-bridge "$IMAGE:$GITHUB_SHA"
+          # `git:from-image` exits 1 on an unchanged image digest — a re-run of an
+          # already-released sha is a no-op, not a failure.
+          out=$(ssh -i ~/.ssh/dokku_key -o StrictHostKeyChecking=accept-new \
+            "dokku@$DOKKU_HOST" git:from-image bsky-bridge "$IMAGE:$GITHUB_SHA" 2>&1) \
+            || { echo "$out" | grep -q "No changes detected" \
+                 && echo "no-op: image digest unchanged (already deployed)" \
+                 || { echo "$out" | tail -30; exit 1; }; }
+          echo "$out" | tail -5

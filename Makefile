@@ -5,15 +5,14 @@
 #   make push             push HEAD to origin (triggers the CI image build)
 #   make watch            watch CI runs for HEAD until they all finish
 #   make release          release HEAD's bridge image to dokku
-#   make deploy           push + watch + release
+#   make deploy           push + watch (CI releases the images itself)
 #
 # Deploy model: CI builds the pds-bridge image (.github/workflows/
-# deploy-bridge.yml → ghcr.io/vthunder/browserid-bsky/pds-bridge); the app
-# (`bsky-bridge`) runs on the browserid.me dokku host, released by
-# `git:from-image` via the mini-ops key. (The workflow's own ssh step targets
-# the stale DOKKU_HOST=sandmill.org repo var — the apps moved; releasing from
-# here is the working path, same as browserid-ng.) The `bsky-pds` app is the
-# upstream PDS image, managed directly in dokku — not deployed from this repo.
+# deploy-bridge.yml → ghcr.io/vthunder/browserid-bsky/pds-bridge) and releases
+# it itself (browserid-bsky-ci dokku key + DOKKU_HOST=browserid.me, fixed
+# 2026-08-11). `release` is the manual fallback via the mini-ops key. The
+# `bsky-pds` app is the upstream PDS image, managed directly in dokku — not
+# deployed from this repo.
 
 SHA  := $(shell git rev-parse HEAD)
 HOST ?= dokku@browserid.me
@@ -42,4 +41,4 @@ watch:
 release-bridge: ; -$(SSH) $(HOST) git:from-image bsky-bridge $(REG)/pds-bridge:$(SHA)
 release: release-bridge
 
-deploy: push watch release
+deploy: push watch
