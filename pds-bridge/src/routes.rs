@@ -95,7 +95,7 @@ pub(crate) async fn verify_presentation(state: &S, presentation: &str) -> Result
         scopes: v["scopes"]
             .as_array()
             .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-            .unwrap_or_else(|| wc.scopes.clone()),
+            .unwrap_or_else(|| wc.scope_strings()),
         warrant_status: wc.status.clone(),
         warrant_jws: pres.warrant.encoded().to_string(),
         config_cert_jws: pres.config_cert.encoded().to_string(),

@@ -52,8 +52,8 @@ pub async fn well_known(State(state): State<S>) -> Response {
 }
 
 /// The support document as data, so it can be asserted on directly.
-pub fn support_document(st: &IdpState) -> serde_json::Value {
-    let doc = SupportDocument::new(st.keypair.public_key())
+pub fn support_document(_st: &IdpState) -> serde_json::Value {
+    let doc = SupportDocument::new()
         .with_device_cert("/idp/device_cert")
         .with_access_cert("/idp/access/mint")
         .with_device_authorization("/idp/device-authorize")
@@ -472,10 +472,11 @@ mod tests {
         // Named `<handle>+<tag>` agents need the agent mode advertised, or
         // the broker will not offer to provision one.
         assert_eq!(doc["agent-device-authorization"], "/idp/device-authorize");
-        // The published key is advisory (DNSSEC is the trust root) but must
-        // still be the key we actually sign with, or nothing verifies.
+        // The document must carry NO key (2026-08-25 sweep): the _browserid
+        // DNSSEC record is the sole root of trust, and a TLS-served key is a
+        // downgrade vector for any verifier that reads it.
         let parsed: SupportDocument = serde_json::from_value(doc).unwrap();
-        assert_eq!(parsed.public_key.unwrap(), st.keypair.public_key());
+        assert!(parsed.public_key.is_none(), "support document must not serve a key");
     }
 
     const DOMAIN: &str = "bsky.browserid.test";

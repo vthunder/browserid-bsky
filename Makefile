@@ -33,6 +33,9 @@ push:
 # gh's --commit filter needs the FULL sha — a short sha silently matches nothing.
 watch:
 	@echo "Watching CI for $(SHA)…"
+	@# Runs take a few seconds to register after a push — wait for them to
+	@# APPEAR before waiting for them to finish, or this exits instantly.
+	@until gh run list --commit $(SHA) --json status -q '.[].status' | grep -q .; do sleep 5; done
 	@while gh run list --commit $(SHA) --json status -q '.[].status' \
 	    | grep -qE 'in_progress|queued|requested|waiting'; do sleep 15; done
 	@gh run list --commit $(SHA)
