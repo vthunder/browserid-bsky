@@ -804,7 +804,7 @@ async fn fully_verified(state: &S, did: &str, rkey: &str) -> Option<(String, Str
     if w.audience != state.origin || Utc::now().timestamp() >= w.exp {
         return None;
     }
-    match fetch_well_known_key(state, &cc.claims().iss).await {
+    match resolve_issuer_key(state, &cc.claims().iss).await {
         Some(k) if cc.verify(&k).is_ok() => {}
         _ => return None,
     }
@@ -822,7 +822,7 @@ async fn fully_verified(state: &S, did: &str, rkey: &str) -> Option<(String, Str
     let post = get_record(state, &pds, did, "app.bsky.feed.post", rkey).await;
     let (Some(cl), Some(a), Some(rec)) = (claims, acc, post) else { return None };
     let ac = a.claims();
-    let idp_ok = matches!(fetch_well_known_key(state, &ac.iss).await, Some(k) if a.verify(&k).is_ok());
+    let idp_ok = matches!(resolve_issuer_key(state, &ac.iss).await, Some(k) if a.verify(&k).is_ok());
     let ok = cl.verify(&ac.access_key, sig)
         && ac.identity == *grantee
         && cl.content_hash == crate::attestation::content_hash(&rec)
@@ -1128,7 +1128,7 @@ pub async fn attributed_post(
     }
     // Chain the access cert to its IdP (advisory well-known; the authoritative
     // DNSSEC check happens at token exchange via the hosted verifier).
-    match fetch_well_known_key(&state, &ac.iss).await {
+    match resolve_issuer_key(&state, &ac.iss).await {
         Some(k) if access_cert.verify(&k).is_ok() => {}
         _ => return err(StatusCode::FORBIDDEN, "invalid_grant", "access cert not verifiable to its IdP"),
     }
@@ -1957,7 +1957,7 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
     // authoritative DNSSEC-rooted check runs at post time via the hosted
     // verifier — stated in the receipt).
     let iss = cc.claims().iss.clone();
-    let idp_key = fetch_well_known_key(&state, &iss).await;
+    let idp_key = resolve_issuer_key(&state, &iss).await;
 
     let mut checks = serde_json::Map::new();
     let mut ok = true;
@@ -1993,7 +1993,7 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
                 let acc_claims = acc.claims();
                 check("attestation_signed_by_grantee", cl.verify(&acc.claims().access_key, sig), &mut checks, &mut att_ok);
                 check("access_cert_is_grantee", acc_claims.identity == grantee, &mut checks, &mut att_ok);
-                let idp2 = fetch_well_known_key(&state, &acc_claims.iss).await;
+                let idp2 = resolve_issuer_key(&state, &acc_claims.iss).await;
                 check("access_cert_signed_by_idp", idp2.map(|k| acc.verify(&k).is_ok()).unwrap_or(false), &mut checks, &mut att_ok);
                 check("content_hash_matches_post", cl.content_hash == crate::attestation::content_hash(rec), &mut checks, &mut att_ok);
                 check("attestation_within_cert_validity", cl.iat < acc_claims.exp, &mut checks, &mut att_ok);
@@ -2051,19 +2051,13 @@ pub async fn verify(State(state): State<S>, axum::extract::Query(q): axum::extra
     }
 }
 
-async fn fetch_well_known_key(state: &S, domain: &str) -> Option<browserid_core::PublicKey> {
-    let doc: browserid_core::discovery::SupportDocument = state
-        .http
-        .get(format!("https://{domain}/.well-known/browserid"))
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    doc.public_key
+/// An issuer's key, from its `_browserid` DNSSEC record — the sole root of
+/// trust (2026-08-25 sweep: support documents no longer serve keys, and
+/// trusting a TLS-served key was a downgrade vector). `None` when the domain
+/// has no Secure record — verification then fails, correctly.
+async fn resolve_issuer_key(_state: &S, domain: &str) -> Option<browserid_core::PublicKey> {
+    let dns = browserid_dnssec::DnsFetcher::new().ok()?;
+    browserid_dnssec::resolve_idp_key(&dns, domain).await.ok()
 }
 
 fn esc(s: &str) -> String {
