@@ -16,6 +16,7 @@ repository = "https://github.com/vthunder/browserid-bsky"
 # `cargo update -p browserid-core -p browserid-rp`)
 browserid-core = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
 browserid-rp = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
+browserid-dnssec = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
 browserid-agent = { git = "https://github.com/vthunder/browserid-ng", branch = "main" }
 
 serde = { version = "1", features = ["derive"] }

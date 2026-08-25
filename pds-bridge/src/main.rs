@@ -34,19 +34,36 @@ async fn main() {
         .build()
         .expect("failed to build HTTP client");
 
-    // The broker's published key — verifies its signed warrant status lists
-    // for the live revocation re-check. Verification of presentations is
-    // outsourced to {broker_url}/verify-access (see lib.rs).
-    let doc: browserid_core::discovery::SupportDocument = http
-        .get(format!("{broker_url}/.well-known/browserid"))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .expect("broker unreachable")
-        .json()
-        .await
-        .expect("bad broker support document");
-    let broker_key = doc.public_key.expect("broker support document has no key");
+    // The broker's key — verifies its signed warrant status lists for the
+    // live revocation re-check. Resolved from the broker's `_browserid`
+    // DNSSEC record (the sole root of trust; 2026-08-25 sweep — support
+    // documents no longer serve keys, and reading one was a downgrade
+    // vector). Verification of presentations is outsourced to
+    // {broker_url}/verify-access (see lib.rs).
+    let broker_host = reqwest::Url::parse(&broker_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .expect("bad BROKER_URL");
+    let broker_key = if broker_host == "localhost" || broker_host.starts_with("127.") {
+        // DEV exception (localhost only, mirroring the broker's own): no
+        // DNSSEC exists for localhost, and a localhost broker can never be a
+        // production origin — its dev doc serves the key.
+        let doc: browserid_core::discovery::SupportDocument = http
+            .get(format!("{broker_url}/.well-known/browserid"))
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .expect("broker unreachable")
+            .json()
+            .await
+            .expect("bad broker support document");
+        doc.public_key.expect("dev broker support document has no key")
+    } else {
+        let dns = browserid_dnssec::DnsFetcher::new().expect("dns fetcher");
+        browserid_dnssec::resolve_idp_key(&dns, &broker_host)
+            .await
+            .expect("could not resolve the broker key from its _browserid DNSSEC record")
+    };
 
     // Labeler (optional): k256 signing key → signs labels for verified posts.
     let labeler = std::env::var("LABELER_K256_PRIVATE_KEY_HEX").ok().map(|hex| {

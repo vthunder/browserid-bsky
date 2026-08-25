@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 browserid-core = { workspace = true }
 browserid-rp = { workspace = true }
+browserid-dnssec = { workspace = true }
 
 axum = { workspace = true }
 tokio = { workspace = true }

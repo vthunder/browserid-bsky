@@ -1774,6 +1774,7 @@ dependencies = [
  "axum-test",
  "base64",
  "browserid-core",
+ "browserid-dnssec",
  "browserid-rp",
  "bs58",
  "chacha20poly1305",
