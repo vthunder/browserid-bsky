@@ -1,7 +1,7 @@
 {
   "name": "@browserid-ng/bsky",
   "version": "0.2.1",
-  "description": "Set up a Bluesky account on bsky.browserid.me and post to it with verifiable provenance — for AI agents, no compiler required.",
+  "description": "Set up a Bluesky account on bsky.browserid.me and post to it with verifiable provenance \u2014 for AI agents, no compiler required.",
   "type": "module",
   "bin": {
     "browserid-bsky": "cli.mjs"
@@ -18,5 +18,10 @@
   "dependencies": {
     "@browserid-ng/agent": "^0.3.0"
   },
-  "license": "MPL-2.0"
+  "license": "MPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vthunder/browserid-bsky.git",
+    "directory": "agent-cli"
+  }
 }
