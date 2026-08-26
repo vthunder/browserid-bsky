@@ -1,0 +1,35 @@
+# Auto-publish npm packages whose local version is ahead of the registry —
+# same model as browserid-ng (bean browserid-ng-1bqx): a content change must
+# carry a version bump (the script fails on drift), and merging the bump to
+# main IS the release, via npm OIDC trusted publishing (no tokens).
+#
+# One-time setup: @browserid-ng/bsky on npmjs.com → Settings → Trusted
+# Publisher → GitHub Actions, repo vthunder/browserid-bsky, workflow
+# publish.yml.
+name: publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "agent-cli/**"
+      - "scripts/publish-status.mjs"
+      - ".github/workflows/publish.yml"
+  workflow_dispatch: {}
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC for npm trusted publishing + --provenance
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm >= 11.5.1.
+      - run: npm install -g npm@latest
+      - name: publish packages whose local version is ahead (fails on drift)
+        run: node scripts/publish-status.mjs --publish

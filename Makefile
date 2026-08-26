@@ -19,13 +19,18 @@ HOST ?= dokku@browserid.me
 SSH  := ssh -i $(HOME)/.ssh/mini-ops -o StrictHostKeyChecking=accept-new
 REG  := ghcr.io/vthunder/browserid-bsky
 
-.PHONY: build test push watch release release-bridge deploy
+.PHONY: build test push watch release release-bridge deploy publish-status
 
 build:
 	cargo build --workspace
 
 test:
 	cargo test --workspace
+
+# Publish-state oracle for @browserid-ng/bsky (local vs npm, content diff at
+# equal versions). Same model as browserid-ng.
+publish-status:
+	node scripts/publish-status.mjs
 
 push:
 	git push origin HEAD
