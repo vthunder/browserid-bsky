@@ -823,7 +823,7 @@ mod tests {
     async fn mock_broker(email: &'static str) -> String {
         use axum::routing::post;
         let app = axum::Router::new().route(
-            "/verify-access",
+            "/verify",
             post(move || async move {
                 Json(serde_json::json!({
                     "status": "okay",

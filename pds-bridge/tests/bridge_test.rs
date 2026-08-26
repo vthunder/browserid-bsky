@@ -117,7 +117,7 @@ fn captured(cap: &Captures, collection: &str) -> Vec<Value> {
 
 /// A mock hosted verifier: runs the REAL core verification algorithm
 /// (`AccessPresentation::verify`) with the test issuer key and answers in
-/// the broker's `/verify-access` response shape — the bridge outsources
+/// the broker's `/verify` response shape — the bridge outsources
 /// verification, so the tests exercise its handling of that contract.
 async fn mock_broker(idp_pub: PublicKey) -> String {
     async fn verify_access(
@@ -150,7 +150,7 @@ async fn mock_broker(idp_pub: PublicKey) -> String {
         }
     }
     let app = axum::Router::new()
-        .route("/verify-access", post(verify_access))
+        .route("/verify", post(verify_access))
         .with_state(idp_pub);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());

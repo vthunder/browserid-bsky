@@ -39,7 +39,7 @@ async fn main() {
     // DNSSEC record (the sole root of trust; 2026-08-25 sweep — support
     // documents no longer serve keys, and reading one was a downgrade
     // vector). Verification of presentations is outsourced to
-    // {broker_url}/verify-access (see lib.rs).
+    // {broker_url}/verify (see lib.rs).
     let broker_host = reqwest::Url::parse(&broker_url)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))

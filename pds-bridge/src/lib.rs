@@ -11,7 +11,7 @@
 //!   untouched (human clients, relay crawl).
 //!
 //! Verification is **outsourced to the hosted verifier**
-//! (`POST {broker}/verify-access`) — there is exactly one verification
+//! (`POST {broker}/verify`) — there is exactly one verification
 //! algorithm and it runs where it is maintained, with real DNSSEC-rooted
 //! discovery (primaries like sandmill.org just work). The bridge keeps only
 //! a status-list *client* for live warrant-revocation re-checks on token

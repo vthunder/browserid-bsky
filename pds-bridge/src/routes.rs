@@ -42,7 +42,7 @@ pub struct Verified {
 }
 
 /// Verify a presentation by **outsourcing to the hosted verifier**
-/// (`POST {broker}/verify-access`) — one verification algorithm, running
+/// (`POST {broker}/verify`) — one verification algorithm, running
 /// where it is maintained, with real DNSSEC-rooted discovery (bean
 /// browserid-ng-kozn tracks in-process reuse of the same algorithm). The
 /// hosted response omits grantee/warrant-status (audit D2), so those claims
@@ -60,7 +60,7 @@ pub(crate) async fn verify_presentation(state: &S, presentation: &str) -> Result
 
     let resp = state
         .http
-        .post(format!("{}/verify-access", state.broker_url))
+        .post(format!("{}/verify", state.broker_url))
         .json(&serde_json::json!({ "presentation": presentation, "audience": state.origin }))
         .send()
         .await
