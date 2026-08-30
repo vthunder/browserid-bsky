@@ -122,28 +122,57 @@ pub async fn resolve_handle(
 ) -> Result<Resolved, IdpError> {
     let handle = normalize_handle(handle)?;
 
-    // Forward: both lookups in parallel, DNS authoritative on conflict.
-    let (dns, well_known) =
-        tokio::join!(dns_atproto_did(st, http, &handle), well_known_atproto_did(http, &handle));
-    let did = match (dns, well_known) {
-        (Some(d), Some(w)) => {
-            if d != w {
-                tracing::warn!(%handle, dns = %d, well_known = %w, "handle DID conflict — DNS wins");
+    // Forward: both lookups start in parallel, DNS authoritative on
+    // conflict — but the losing method must never gate the winner (k67v).
+    // DNS answers in milliseconds, while the well-known probe hangs for its
+    // full client timeout on a handle domain that serves no HTTPS at all —
+    // a large, legitimate slice of DNS-verified custom-domain handles. That
+    // stall pushed whole resolutions past the broker's 10s authority-probe
+    // budget, which read valid handles as unprovable. So: once DNS yields a
+    // DID, well-known gets only a short grace purely for the conflict
+    // warning; when DNS misses, well-known (already running, with its own
+    // cap) carries the day as before.
+    let mut wk = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            tokio::time::timeout(WELL_KNOWN_TIMEOUT, well_known_atproto_did(&handle))
+                .await
+                .ok()
+                .flatten()
+        }
+    });
+    let did = match dns_atproto_did(st, http, &handle).await {
+        Some(d) => {
+            match tokio::time::timeout(WELL_KNOWN_CONFLICT_GRACE, &mut wk).await {
+                Ok(Ok(Some(w))) if w != d => {
+                    tracing::warn!(%handle, dns = %d, well_known = %w,
+                        "handle DID conflict — DNS wins");
+                }
+                Ok(_) => {}          // agreement, no answer, or task error — nothing to say
+                Err(_) => wk.abort(), // still hanging: DNS already decided
             }
             d
         }
-        (Some(d), None) => d,
-        (None, Some(w)) => w,
-        (None, None) => {
-            return Err(IdpError::BadRequest(format!(
-                "{handle} does not resolve to an atproto account — check the handle, \
-                 or that its DNS/well-known record is published"
-            )))
-        }
+        None => match wk.await {
+            Ok(Some(w)) => w,
+            _ => {
+                return Err(IdpError::BadRequest(format!(
+                    "{handle} does not resolve to an atproto account — check the handle, \
+                     or that its DNS/well-known record is published"
+                )))
+            }
+        },
     };
 
     finish_resolution(http, handle, did).await
 }
+
+/// Cap on the well-known leg as a whole: it must fit comfortably inside the
+/// broker's 10s authority-probe budget even when it is the deciding method.
+const WELL_KNOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long a winning DNS answer waits on well-known for conflict detection
+/// only — never worth stalling resolution beyond this.
+const WELL_KNOWN_CONFLICT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve starting from a DID instead of a handle (the retirement path).
 /// The bidirectional check still applies, but rooted the other way: we read
@@ -217,7 +246,7 @@ async fn dns_atproto_did(st: &IdpState, http: &reqwest::Client, handle: &str) ->
 }
 
 /// `https://<handle>/.well-known/atproto-did` — the plain-text DID.
-async fn well_known_atproto_did(_http: &reqwest::Client, handle: &str) -> Option<String> {
+async fn well_known_atproto_did(handle: &str) -> Option<String> {
     // The handle is user-supplied, so this URL is externally named: it goes
     // through the guard, on the no-redirect client, every hop checked.
     let url = format!("https://{handle}/.well-known/atproto-did");
