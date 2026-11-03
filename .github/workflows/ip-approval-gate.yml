@@ -1,0 +1,60 @@
+# Prior-approval gate for merges to main.
+#
+# Copy of sandmill-infra/ip-approval/ip-approval-gate.yml; installed as
+# .github/workflows/ip-approval-gate.yml in each canonical repo and required
+# by branch protection on main. Every pull request to main must carry a
+# record under .approvals/ whose patch hash matches the PR's own diff and
+# which is either >= wait_days old or carries an explicit approved_at.
+# Records are written by sandmill-infra/bin/ip-submit.sh.
+name: ip-approval-gate
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: check approval record
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          records=(.approvals/*.json)
+          if [ ${#records[@]} -eq 0 ]; then
+            echo "::error::no .approvals/ record in this PR; run sandmill-infra/bin/ip-submit.sh and wait out the approval period" >&2
+            exit 1
+          fi
+          now=$(date -u +%s)
+          ok=0
+          for rec in "${records[@]}"; do
+            base=$(jq -r .base "$rec"); want=$(jq -r .patch_sha256 "$rec")
+            if ! git cat-file -e "$base^{commit}" 2>/dev/null || ! git merge-base --is-ancestor "$base" "$HEAD_SHA"; then
+              echo "$rec: base $base is not an ancestor of PR head; skipping"; continue
+            fi
+            # Keep this expression byte-identical with ip-submit.sh.
+            have=$(git diff --no-color --full-index --no-ext-diff "$base" "$HEAD_SHA" -- . ':(exclude).approvals' | sha256sum | cut -d' ' -f1)
+            if [ "$have" != "$want" ]; then
+              echo "$rec: hash mismatch (record $want, PR $have): the PR differs from what was submitted"; continue
+            fi
+            if [ "$(jq -r '.objection // empty' "$rec")" != "" ]; then
+              echo "::error::$rec: an objection is recorded: $(jq -r .objection "$rec")"; continue
+            fi
+            approved=$(jq -r '.approved_at // empty' "$rec")
+            if [ -n "$approved" ]; then
+              echo "$rec: explicitly approved at $approved"; ok=1; break
+            fi
+            sent=$(date -u -d "$(jq -r .submitted_at "$rec")" +%s)
+            wait=$(jq -r '.wait_days // 14' "$rec")
+            due=$((sent + wait*86400))
+            if [ "$now" -ge "$due" ]; then
+              echo "$rec: submitted $(jq -r .submitted_at "$rec"), $wait-day objection window elapsed"; ok=1; break
+            fi
+            echo "::error::$rec matches this PR but its objection window runs until $(date -u -d @$due +%Y-%m-%dT%H:%M:%SZ)"
+          done
+          [ "$ok" = 1 ] || { echo "::error::no valid approval record for PR head $HEAD_SHA" >&2; exit 1; }
