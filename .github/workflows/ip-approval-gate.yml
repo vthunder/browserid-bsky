@@ -13,7 +13,8 @@ on:
 permissions:
   contents: read
 jobs:
-  gate:
+  ip-approval-gate:
+    name: ip-approval-gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -22,6 +23,7 @@ jobs:
       - name: check approval record
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -38,7 +40,8 @@ jobs:
               echo "$rec: base $base is not an ancestor of PR head; skipping"; continue
             fi
             # Keep this expression byte-identical with ip-submit.sh.
-            have=$(git diff --no-color --full-index --no-ext-diff "$base" "$HEAD_SHA" -- . ':(exclude).approvals' | sha256sum | cut -d' ' -f1)
+            mb=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            have=$(git diff --no-color --full-index --no-ext-diff "$mb" "$HEAD_SHA" -- . ':(exclude).approvals' | sha256sum | cut -d' ' -f1)
             if [ "$have" != "$want" ]; then
               echo "$rec: hash mismatch (record $want, PR $have): the PR differs from what was submitted"; continue
             fi
