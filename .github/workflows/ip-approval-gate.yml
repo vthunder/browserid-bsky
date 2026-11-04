@@ -2,10 +2,11 @@
 #
 # Copy of sandmill-infra/ip-approval/ip-approval-gate.yml; installed as
 # .github/workflows/ip-approval-gate.yml in each canonical repo and required
-# by branch protection on main. Every pull request to main must carry a
-# record under .approvals/ whose patch hash matches the PR's own diff and
-# which is either >= wait_days old or carries an explicit approved_at.
-# Records are written by sandmill-infra/bin/ip-submit.sh.
+# by branch protection on main. Every pull request to main must match a
+# record in the public vthunder/ip-approvals repo (records/<project>/) whose
+# patch hash equals the PR's own diff and which is either >= wait_days old
+# or carries an explicit approved_at. Records are written by
+# sandmill-infra/bin/ip-submit.sh.
 name: ip-approval-gate
 on:
   pull_request:
@@ -20,16 +21,21 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: vthunder/ip-approvals
+          path: .ip-approvals
       - name: check approval record
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PROJECT: ${{ github.event.repository.name }}
         run: |
           set -euo pipefail
           shopt -s nullglob
-          records=(.approvals/*.json)
+          records=(.ip-approvals/records/"$PROJECT"/*.json)
           if [ ${#records[@]} -eq 0 ]; then
-            echo "::error::no .approvals/ record in this PR; run sandmill-infra/bin/ip-submit.sh and wait out the approval period" >&2
+            echo "::error::no record for $PROJECT in vthunder/ip-approvals; run sandmill-infra/bin/ip-submit.sh and wait out the approval period" >&2
             exit 1
           fi
           now=$(date -u +%s)
@@ -41,7 +47,7 @@ jobs:
             fi
             # Keep this expression byte-identical with ip-submit.sh.
             mb=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-            have=$(git diff --no-color --full-index --no-ext-diff "$mb" "$HEAD_SHA" -- . ':(exclude).approvals' | sha256sum | cut -d' ' -f1)
+            have=$(git diff --no-color --full-index --no-ext-diff "$mb" "$HEAD_SHA" | sha256sum | cut -d' ' -f1)
             if [ "$have" != "$want" ]; then
               echo "$rec: hash mismatch (record $want, PR $have): the PR differs from what was submitted"; continue
             fi
