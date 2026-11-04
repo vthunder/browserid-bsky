@@ -53,3 +53,4 @@ with `cargo update -p browserid-core -p browserid-rp`.
 ## License
 
 [MPL-2.0](./LICENSE).
+
