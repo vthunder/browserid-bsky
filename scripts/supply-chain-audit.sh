@@ -11,7 +11,7 @@
 #   node    `npm audit --omit=dev` on agent-cli (its lockfile); HIGH or
 #           CRITICAL in production deps fails unless the GHSA id is listed in
 #           .github/supply-chain/npm-ignore.txt.
-#   secrets `gitleaks git` over the full history (default rules).
+#   secrets `gitleaks git` over the full history with .gitleaks.toml.
 #
 # Tools: cargo-audit (`cargo install cargo-audit --locked`), npm, gitleaks.
 # A missing tool fails the matching section rather than silently passing.
@@ -71,7 +71,7 @@ run_node() {
 run_secrets() {
   section "gitleaks (full history)"
   command -v gitleaks >/dev/null || { echo "gitleaks not installed"; return 1; }
-  gitleaks git --no-banner --redact=90 .
+  gitleaks git . --config .gitleaks.toml --redact --no-banner
 }
 
 case "$MODE" in
