@@ -6,6 +6,8 @@
 #   make watch            watch CI runs for HEAD until they all finish
 #   make release          release HEAD's bridge image to dokku
 #   make deploy           push + watch (CI releases the images itself)
+#   make release-check    local equivalent of release-candidate.yml (summary;
+#                         non-zero on any failure or a dirty tree)
 #
 # Deploy model: CI builds the pds-bridge image (.github/workflows/
 # deploy-bridge.yml → ghcr.io/vthunder/browserid-bsky/pds-bridge) and releases
@@ -19,7 +21,7 @@ HOST ?= dokku@browserid.me
 SSH  := ssh -i $(HOME)/.ssh/mini-ops -o StrictHostKeyChecking=accept-new
 REG  := ghcr.io/vthunder/browserid-bsky
 
-.PHONY: build test push watch release release-bridge deploy publish-status
+.PHONY: build test push watch release release-bridge deploy publish-status release-check
 
 build:
 	cargo build --workspace
@@ -31,6 +33,11 @@ test:
 # equal versions). Same model as browserid-ng.
 publish-status:
 	node scripts/publish-status.mjs
+
+# The fast local loop for .github/workflows/release-candidate.yml; on the dev
+# box run it via `ssh localtest` (Gatekeeper stalls cargo test binaries).
+release-check:
+	scripts/release-check.sh
 
 push:
 	git push origin HEAD

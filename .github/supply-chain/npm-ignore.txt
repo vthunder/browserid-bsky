@@ -1,0 +1,3 @@
+# GHSA ids that scripts/supply-chain-audit.sh tolerates in production npm
+# dependencies. One id per line, first token; give a reason and a review date.
+# (none)

@@ -1,0 +1,23 @@
+# cargo-audit configuration. Read by `cargo audit` from the workspace root;
+# the gate is scripts/supply-chain-audit.sh (CI: release-candidate.yml
+# `rc / audit`; locally: `make release-check`).
+#
+# Policy: every RUSTSEC *vulnerability* fails the gate unless listed here with
+# a reason and a review date. Unsound/unmaintained/yanked *warnings* are
+# reported but do not fail. Same entries and reasons as browserid-ng's
+# .cargo/audit.toml: hickory arrives through the browserid-dnssec git crate.
+
+[advisories]
+ignore = [
+    # hickory-proto 0.25.2: NSEC3 closest-encloser proof can loop on cross-zone
+    # responses. No patched release exists (RustSec lists no fix). Reachable
+    # only through DNSSEC validation of a hostile resolver answer; the lookup
+    # already runs under a timeout. Re-check when hickory 0.26 ships stable.
+    # Review: 2027-02-01.
+    "RUSTSEC-2026-0118",
+    # hickory-proto 0.25.2: O(n^2) name compression on encode (CPU). Fixed in
+    # 0.26.1 only, a major bump of hickory-client/proto inside
+    # browserid-dnssec, not a lockfile change here. The encode side is our own
+    # queries (short names), so not attacker driven. Review: 2027-02-01.
+    "RUSTSEC-2026-0119",
+]
