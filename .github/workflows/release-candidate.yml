@@ -48,7 +48,7 @@ jobs:
           echo "Dockerfile tag $tag_v, digest RUST_VERSION $digest_v, CI rustc $have_v"
           [ "$tag_v" = "$digest_v" ] || { echo "::error::Dockerfile tag says rust $tag_v but its digest carries $digest_v"; exit 1; }
           [ "$tag_v" = "$have_v" ] || { echo "::error::Dockerfile builds with rust $tag_v, this job with $have_v"; exit 1; }
-      - name: build the tests (network allowed: crates and git deps)
+      - name: build the tests (network allowed, for crates and git deps)
         run: cargo test --workspace --locked --no-run
       - name: the namespace below really is offline
         run: |
