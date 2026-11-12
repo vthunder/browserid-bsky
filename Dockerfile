@@ -2,7 +2,10 @@
 # `git:from-image` (see .github/workflows/deploy-bridge.yml).
 
 # Stage 1: Build
-FROM rust:1.93-bookworm AS builder
+# Pinned by digest; the tag names the exact rustc the digest carries, and
+# .github/workflows/release-candidate.yml checks the CI toolchain, this tag
+# and the digest's RUST_VERSION all agree.
+FROM rust:1.93.1-bookworm@sha256:7c4ae649a84014c467d79319bbf17ce2632ae8b8be123ac2fb2ea5be46823f31 AS builder
 
 WORKDIR /build
 
@@ -28,7 +31,7 @@ RUN mkdir -p smoke/src && echo "fn main() {}" > smoke/src/main.rs && \
     cargo build --release --package pds-bridge
 
 # Stage 2: Runtime
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \

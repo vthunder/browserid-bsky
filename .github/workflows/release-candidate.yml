@@ -1,0 +1,153 @@
+# Release candidate: every check that decides a merge AND a deploy, run on
+# the exact commit (sandmill-infra/ip-approval/PLAN.md). The public staging
+# mirror runs it on every push, and sandmill-infra/bin/ip-submit.sh refuses
+# a commit unless all of these jobs passed there. The canonical repo runs
+# the identical workflow on every pull request to main, and branch
+# protection requires every job. No path filters: a job that does not run
+# is a failure, never a pass by absence.
+#
+# Jobs: the Rust workspace and the agent-cli tests (both run inside a
+# loopback-only network namespace, so no test can depend on Bluesky, DNS or
+# any third-party API), the npm publish drift gate publish.yml would fail
+# on, the supply-chain audit, and the pds-bridge image built exactly as
+# deploy-bridge.yml builds it, then started with a throwaway config and
+# probed. Local equivalent: `make release-check`.
+name: release-candidate
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: rc / rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The exact rustc of the Dockerfile's builder stage; checked below.
+      - uses: dtolnay/rust-toolchain@633c1125191e55c620c8ae7d364073c0ead621c1 # 1.93.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: toolchain pin agrees with the Dockerfile tag and its digest
+        run: |
+          ref="$(sed -nE 's/^FROM (rust:[^ ]+) AS builder.*/\1/p' Dockerfile)"
+          tag_v="$(echo "$ref" | sed -nE 's/^rust:([0-9]+\.[0-9]+\.[0-9]+)-.*@sha256:[0-9a-f]{64}$/\1/p')"
+          [ -n "$tag_v" ] || { echo "::error::Dockerfile builder must be rust:X.Y.Z-<distro>@sha256:<digest>, got '$ref'"; exit 1; }
+          digest_v="$(docker buildx imagetools inspect "rust@${ref#*@}" --format '{{json (index .Image "linux/amd64")}}' \
+            | jq -r '.config.Env[] | select(startswith("RUST_VERSION=")) | sub("RUST_VERSION=";"")')"
+          have_v="$(rustc --version | awk '{print $2}')"
+          echo "Dockerfile tag $tag_v, digest RUST_VERSION $digest_v, CI rustc $have_v"
+          [ "$tag_v" = "$digest_v" ] || { echo "::error::Dockerfile tag says rust $tag_v but its digest carries $digest_v"; exit 1; }
+          [ "$tag_v" = "$have_v" ] || { echo "::error::Dockerfile builds with rust $tag_v, this job with $have_v"; exit 1; }
+      - name: build the tests (network allowed, for crates and git deps)
+        run: cargo test --workspace --locked --no-run
+      - name: the namespace below really is offline
+        run: |
+          scripts/offline.sh bash -c '! curl -sS --max-time 5 -o /dev/null https://bsky.social 2>/dev/null' \
+            || { echo "::error::scripts/offline.sh did not cut the network"; exit 1; }
+      - name: workspace tests (loopback-only network)
+        run: scripts/offline.sh cargo test --workspace --locked --offline
+
+  js:
+    name: rc / js
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      # What publish.yml fails on: a version already on npm with different
+      # content (NEEDS BUMP). First, before anything can write into the tree.
+      - name: publish drift gate
+        run: node scripts/publish-status.mjs
+      - name: install agent-cli (lockfile)
+        working-directory: agent-cli
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: agent-cli tests (loopback-only network)
+        working-directory: agent-cli
+        run: ../scripts/offline.sh node --test
+
+  audit:
+    name: rc / audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # gitleaks scans every commit
+      - uses: dtolnay/rust-toolchain@633c1125191e55c620c8ae7d364073c0ead621c1 # 1.93.1
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
+        with:
+          tool: cargo-audit
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: scripts/supply-chain-audit.sh rust
+      - run: scripts/supply-chain-audit.sh node
+      # The CLI, not gitleaks-action: the action scans only the pushed or PR
+      # range, so a mirror push could pass what the PR fails.
+      - name: gitleaks (full history of HEAD)
+        run: |
+          v=8.30.1; sum=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          curl -sSfL -o /tmp/gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v$v/gitleaks_${v}_linux_x64.tar.gz"
+          echo "$sum  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks git . --config .gitleaks.toml --redact --no-banner
+
+  # The image deploy-bridge.yml builds and releases, built the same way (same
+  # actions, file, context, platform, cache) but loaded locally instead of
+  # pushed, then started with a throwaway config and probed. A dependency
+  # needing a newer compiler, a missing workspace member, a bad COPY or a
+  # startup refusal fails here instead of at deploy.
+  image:
+    name: rc / image pds-bridge
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: rc-pds-bridge
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: refuses to start without its required secret
+        run: |
+          set +e
+          out="$(docker run --rm --network none rc-pds-bridge 2>&1)"; rc=$?
+          echo "$out" | tail -3
+          [ $rc -ne 0 ] && echo "$out" | grep -q "PDS_ADMIN_PASSWORD is required" \
+            || { echo "::error::expected the PDS_ADMIN_PASSWORD startup refusal (rc=$rc)"; exit 1; }
+      # Throwaway config: a stub localhost broker (static support document,
+      # RFC 8032 test key; see .github/rc/README.md), a PDS that does not
+      # exist, IdP and labeler off. Nothing at startup leaves the host.
+      - name: start and probe /browserid/health
+        run: |
+          (cd .github/rc/stub-broker && python3 -m http.server 18081 --bind 127.0.0.1 >/tmp/stub-broker.log 2>&1 &)
+          for i in $(seq 1 20); do curl -sf http://127.0.0.1:18081/.well-known/browserid >/dev/null && break; sleep 0.5; done
+          docker run -d --name rc --network host \
+            -e BRIDGE_PORT=18080 -e BROKER_URL=http://127.0.0.1:18081 \
+            -e PDS_URL=http://127.0.0.1:1 -e PDS_ADMIN_PASSWORD=rc-throwaway \
+            rc-pds-bridge
+          for i in $(seq 1 60); do
+            if [ "$(curl -sf http://127.0.0.1:18080/browserid/health)" = ok ]; then
+              echo "healthy after ${i}s"
+              curl -sf http://127.0.0.1:18080/llms.txt >/dev/null || { echo "::error::bridge is up but does not serve /llms.txt"; docker logs rc; exit 1; }
+              exit 0
+            fi
+            [ "$(docker inspect -f '{{.State.Running}}' rc)" = true ] || break
+            sleep 1
+          done
+          echo "::error::pds-bridge image did not become healthy"; docker logs rc; exit 1

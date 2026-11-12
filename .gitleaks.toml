@@ -1,0 +1,8 @@
+# gitleaks configuration. Read by rc / audit (gitleaks CLI over the full
+# history of HEAD) and by scripts/supply-chain-audit.sh secrets. Default
+# rules; allowlist only reviewed test fixtures, each with a reason.
+
+title = "browserid-bsky"
+
+[extend]
+useDefault = true
